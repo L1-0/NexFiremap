@@ -1,4 +1,26 @@
-"""Validated operator-supplied MBTiles basemaps for disconnected use."""
+"""Validated operator-supplied MBTiles basemaps for disconnected use.
+
+An operator can upload their own pre-built offline basemap - either an
+MBTiles tile archive (the usual offline-map format: a SQLite database of
+pre-rendered raster tiles) or a plain georeferenced raster (GeoTIFF/raster
+GeoPackage, e.g. an orthophoto or a DEM) - and this module validates it,
+stores it under a stable id, and serves it through the same tile-URL shape
+the rest of the app already uses for online layers (see ``public_layers``).
+
+Every upload is structurally validated before it's accepted (SQLite
+integrity check, required tables/columns, at least one tile, sane zoom
+range, real coordinate bounds) so a corrupt or malformed file fails loudly
+at import time with a specific reason, rather than surfacing as silent
+missing tiles later during an actual incident. Metadata (name, source,
+attribution, licence, limitations) is mandatory on every import for the
+same reason further_plan.md requires it elsewhere: an offline layer with no
+provenance is not trustworthy enough to base tactical decisions on.
+
+A raster source can also be locally re-derived into slope/aspect rasters
+and elevation contours (``derive_terrain_package``) entirely offline - the
+same terrain products ``terrain.py`` would otherwise need a network DEM
+source for.
+"""
 
 from __future__ import annotations
 
@@ -34,7 +56,7 @@ FORMATS = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp"
 
 
 class OfflineSourceError(ValueError):
-    pass
+    """Invalid offline-source upload, metadata, or a corrupt/unreadable file."""
 
 
 def _now() -> str:
@@ -42,10 +64,20 @@ def _now() -> str:
 
 
 class OfflineSourceManager:
+    """Import, validate, store and serve operator-supplied offline map
+    sources. Each source has two files on disk: the data itself
+    (``<id>.mbtiles``/``.tif``/``.gpkg``) and a JSON sidecar
+    (``<id>.json``) carrying its metadata - the sidecar's existence is what
+    ``list()``/``load()`` treat as "this source is fully imported", see
+    ``_prune_orphaned_data`` for why that split matters."""
+
     def __init__(self, root: Path) -> None:
         self.directory = (root / "offline_sources").resolve()
 
     def _path(self, source_id: str) -> Path:
+        """MBTiles path for a source id, rejecting a malformed id (blocks
+        path traversal) and double-checking the resolved path still lands
+        inside the offline-sources directory."""
         if not SOURCE_ID_RE.fullmatch(source_id):
             raise OfflineSourceError("invalid offline source id")
         path = (self.directory / f"{source_id}.mbtiles").resolve()
@@ -57,6 +89,11 @@ class OfflineSourceManager:
         return self._path(source_id).with_suffix(".json")
 
     def _stored_path(self, record: dict[str, Any]) -> Path:
+        """Actual data file for a loaded record - not simply ``_path()``
+        with a different suffix, because a raster source's real extension
+        (``.tif``/``.gpkg``) is recorded in ``storage_filename`` rather than
+        assumed, and ``Path(filename).name`` strips any directory component
+        so a crafted ``storage_filename`` can't escape the sources directory."""
         filename = str(record.get("storage_filename") or f"{record['id']}.mbtiles")
         path = (self.directory / Path(filename).name).resolve()
         if not path.is_relative_to(self.directory):
@@ -64,6 +101,11 @@ class OfflineSourceManager:
         return path
 
     def begin_upload(self, content_length: int | None) -> tuple[str, Path]:
+        """Allocate a new source id and a hidden partial-upload path to
+        stream the incoming file into - nothing is visible to ``list()``/
+        ``load()`` until ``finalize_upload``/``finalize_raster_upload``
+        atomically publishes it, so a request that dies mid-upload never
+        exposes a half-written source."""
         if content_length is not None and (content_length <= 0 or content_length > MAX_UPLOAD_BYTES):
             raise OfflineSourceError(f"MBTiles upload must be between 1 byte and {MAX_UPLOAD_BYTES} bytes")
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -71,6 +113,9 @@ class OfflineSourceManager:
         return source_id, self.directory / f".{source_id}.upload"
 
     def abort_upload(self, partial: Path) -> None:
+        """Clean up a partial-upload file after a failed/cancelled
+        request - best-effort, so any filesystem error is swallowed rather
+        than masking the original failure that triggered the abort."""
         try:
             if partial.is_relative_to(self.directory) and partial.exists():
                 partial.unlink()
@@ -79,6 +124,11 @@ class OfflineSourceManager:
 
     @staticmethod
     def _detect_format(value: str | None, sample: bytes) -> str:
+        """Trust the MBTiles ``metadata`` table's declared ``format`` when
+        present and recognised; otherwise sniff one tile's magic bytes.
+        Falling back to sniffing matters because not every MBTiles producer
+        populates the metadata table correctly, and a wrong declared format
+        would otherwise get served with the wrong Content-Type."""
         normalized = str(value or "").lower().strip().replace("jpeg", "jpg")
         if normalized in {"png", "jpg", "webp"}:
             return normalized
@@ -90,6 +140,19 @@ class OfflineSourceManager:
     def finalize_upload(self, source_id: str, partial: Path, *, name: str, source: str,
                         attribution: str, acquired_at: str, licence: str,
                         limitations: str = "") -> dict[str, Any]:
+        """Validate an uploaded MBTiles file end to end and publish it.
+
+        Validation opens the file as SQLite directly (not through a tile
+        library) so a structurally-invalid file is rejected with a specific
+        reason before anything is trusted about it: integrity check first
+        (catches truncated/corrupt uploads), then required tables/columns,
+        then real data (tile count, zoom range, an actual tile sniffed for
+        format, and - if present - bounds that parse as valid WGS84).
+
+        Publishing is two atomic renames (data file, then sidecar) rather
+        than one - see ``_prune_orphaned_data`` for why the gap between them
+        is safe to leave rather than trying to make fully atomic.
+        """
         if not partial.is_file() or partial.stat().st_size <= 0:
             raise OfflineSourceError("uploaded MBTiles file is empty")
         if partial.stat().st_size > MAX_UPLOAD_BYTES:
@@ -167,6 +230,13 @@ class OfflineSourceManager:
     def finalize_raster_upload(self, source_id: str, partial: Path, *, name: str, source: str,
                                attribution: str, acquired_at: str, licence: str,
                                limitations: str = "") -> dict[str, Any]:
+        """Validate an uploaded georeferenced raster (GeoTIFF or raster
+        GeoPackage) and publish it - the raster counterpart to
+        ``finalize_upload``. Bounds are always reprojected to WGS84
+        (``transform_bounds``) regardless of the source CRS, since every
+        consumer of a source record (map-pack coverage checks, the tile
+        server's XYZ math) works in WGS84/Web Mercator, not the raster's
+        native projection."""
         if not partial.is_file() or partial.stat().st_size <= 0:
             raise OfflineSourceError("uploaded raster file is empty")
         required = {"name": str(name or "").strip()[:200], "source": str(source or "").strip()[:500],
@@ -210,6 +280,10 @@ class OfflineSourceManager:
         return record
 
     def load(self, source_id: str) -> dict[str, Any]:
+        """Read one source's metadata sidecar, verifying its schema tag and
+        that the data file it points at still actually exists (a sidecar
+        with no data file behind it - e.g. the data file was manually
+        deleted - is treated the same as "not found", not a crash)."""
         sidecar = self._sidecar(source_id)
         if not sidecar.is_file():
             raise FileNotFoundError(source_id)
@@ -284,12 +358,18 @@ class OfflineSourceManager:
         } for item in self.list()]
 
     def tile(self, source_id: str, zoom: int, x: int, y: int) -> tuple[bytes, str] | None:
+        """One XYZ tile from a source, whichever kind it is. A raster
+        source is reprojected on the fly per request (``_raster_tile``); an
+        MBTiles source is a direct row lookup."""
         record = self.load(source_id)
         if not (record["min_zoom"] <= zoom <= record["max_zoom"]): return None
         count = 1 << zoom
         if not (0 <= x < count and 0 <= y < count): return None
         if record.get("kind") == "raster":
             return self._raster_tile(record, zoom, x, y)
+        # MBTiles stores tiles in TMS row order (origin at the bottom-left),
+        # the XYZ scheme this server/the browser otherwise uses everywhere
+        # has origin at the top-left - flip the row index to bridge the two.
         tms_y = count - 1 - y
         uri = self._path(source_id).resolve().as_uri() + "?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=10.0)
@@ -304,6 +384,13 @@ class OfflineSourceManager:
             conn.close()
 
     def _raster_tile(self, record: dict[str, Any], zoom: int, x: int, y: int) -> tuple[bytes, str] | None:
+        """Reproject one 256x256 Web Mercator tile window out of a stored
+        raster on demand - there's no pre-rendered tile pyramid for an
+        imported raster, so every request does a small windowed reproject
+        (GDAL only reads the source pixels the destination window actually
+        needs, so this stays cheap regardless of the source raster's full
+        size, matching imagery.py's read_band_on_grid). Returns ``None`` if
+        the tile falls entirely outside the raster's bounds."""
         origin = 20037508.342789244; tiles = 1 << zoom; span = 2 * origin / tiles
         left, right = -origin + x * span, -origin + (x + 1) * span
         top, bottom = origin - y * span, origin - (y + 1) * span
@@ -325,6 +412,14 @@ class OfflineSourceManager:
                           dst_nodata=0, resampling=Resampling.nearest)
                 mask = coverage == 0
                 if source.dtypes[0] != "uint8":
+                    # A DEM or other non-8-bit raster (float elevation,
+                    # 16-bit imagery, ...) needs some value range mapped
+                    # into a displayable 0-255 - a 2nd/98th-percentile
+                    # stretch (per band, per tile) gives a reasonable
+                    # visual contrast without a fixed min/max that would
+                    # need per-dataset tuning, at the cost of the same
+                    # raw value not always mapping to the same displayed
+                    # brightness across different tiles/zooms.
                     for band in range(values.shape[0]):
                         valid = values[band][~mask]
                         low, high = (np.percentile(valid, [2, 98]) if valid.size else (0, 1))
@@ -338,6 +433,15 @@ class OfflineSourceManager:
             raise OfflineSourceError(f"offline raster tile could not be read: {exc}") from exc
 
     def derive_terrain_package(self, source_id: str, interval_m: float = 20.0) -> tuple[Path, dict[str, Any]]:
+        """Derive slope, aspect and elevation contours from a locally
+        imported DEM, entirely offline, and bundle them into one zip. Slope/
+        aspect come from a simple finite-difference gradient (not a
+        smoothed/windowed algorithm - adequate for tactical use, not survey
+        precision); geographic (lat/lon) DEMs have their pixel spacing
+        converted to metres first (``x_size``/``y_size``) so the gradient's
+        units are consistent regardless of the source CRS. Contour levels
+        are capped at 200 to keep the output bounded for a very fine
+        interval over a large elevation range."""
         record = self.load(source_id)
         if record.get("kind") != "raster": raise OfflineSourceError("terrain derivation requires a geospatial raster source")
         if not math.isfinite(interval_m) or not 1 <= interval_m <= 1000:

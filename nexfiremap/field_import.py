@@ -1,4 +1,22 @@
-"""Previewed, provenance-preserving field observation imports."""
+"""Previewed, provenance-preserving field observation imports.
+
+Turns a field-collected file (GeoJSON/GPX/KML/KMZ/GeoPackage/CSV from a
+handheld GPS, a mapping app, or a spreadsheet) into tactical features on an
+incident - but never blindly. ``prepare`` parses and validates the source
+into a preview report (feature counts, how many fall outside the reviewed
+AOI, whether any need explicit confirmation) *without* writing anything, so
+an operator can see what would be imported before committing. ``apply``
+re-runs the same parse and then commits it as one atomic transaction,
+requiring explicit acknowledgement for anything the preview flagged
+(features outside the AOI, or confirmed-status observations) - accepting a
+device's raw output shouldn't be able to silently plant something on the
+map the operator never actually reviewed.
+
+Every accepted import also keeps the original uploaded file byte-for-byte
+(``original_blob``) and records exactly which import produced each feature
+(``source_import_id``), so provenance survives even after the parsed
+features are edited or merged.
+"""
 
 from __future__ import annotations
 
@@ -27,10 +45,14 @@ SUPPORTED_FORMATS = {"geojson", "gpx", "kml", "kmz", "gpkg", "csv"}
 
 
 class FieldImportError(OperationsError):
-    pass
+    """Malformed source file, or an import that requires explicit
+    acknowledgement/confirmation it wasn't given."""
 
 
 def _positions(geometry: dict[str, Any]) -> Iterable[list[float]]:
+    """Every vertex of a geometry as [lon, lat, ...] - used for the
+    outside-AOI check, so a LineString/Polygon counts as "outside" if any
+    one of its vertices is, not just its first point."""
     coordinates = geometry.get("coordinates")
     if geometry.get("type") == "Point":
         yield coordinates
@@ -42,10 +64,18 @@ def _positions(geometry: dict[str, Any]) -> Iterable[list[float]]:
 
 
 def _default_type(geometry_type: str) -> str:
+    """Reasonable fallback ``feature_type`` when the source data doesn't
+    map to one - keyed purely by geometry shape, since that's all a bare
+    imported point/line/polygon tells us about intent."""
     return {"Point": "spot_fire", "LineString": "fire_perimeter", "Polygon": "burn_area"}[geometry_type]
 
 
 def _parse_geojson(content: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Parse GeoJSON into ``(geometry, properties)`` pairs, accepting a bare
+    Feature or a FeatureCollection. Any non-default/non-CRS84 ``crs`` member
+    is rejected outright rather than guessed at - GeoJSON's own spec says
+    coordinates are always WGS84/CRS84, so an explicit different CRS means
+    this file needs reprojecting before import, not silent mis-plotting."""
     try:
         value = json.loads(content)
     except json.JSONDecodeError as exc:
@@ -70,11 +100,19 @@ def _parse_geojson(content: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
 
 
 def _parse_gpx(content: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Parse GPX waypoints (-> Point features) and track segments (->
+    LineString features). The DOCTYPE/ENTITY check (repeated in
+    ``_parse_kml``) blocks XXE - a crafted external entity in an uploaded
+    XML file could otherwise read local files or make outbound requests
+    through Python's stdlib XML parser."""
     if "<!DOCTYPE" in content.upper() or "<!ENTITY" in content.upper():
         raise FieldImportError("XML document type/entity declarations are not allowed")
     try: root = ET.fromstring(content)
     except ET.ParseError as exc: raise FieldImportError(f"invalid GPX: {exc}") from exc
     result = []
+    # "{*}tag" matches the tag in any XML namespace - GPX producers vary in
+    # which namespace URI/version they declare, so matching by local name
+    # only avoids having to enumerate every GPX schema version's namespace.
     for waypoint in root.findall(".//{*}wpt"):
         try: coordinates = [float(waypoint.attrib["lon"]), float(waypoint.attrib["lat"])]
         except (KeyError, ValueError) as exc: raise FieldImportError("GPX waypoint has invalid coordinates") from exc
@@ -93,6 +131,9 @@ def _parse_gpx(content: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
 
 
 def _kml_coordinates(text: str | None) -> list[list[float]]:
+    """KML packs coordinates as whitespace-separated ``lon,lat[,alt]``
+    tuples in one text node - split on whitespace first, then each token on
+    commas, keeping only lon/lat/alt (KML allows no more than 3)."""
     result = []
     for token in str(text or "").split():
         try:
@@ -105,6 +146,10 @@ def _kml_coordinates(text: str | None) -> list[list[float]]:
 
 
 def _parse_kml(content: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Parse KML Placemarks - Point/LineString/Polygon only (no MultiGeometry,
+    NetworkLink, or other KML constructs), each Placemark's outer boundary
+    ring only for a Polygon (inner rings/holes aren't preserved - a field
+    import is a point/line/area sketch, not a precision boundary)."""
     if "<!DOCTYPE" in content.upper() or "<!ENTITY" in content.upper():
         raise FieldImportError("XML document type/entity declarations are not allowed")
     try: root = ET.fromstring(content)
@@ -129,6 +174,12 @@ def _parse_kml(content: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
 
 
 def _parse_csv(content: str, mapping: dict[str, str]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Parse a CSV of point observations. Every row becomes a Point feature
+    - CSV has no native concept of lines/polygons, so unlike the other
+    parsers this one only ever produces one geometry type. Column names for
+    lat/lon (and, later, other fields) are configurable via ``mapping``
+    since field-collected spreadsheets rarely agree on a header naming
+    convention."""
     try: rows = list(csv.DictReader(io.StringIO(content)))
     except csv.Error as exc: raise FieldImportError(f"invalid CSV: {exc}") from exc
     if not rows: raise FieldImportError("CSV contains no data rows")
@@ -143,6 +194,13 @@ def _parse_csv(content: str, mapping: dict[str, str]) -> list[tuple[dict[str, An
 
 
 def _wkb_geometry(data: bytes) -> dict[str, Any]:
+    """Minimal hand-rolled Well-Known Binary reader for GeoPackage geometry
+    blobs - only Point/LineString/Polygon (2D or 3D/Z), no external WKB
+    library dependency for a format this narrow. Handles both the standard
+    ISO WKB type-code encoding (Z flag in the high bit, ``0x80000000``) and
+    the older OGC "ISO extension" convention some producers still use
+    (``base type + 1000`` for Z) since a GeoPackage exporter isn't
+    guaranteed to use either one exclusively."""
     def read(offset: int = 0) -> tuple[dict[str, Any], int]:
         if offset + 5 > len(data): raise FieldImportError("GeoPackage geometry is truncated")
         endian = "<" if data[offset] == 1 else ">" if data[offset] == 0 else None
@@ -161,6 +219,11 @@ def _wkb_geometry(data: bytes) -> dict[str, Any]:
             return {"type": "Point", "coordinates": point()}, offset
         if offset + 4 > len(data): raise FieldImportError("GeoPackage geometry count is truncated")
         count = struct.unpack_from(endian + "I", data, offset)[0]; offset += 4
+        # The count comes straight from an untrusted blob before any bounds
+        # check against the blob's actual remaining length - cap it well
+        # below what a legitimate field sketch would ever need so a
+        # corrupted/hostile count can't drive an enormous allocation before
+        # the subsequent per-point truncation check would even run.
         if count > 1_000_000: raise FieldImportError("GeoPackage geometry has an unsafe coordinate count")
         if base == 2:
             return {"type": "LineString", "coordinates": [point() for _ in range(count)]}, offset
@@ -176,6 +239,12 @@ def _wkb_geometry(data: bytes) -> dict[str, Any]:
 
 
 def _gpkg_geometry(blob: bytes) -> dict[str, Any]:
+    """Strip the GeoPackage binary header (magic "GP", version, flags, SRS
+    id, then an optional bounding-box envelope whose size depends on the
+    flags byte) to get to the plain WKB geometry underneath, then hand off
+    to ``_wkb_geometry``. The envelope's size code -> byte-count mapping is
+    fixed by the GeoPackage spec (0 = none, 1 = XY, 2/3 = XYZ or XYM, 4 =
+    XYZM, each coordinate pair/triple/quad stored as 8-byte doubles)."""
     if len(blob) < 8 or blob[:2] != b"GP": raise FieldImportError("GeoPackage geometry header is invalid")
     flags = blob[3]; envelope_code = (flags >> 1) & 0x07
     envelope_values = {0: 0, 1: 4, 2: 6, 3: 6, 4: 8}.get(envelope_code)
@@ -184,6 +253,12 @@ def _gpkg_geometry(blob: bytes) -> dict[str, Any]:
 
 
 def _parse_gpkg(raw: bytes) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Parse every feature from every vector layer in an uploaded
+    GeoPackage. The upload is written to a temp file and opened as a
+    read-only SQLite database directly (``mode=ro``) rather than through a
+    heavier GIS library, since GeoPackage *is* SQLite - reading its
+    ``gpkg_contents``/``gpkg_geometry_columns`` catalog tables and each
+    layer's geometry blob column is all that's actually needed here."""
     with tempfile.TemporaryDirectory() as temp:
         path = Path(temp) / "source.gpkg"; path.write_bytes(raw)
         try: conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
@@ -197,6 +272,11 @@ def _parse_gpkg(raw: bytes) -> list[tuple[dict[str, Any], dict[str, Any]]]:
             if not tables: raise FieldImportError("GeoPackage contains no vector feature table")
             result = []
             for definition in tables:
+                # Unlike GeoJSON, GeoPackage layers can legitimately be in
+                # any CRS - this module has no reprojection step, so a
+                # layer in anything other than plain WGS84 (EPSG:4326) is
+                # rejected outright rather than imported with wrong
+                # coordinates.
                 if int(definition["srs_id"]) != 4326:
                     raise FieldImportError("GeoPackage vector layers must use EPSG:4326 before field import")
                 table, geometry_column = str(definition["table_name"]), str(definition["column_name"])
@@ -215,11 +295,19 @@ def _parse_gpkg(raw: bytes) -> list[tuple[dict[str, Any], dict[str, Any]]]:
 
 
 class FieldImportManager:
+    """Two-phase import: ``prepare`` parses and reports without writing,
+    ``apply`` re-parses and commits - see module docstring for why it's
+    split this way."""
+
     def __init__(self, db: Database, store: OperationsStore) -> None:
         self.db, self.store = db, store
 
     @staticmethod
     def _format(filename: str, requested: str) -> str:
+        """Resolve the import format: an explicit ``requested`` format wins,
+        otherwise fall back to the filename's extension - ``json`` is
+        treated as an alias for ``geojson`` since that's what most tools
+        actually name a GeoJSON export."""
         value = requested.lower().strip() if requested else Path(filename).suffix.lower().lstrip(".")
         if value == "json": value = "geojson"
         if value not in SUPPORTED_FORMATS:
@@ -228,6 +316,9 @@ class FieldImportManager:
 
     @staticmethod
     def _raw(request: dict[str, Any]) -> bytes:
+        """Original source bytes from the request, whichever way the
+        caller sent them - base64 (needed for binary formats like KMZ/
+        GeoPackage over a JSON API) or plain UTF-8 text."""
         encoded = request.get("content_base64")
         if encoded:
             try: return base64.b64decode(str(encoded), validate=True)
@@ -239,6 +330,11 @@ class FieldImportManager:
 
     @staticmethod
     def _kmz_text(raw: bytes) -> str:
+        """Extract the single KML document from a KMZ (a zip archive) as
+        text, guarding against zip-bomb-style and path-traversal payloads -
+        see the inline comments below for exactly what each check catches
+        and why the streaming read, not the declared-size sum, is the real
+        guard."""
         try:
             with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                 files = [item for item in archive.infolist() if not item.is_dir()]
@@ -254,6 +350,12 @@ class FieldImportManager:
                 # crosses the limit.
                 if len(files) > 100 or sum(item.file_size for item in files) > MAX_SOURCE_BYTES:
                     raise FieldImportError("KMZ expanded content exceeds safe import limits")
+                # Guards Zip Slip: a crafted entry name (absolute, or with a
+                # ".." component) could otherwise resolve outside the
+                # intended extraction area if this content were ever
+                # written to disk by name rather than read into memory as
+                # it is here - checked anyway as defence in depth against
+                # future code paths making that assumption.
                 if any(Path(item.filename).is_absolute() or ".." in Path(item.filename).parts for item in files):
                     raise FieldImportError("KMZ contains an unsafe path")
                 candidates = [item for item in files if item.filename.lower().endswith(".kml")]
@@ -275,6 +377,14 @@ class FieldImportManager:
             raise FieldImportError("KMZ is not a valid UTF-8 KML archive") from exc
 
     def prepare(self, incident_id: str, request: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Parse and validate a source file into a review report plus the
+        prepared feature rows ``apply`` would insert - performs no writes,
+        so it's safe to call repeatedly while an operator reviews the same
+        upload. Every prepared feature is validated the same way a manually
+        entered tactical feature would be (geometry/type match,
+        ``_validate_geometry``), and per-feature confirmation/AOI status is
+        tallied into the report so ``apply`` can require explicit
+        acknowledgement for anything unusual (see class docstring)."""
         incident = self.store.get_incident(incident_id)
         filename = _clean_text(request.get("filename"), 300)
         if not filename:
@@ -313,6 +423,11 @@ class FieldImportManager:
                 raise FieldImportError(f"feature {index} type does not match its geometry")
             if any(not (west <= float(p[0]) <= east and south <= float(p[1]) <= north) for p in _positions(geometry)):
                 outside += 1
+            # Indirects every field lookup through the caller-supplied
+            # column mapping (e.g. a CSV with a "Notes" column mapped to
+            # "title") so the rest of this loop can just ask for the
+            # semantic field name without knowing the source file's actual
+            # header/tag naming.
             def field(key: str, fallback: str = "") -> Any:
                 column = mapping.get(key, key)
                 return props.get(column, fallback)
@@ -345,6 +460,12 @@ class FieldImportManager:
         return report, prepared
 
     def apply(self, incident_id: str, request: dict[str, Any], actor: str) -> dict[str, Any]:
+        """Re-run ``prepare`` (never trusts a client-supplied report - the
+        server is the source of truth for what will actually be imported)
+        and, once any required acknowledgement/confirmation reason is
+        present, commit every feature plus the import record itself in one
+        transaction so a partial import (some features written, others not)
+        can never happen on failure."""
         report, prepared = self.prepare(incident_id, request)
         if report["requires_aoi_acknowledgement"] and not request.get("acknowledge_outside_aoi"):
             raise FieldImportError("features outside the reviewed AOI require explicit acknowledgement")
@@ -388,6 +509,9 @@ class FieldImportManager:
         return {"imported": True, "import_id": import_id, "feature_ids": ids, "report": report}
 
     def list_imports(self, incident_id: str) -> list[dict[str, Any]]:
+        """Import history, excluding ``original_blob`` - same rationale as
+        products.py's ``list``: a listing view shouldn't pay to transfer
+        every stored source file's bytes."""
         self.store.get_incident(incident_id)
         return [dict(row) for row in self.db.conn.execute(
             "SELECT id,incident_id,filename,format,sha256,size_bytes,source,imported_by,imported_at,feature_count,report_json FROM incident_source_imports WHERE incident_id=? ORDER BY imported_at DESC",
@@ -395,6 +519,8 @@ class FieldImportManager:
         ).fetchall()]
 
     def original(self, incident_id: str, import_id: str) -> tuple[str, bytes]:
+        """The exact original uploaded file, for provenance/audit - what
+        was actually submitted, independent of how it was later parsed."""
         row = self.db.conn.execute(
             "SELECT filename,original_blob FROM incident_source_imports WHERE id=? AND incident_id=?",
             (import_id, incident_id),

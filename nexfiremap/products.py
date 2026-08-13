@@ -1,4 +1,22 @@
-"""Deterministic classified incident products and portable vector exports."""
+"""Deterministic classified incident products and portable vector exports.
+
+Turns a snapshot/export bundle (see operations.py) into a downloadable file in
+whatever format the recipient's workflow needs - GeoJSON/GPX/KML/KMZ/CSV for
+GIS and handheld tools, GeoTIFF/GeoPackage/GeoPDF for offline raster viewers,
+and a plain PDF map for printing or attaching to an incident action plan.
+
+"Deterministic" matters here: two calls with the same bundle and format
+always produce byte-identical output (fixed timestamps in PDF/KMZ metadata,
+sorted JSON keys, sorted dict iteration) so a product's stored SHA-256 is a
+real integrity check, not something that drifts on every regeneration.
+
+Classification (draft/operational/public) controls redaction, not just a
+label: a ``public`` product is rebuilt from a filtered feature set
+(``classified_bundle``) that strips everything except a small public-safe
+subset of feature types and properties - tactics, resources, hazards, safety
+records and audit history never make it into a public-facing product even by
+accident, because they are never in the input bundle handed to the renderer.
+"""
 
 from __future__ import annotations
 
@@ -34,6 +52,13 @@ SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _public_feature(feature: dict[str, Any]) -> dict[str, Any] | None:
+    """Redact one feature for a public-classification product, or drop it
+    entirely (``None``) if its type isn't in the public-safe allowlist or it
+    has been soft-deleted. Only a fixed, small property set survives -
+    anything not explicitly named in ``allowed`` below (tactics, hazards,
+    resource assignments, ...) is left out rather than filtered out, so a
+    new property added elsewhere in the app can never leak into a public
+    product by omission."""
     props = feature.get("properties", {})
     if props.get("feature_type") not in PUBLIC_TYPES or props.get("deleted_at"):
         return None
@@ -42,6 +67,10 @@ def _public_feature(feature: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def classified_bundle(bundle: dict[str, Any], classification: str) -> dict[str, Any]:
+    """For ``draft``/``operational`` products, pass the bundle through
+    unchanged. For ``public``, rebuild it from scratch with only the
+    redacted feature set and a minimal incident summary - see
+    ``_public_feature`` for exactly what is dropped."""
     if classification != "public": return bundle
     incident = bundle["incident"]
     public_features = [item for feature in bundle["features"]["features"] if (item := _public_feature(feature))]
@@ -55,6 +84,11 @@ def classified_bundle(bundle: dict[str, Any], classification: str) -> dict[str, 
 
 
 def _feature_rows(bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten every feature to one CSV-friendly row. Geometry itself is
+    serialized to a JSON string column rather than split into lat/lon (or
+    similar) columns, since features can be points, lines or polygons -
+    one column that round-trips exactly beats several that only work for
+    one geometry type."""
     return [{"id": p.get("id"), "feature_type": p.get("feature_type"), "title": p.get("title"),
              "status": p.get("status"), "observed_at": p.get("observed_at"),
              "geometry_type": feature.get("geometry", {}).get("type"),
@@ -63,6 +97,11 @@ def _feature_rows(bundle: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _all_points(value: Any) -> list[tuple[float, float]]:
+    """Recursively flatten a GeoJSON ``coordinates`` array of any nesting
+    depth (Point/LineString/Polygon, and their Multi- variants if they ever
+    show up) down to a flat list of (lon, lat) pairs - a coordinate leaf is
+    recognised by being a 2+-element list of numbers, everything else just
+    gets walked one level deeper."""
     if isinstance(value, list) and len(value) >= 2 and all(isinstance(v, (int, float)) for v in value[:2]):
         return [(float(value[0]), float(value[1]))]
     if not isinstance(value, list):
@@ -71,6 +110,11 @@ def _all_points(value: Any) -> list[tuple[float, float]]:
 
 
 def _bounds(bundle: dict[str, Any]) -> tuple[float, float, float, float]:
+    """Padded (west, south, east, north) map extent for the raster/PDF
+    renderers below. Falls back to a small box around the incident's centre
+    point when the bundle has no geometry at all (e.g. an empty export),
+    rather than raising - a still-useful, if nearly featureless, map beats
+    a failed product."""
     points = [point for feature in bundle.get("features", {}).get("features", [])
               for point in _all_points((feature.get("geometry") or {}).get("coordinates", []))]
     if not points:
@@ -80,11 +124,20 @@ def _bounds(bundle: dict[str, Any]) -> tuple[float, float, float, float]:
         return (float(lon) - .01, float(lat) - .01, float(lon) + .01, float(lat) + .01)
     west, east = min(p[0] for p in points), max(p[0] for p in points)
     south, north = min(p[1] for p in points), max(p[1] for p in points)
+    # A minimum pad (.002 deg) keeps a single-point or degenerate-extent
+    # bundle from producing a zero-size bbox that rasterize()/matplotlib
+    # would choke on.
     pad = max(east - west, north - south, .002) * .05
     return west - pad, south - pad, east + pad, north + pad
 
 
 def _raster_product(bundle: dict[str, Any], driver: str) -> bytes:
+    """Burn every feature into a single-band classified raster (GeoTIFF or
+    GeoPackage raster) - each distinct ``feature_type`` gets its own integer
+    class value (1..n, sorted alphabetically for determinism), 0 is nodata/
+    background. The class-to-type mapping and the full product metadata are
+    embedded as GDAL tags (``CLASS_VALUES``/``PRODUCT_METADATA``) so the
+    raster is self-describing even opened outside NexFiremap."""
     features = bundle.get("features", {}).get("features", [])
     kinds = sorted({str((f.get("properties") or {}).get("feature_type", "feature")) for f in features})
     values = {kind: index + 1 for index, kind in enumerate(kinds)}
@@ -111,6 +164,13 @@ def _raster_product(bundle: dict[str, Any], driver: str) -> bytes:
 
 
 def _pdf_product(bundle: dict[str, Any]) -> bytes:
+    """Render a single-page reference map (features, legend, scale bar, north
+    arrow, footer) with matplotlib and export straight to PDF - no basemap
+    tiles, since a printed/offline product can't depend on live tile
+    fetches. ``CreationDate``/``ModDate`` are pinned to the product's own
+    ``produced_at`` (not wall-clock "now") so re-rendering the same bundle
+    later still yields a byte-identical PDF, matching this module's
+    determinism guarantee."""
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib import pyplot as plt
@@ -132,6 +192,11 @@ def _pdf_product(bundle: dict[str, Any]) -> bytes:
                 axis.fill([p[0] for p in ring], [p[1] for p in ring], facecolor=color, edgecolor=color, alpha=.28)
     west, south, east, north = _bounds(bundle); axis.set(xlim=(west, east), ylim=(south, north), xlabel="Longitude (°)", ylabel="Latitude (°)")
     axis.grid(True, linewidth=.35, alpha=.5); axis.set_aspect("equal", adjustable="box")
+    # Target roughly a fifth of the map's on-screen width, converted from
+    # degrees to km at this latitude (the cos() term shrinks a degree of
+    # longitude toward the poles); the nearest round number at or below
+    # that becomes the bar's actual length, so the bar always reads a tidy
+    # value ("5 km") instead of an arbitrary one ("4.37 km").
     center_lat = (south + north) / 2; target_km = (east - west) * 111.32 * max(.05, math.cos(math.radians(center_lat))) / 5
     candidates = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200]
     scale_km = max((value for value in candidates if value <= target_km), default=0.1)
@@ -155,7 +220,7 @@ def _pdf_product(bundle: dict[str, Any]) -> bytes:
     output = io.BytesIO()
     timestamp = str(metadata.get("produced_at") or "2000-01-01T00:00:00+00:00").replace("Z", "+00:00")
     try: pdf_date = dt.datetime.fromisoformat(timestamp)
-    except ValueError: pdf_date = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+    except ValueError: pdf_date = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)  # malformed timestamp - a fixed fallback beats failing the whole product
     fig.savefig(output, format="pdf", metadata={"Title": str(metadata.get("title") or "NexFiremap product"),
                 "Author": "NexFiremap", "Subject": str(metadata.get("product_type") or "incident map"),
                 "CreationDate": pdf_date, "ModDate": pdf_date})
@@ -164,6 +229,15 @@ def _pdf_product(bundle: dict[str, Any]) -> bytes:
 
 
 def _geopdf_product(bundle: dict[str, Any]) -> bytes:
+    """A geospatial PDF (readable in Avenza/GIS tools with coordinates, not
+    just a picture): rasterize features into a false-colour RGB GeoTIFF
+    (each feature gets a distinct-ish colour from a cheap deterministic hash
+    of its class index, not a real palette) and let GDAL's PDF driver carry
+    the georeferencing across into the PDF itself via ``raster_copy``.
+    Requires a GDAL build with PDF write support - raised as a clear
+    ``OperationsError`` rather than a raw rasterio exception when that
+    support is missing, since this is an installation/environment issue the
+    caller can't fix by retrying."""
     features = bundle.get("features", {}).get("features", [])
     width = height = 1024; bounds = _bounds(bundle); transform = from_bounds(*bounds, width, height)
     shapes = [(feature["geometry"], index + 1) for index, feature in enumerate(features) if feature.get("geometry")]
@@ -185,6 +259,10 @@ def _geopdf_product(bundle: dict[str, Any]) -> bytes:
 
 
 def render(bundle: dict[str, Any], fmt: str) -> tuple[bytes, str]:
+    """Dispatch to the right encoder for ``fmt`` and return ``(content,
+    media_type)``. GPX/KML share one XML-building code path below (they're
+    structurally very similar - waypoints/tracks vs. placemarks) rather than
+    two near-duplicate functions."""
     if fmt in {"json", "geojson"}:
         return json.dumps(bundle, sort_keys=True, indent=2, ensure_ascii=False).encode(), "application/geo+json" if fmt == "geojson" else "application/json"
     if fmt == "pdf": return _pdf_product(bundle), "application/pdf"
@@ -194,6 +272,9 @@ def render(bundle: dict[str, Any], fmt: str) -> tuple[bytes, str]:
     if fmt == "kmz":
         kml, _ = render(bundle, "kml"); output = io.BytesIO()
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            # Fixed date_time, not "now" - zip entries otherwise embed a
+            # timestamp that would make the same bundle produce a different
+            # KMZ (and thus a different SHA-256) on every call.
             info = zipfile.ZipInfo("doc.kml", date_time=(2000, 1, 1, 0, 0, 0)); info.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(info, kml)
         return output.getvalue(), "application/vnd.google-earth.kmz"
@@ -225,11 +306,23 @@ def render(bundle: dict[str, Any], fmt: str) -> tuple[bytes, str]:
 
 
 class ProductManager:
+    """Creates, lists and serves incident products, storing the rendered
+    bytes (not just a pointer to them) in the database so a product remains
+    retrievable byte-for-byte even if the incident's live data later
+    changes - a product is a point-in-time artifact, not a live view."""
+
     def __init__(self, db: Database, store: OperationsStore) -> None:
         self.db, self.store = db, store
 
     def create(self, incident_id: str, *, fmt: str, classification: str, product_type: str,
                snapshot_id: str | None, actor: str, title: str = "") -> dict[str, Any]:
+        """Render and persist one product. Pulls from a specific historical
+        snapshot when ``snapshot_id`` is given (so the product reflects
+        that moment even if the incident has since changed), otherwise from
+        a fresh live export. ``public_information``/``public`` are enforced
+        as a matched pair - a public-classification product always uses the
+        redacting template and nothing else, so a public export can never
+        accidentally carry an operational template's full detail."""
         if fmt not in FORMATS: raise OperationsError("unsupported product format")
         if classification not in CLASSIFICATIONS: raise OperationsError("invalid product classification")
         if product_type not in PRODUCT_TYPES: raise OperationsError("invalid product type")
@@ -265,12 +358,16 @@ class ProductManager:
         return {"id": product_id, "filename": filename, "sha256": digest, "size_bytes": len(content), **metadata}
 
     def list(self, incident_id: str) -> list[dict[str, Any]]:
+        """Product metadata only, deliberately excluding ``content_blob`` -
+        callers listing products (e.g. a picker UI) shouldn't pay to
+        transfer every stored file's bytes just to show a filename."""
         self.store.get_incident(incident_id)
         return [dict(row) for row in self.db.conn.execute(
             "SELECT id,incident_id,snapshot_id,format,classification,product_type,filename,sha256,size_bytes,created_by,created_at,metadata_json FROM incident_products WHERE incident_id=? ORDER BY created_at DESC", (incident_id,)
         ).fetchall()]
 
     def content(self, incident_id: str, product_id: str) -> tuple[str, str, bytes]:
+        """Fetch one stored product's ``(filename, media_type, bytes)`` for download."""
         row = self.db.conn.execute("SELECT filename,metadata_json,content_blob FROM incident_products WHERE id=? AND incident_id=?", (product_id, incident_id)).fetchone()
         if row is None: raise OperationsError("product not found")
         metadata = json.loads(row["metadata_json"])

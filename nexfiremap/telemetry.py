@@ -1,7 +1,20 @@
 """Provider-neutral, replay-safe incident vehicle telemetry.
 
-Raw observations are immutable. All smoothing, freshness and segment quality
-information returned by this module is derived and explicitly labelled.
+Any GPS-tracking device or app (a vehicle AVL unit, a phone app, a hand-held
+GPS) can push position reports here once it's been issued a per-source
+ingest token - the schema doesn't assume a particular vendor's field names,
+just latitude/longitude/observed_at plus optional speed/heading/accuracy.
+
+Raw observations are immutable: once a position report is accepted it is
+never edited or deleted, only ever superseded by a later report. All
+smoothing, freshness and segment quality information returned by this module
+(``tracks``' segment splitting, ``interpolate``'s linear estimate, the
+"stale"/"quality" flags) is derived and explicitly labelled as such, so a
+consumer can always tell an as-reported value from a computed one.
+
+"Replay-safe" means an ingest client can resend the same batch (after a
+dropped response, a retry, a crash) without creating duplicate reports or
+raising an error - see ``ingest``'s per-``external_id`` payload-hash check.
 """
 
 from __future__ import annotations
@@ -23,11 +36,11 @@ from .operations import NotFoundError, OperationsStore, utcnow
 
 
 class TelemetryError(ValueError):
-    pass
+    """Invalid feed configuration or a rejected ingest batch/report."""
 
 
 class TelemetryRateLimit(TelemetryError):
-    pass
+    """One feed source exceeded its configured requests-per-minute budget."""
 
 
 def _text(value: Any, limit: int) -> str:
@@ -35,6 +48,11 @@ def _text(value: Any, limit: int) -> str:
 
 
 def _time(value: Any) -> tuple[str, float]:
+    """Parse an ISO 8601 timestamp, requiring an explicit timezone (an
+    unqualified local time from a device with an unknown clock/timezone
+    would be silently wrong rather than usefully approximate) - returns
+    both the normalised ISO string (for storage/display) and the epoch
+    seconds (for arithmetic/ordering)."""
     raw = _text(value, 80)
     if not raw:
         raise TelemetryError("observed_at is required")
@@ -49,6 +67,9 @@ def _time(value: Any) -> tuple[str, float]:
 
 
 def _haversine_km(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
+    """Great-circle distance in km - used to sanity-check implausible speed
+    jumps (``tracks``) and to derive a speed estimate when a report doesn't
+    carry its own (``ingest``'s ``quality["derived_speed_kmh"]``)."""
     radius = 6371.0088
     p1, p2 = math.radians(a_lat), math.radians(b_lat)
     dp, dl = p2 - p1, math.radians(b_lon - a_lon)
@@ -57,6 +78,8 @@ def _haversine_km(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> flo
 
 
 def _bearing(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
+    """Initial compass bearing (0-360 deg) from a to b - used by
+    ``interpolate`` to report a direction of travel alongside its estimated position."""
     p1, p2, dl = math.radians(a_lat), math.radians(b_lat), math.radians(b_lon - a_lon)
     y = math.sin(dl) * math.cos(p2)
     x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
@@ -64,6 +87,11 @@ def _bearing(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
 
 
 def _row(row: Any) -> dict[str, Any]:
+    """SQLite row -> API dict: expand the ``*_json`` columns back into
+    nested objects and strip ``token_hash`` unconditionally - the ingest
+    token's hash must never reach an API response, even read-only ones,
+    since a leaked hash together with knowledge of the hashing scheme would
+    let someone impersonate the feed (see ``_token_hash``/``ingest``)."""
     item = dict(row)
     for field in ("metadata_json", "quality_json", "raw_json"):
         if field in item:
@@ -73,6 +101,10 @@ def _row(row: Any) -> dict[str, Any]:
 
 
 class TelemetryManager:
+    """CRUD for position-feed sources plus the ingest/query paths that use
+    them: ``ingest`` (device -> server, token-authenticated), ``latest``/
+    ``tracks``/``interpolate`` (server -> map UI, incident-authenticated)."""
+
     def __init__(self, store: OperationsStore, settings: Settings) -> None:
         self.store = store
         self.db = store.db
@@ -85,6 +117,10 @@ class TelemetryManager:
         return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
     def create_source(self, incident_id: str, data: dict[str, Any], actor: str) -> dict[str, Any]:
+        """Register a new position-feed source and issue its ingest token.
+        The token is returned only here (and from ``rotate_token``) - only
+        its SHA-256 is ever stored, so it can't be recovered later even by
+        an operator with database access, only rotated."""
         self.store.get_incident(incident_id)
         name = _text(data.get("name"), 200)
         if not name:
@@ -156,6 +192,8 @@ class TelemetryManager:
         return self.get_source(incident_id, source_id)
 
     def rotate_token(self, incident_id: str, source_id: str, actor: str) -> dict[str, Any]:
+        """Issue a fresh ingest token, invalidating the old one immediately
+        - for a suspected-leaked token or routine credential hygiene."""
         current = self.get_source(incident_id, source_id)
         token, now, revision = secrets.token_urlsafe(32), utcnow(), int(current["revision"]) + 1
         with self.db._write_lock:
@@ -168,6 +206,17 @@ class TelemetryManager:
         return {**self.get_source(incident_id, source_id), "ingest_token": token, "token_shown_once": True}
 
     def ingest(self, source_id: str, token: str, reports: list[dict[str, Any]]) -> dict[str, Any]:
+        """Accept a batch of position reports from one authenticated device.
+
+        Token check uses ``hmac.compare_digest`` (constant-time) rather than
+        ``==`` so comparing the hash can't leak timing information about how
+        much of it matched - standard practice for any secret comparison
+        reachable by an untrusted caller. Per-source rate limiting is a
+        sliding one-minute window kept in memory (``_request_times``), not
+        persisted - acceptable because it resets to "no history" on a
+        restart, which only ever makes the limit temporarily more permissive,
+        never less.
+        """
         source_row = self.db.conn.execute("SELECT * FROM position_feed_sources WHERE id=?", (source_id,)).fetchone()
         if source_row is None or not source_row["active"]:
             raise TelemetryError("position feed is unavailable")
@@ -231,6 +280,9 @@ class TelemetryManager:
             # Preserve the complete sender object (including provider-specific
             # fields) as evidence. Canonical values live in dedicated columns.
             raw_json = json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            # payload_sha256 is the replay-safety key: hashing the sorted-key
+            # JSON (not the raw bytes) means a semantically-identical resend
+            # with different key ordering or whitespace still hashes the same.
             prepared.append({**canonical, "observed_epoch": epoch, "raw_json": raw_json,
                              "payload_sha256": hashlib.sha256(raw_json.encode()).hexdigest()})
 
@@ -243,6 +295,15 @@ class TelemetryManager:
                         (source_id, item["external_id"]),
                     ).fetchone()
                     if existing is not None:
+                        # Same external_id seen before: if the payload hash
+                        # matches, this is a harmless resend of a batch
+                        # already accepted (client retry after a dropped
+                        # response, etc.) - count it and move on rather than
+                        # erroring. A different hash under the same
+                        # external_id means the device reused an id for a
+                        # genuinely different report, which is a real data
+                        # problem worth surfacing rather than silently
+                        # overwriting history.
                         if hmac.compare_digest(str(existing[0]), item["payload_sha256"]):
                             replayed += 1
                             continue
@@ -252,6 +313,11 @@ class TelemetryManager:
                         "WHERE source_id=? AND callsign=? ORDER BY observed_epoch DESC LIMIT 1",
                         (source_id, item["callsign"]),
                     ).fetchone()
+                    # Quality flags are derived and stored alongside the raw
+                    # report (never mutate the report itself) so a consumer
+                    # can distinguish "this is what the device sent" from
+                    # "this is what we inferred about it" - matches the
+                    # module docstring's immutability guarantee.
                     quality: dict[str, Any] = {"late": received_epoch - item["observed_epoch"] > self.settings.position_stale_seconds,
                                                "out_of_order": bool(previous and item["observed_epoch"] < previous[0]),
                                                "poor_accuracy": bool(item["accuracy_m"] is not None and item["accuracy_m"] > 100)}
@@ -274,6 +340,13 @@ class TelemetryManager:
                          json.dumps(quality, sort_keys=True, separators=(",", ":")), item["raw_json"], item["payload_sha256"]),
                     )
                     if item["resource_id"]:
+                        # The WHERE clause's own freshness check
+                        # (position_at IS NULL OR < this report's time)
+                        # matters because a batch's reports aren't
+                        # necessarily in chronological order and a resource
+                        # can be tracked by more than one feed - this update
+                        # is a no-op rather than a regression whenever a
+                        # newer position for the same resource already won.
                         self.db.conn.execute(
                             "UPDATE incident_resources SET latitude=?,longitude=?,position_at=?,updated_at=?,revision=revision+1 "
                             "WHERE id=? AND incident_id=? AND (position_at IS NULL OR position_at < ?)",
@@ -295,6 +368,9 @@ class TelemetryManager:
                 "replayed": replayed, "received_at": received_at}
 
     def latest(self, incident_id: str) -> dict[str, Any]:
+        """Most recent position per (source, callsign), as a point
+        FeatureCollection for the live map layer - one marker per tracked
+        vehicle/person, not one per historical report."""
         self.store.get_incident(incident_id)
         rows = self.db.conn.execute(
             "SELECT * FROM (SELECT r.*, ROW_NUMBER() OVER (PARTITION BY source_id,callsign ORDER BY observed_epoch DESC) AS rn "
@@ -314,6 +390,13 @@ class TelemetryManager:
 
     def tracks(self, incident_id: str, start: str | None = None, end: str | None = None,
                gap_seconds: int = 900) -> dict[str, Any]:
+        """Historical path per (source, callsign) as LineString/Point
+        features, split into separate segments wherever the trail isn't
+        trustworthy as a continuous path: a time gap bigger than
+        ``gap_seconds`` (device was off/out of coverage - joining across it
+        would draw a straight line through wherever it actually went) or an
+        implausible speed jump between consecutive reports (bad GPS fix,
+        clock skew, or a genuinely different device reusing a callsign)."""
         self.store.get_incident(incident_id)
         params: list[Any] = [incident_id]; where = ["incident_id=?"]
         if start:
@@ -356,6 +439,15 @@ class TelemetryManager:
 
     def interpolate(self, incident_id: str, at: str, *, source_id: str, callsign: str,
                     maximum_gap_seconds: int = 600) -> dict[str, Any]:
+        """Estimate where a tracked vehicle/person was at an arbitrary
+        timestamp between two real reports, by linear interpolation in
+        WGS84 degrees (adequate for the short local distances/times this is
+        used over - not a geodesic solution). Refuses to interpolate across
+        a gap bigger than ``maximum_gap_seconds`` - past that, a straight
+        line is more likely to mislead than help, matching ``tracks``'
+        segment-splitting reasoning. The result is explicitly labelled
+        ``"estimated": True`` (except at an exact-match timestamp) so a
+        caller never confuses it with a raw observation."""
         target_iso, target = _time(at)
         before = self.db.conn.execute(
             "SELECT * FROM vehicle_position_reports WHERE incident_id=? AND source_id=? AND callsign=? "

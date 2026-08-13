@@ -33,7 +33,14 @@ _BRIGHTNESS2_KEYS = ("bright_ti5", "bright_t31", "bright_t5")
 
 
 class FirmsError(RuntimeError):
-    """FIRMS returned something that is not usable CSV."""
+    """FIRMS returned something that is not usable CSV.
+
+    ``retryable`` (checked by the caller's autofetch/retry loop) defaults to
+    ``True`` here and is overridden ``False`` on the subclasses below whose
+    condition a retry can never fix (bad key, unsupported source) - so a
+    scheduler can safely back off and retry generically without needing to
+    special-case every FIRMS failure mode itself.
+    """
 
     retryable = True
 
@@ -107,6 +114,9 @@ def _normalise_time(raw: str) -> str | None:
 
 
 def _first(row: dict[str, str], keys: tuple[str, ...]) -> float | None:
+    """First numeric value found among a product's brightness-column
+    aliases (see ``_BRIGHTNESS_KEYS``/``_BRIGHTNESS2_KEYS``) - VIIRS, MODIS
+    and Landsat OLI each name the same physical quantity differently."""
     for key in keys:
         if key in row:
             value = _to_float(row[key])
@@ -116,6 +126,11 @@ def _first(row: dict[str, str], keys: tuple[str, ...]) -> float | None:
 
 
 def _normalise_row(row: dict[str, str], source: str) -> dict[str, Any] | None:
+    """One raw FIRMS CSV row -> a canonical detection dict, or ``None`` if
+    the row is missing a field this module treats as mandatory (position or
+    acquisition time) - such rows are dropped rather than stored with
+    fabricated values, since a wrong lat/lon/time is worse than a missing
+    detection."""
     lat = _to_float(row.get("latitude"))
     lon = _to_float(row.get("longitude"))
     if lat is None or lon is None:
@@ -138,7 +153,7 @@ def _normalise_row(row: dict[str, str], source: str) -> dict[str, Any] | None:
     confidence_raw = _clean(row.get("confidence"))
     confidence_pct, confidence_level = _normalise_confidence(confidence_raw)
 
-    daynight = _clean(row.get("daynight")).upper()[:1] or None
+    daynight = _clean(row.get("daynight")).upper()[:1] or None  # FIRMS sends "D"/"N" (or a full word on some products) - first letter covers both
 
     return {
         "source": source,
@@ -170,7 +185,12 @@ def _normalise_row(row: dict[str, str], source: str) -> dict[str, Any] | None:
 
 
 def _raise_for_body(text: str, source: str) -> None:
-    """FIRMS signals failure in the body, so classify it before parsing."""
+    """FIRMS signals failure in the body, so classify it before parsing.
+
+    All checks are substring matches on the response's first 600 characters
+    (FIRMS has no error code field, just a short plain-text or HTML message),
+    ordered from most to least specific so a message that happens to contain
+    several trigger words is classified by its most actionable cause first."""
     head = text[:600].lower()
 
     if "map_key" in head and "invalid" in head or "invalid mapkey" in head:
@@ -194,6 +214,12 @@ def _raise_for_body(text: str, source: str) -> None:
 
 
 class FirmsClient:
+    """Thin async wrapper around the FIRMS area CSV endpoint: builds the
+    URL, classifies HTTP-level and body-level failures into the typed
+    errors above, and normalises every row it manages to parse. Holds one
+    ``httpx.AsyncClient`` for its lifetime so connections/keep-alive are
+    reused across repeated polls rather than reconnecting each call."""
+
     def __init__(
         self,
         map_key: str,
@@ -254,6 +280,9 @@ class FirmsClient:
         reader = csv.DictReader(io.StringIO(text))
         rows: list[dict[str, Any]] = []
         for raw in reader:
+            # Header casing varies across FIRMS products/sources - normalise
+            # to lower-case here so every lookup in _normalise_row only
+            # needs to check one spelling.
             normalised = _normalise_row(
                 {(k or "").strip().lower(): v for k, v in raw.items() if k}, source
             )
@@ -281,7 +310,9 @@ class FirmsClient:
                 return {"ok": False, "error": "invalid map key"}
             return {"ok": False, "error": text[:200] or "unreadable response"}
 
-        # The endpoint nests the numbers under a per-key object.
+        # The endpoint nests the numbers under a per-key object, but has been
+        # observed to sometimes return the fields flat at the top level
+        # instead - fall back to the raw payload rather than raising KeyError.
         if isinstance(payload, dict):
             inner = payload.get(self.map_key)
             data = inner if isinstance(inner, dict) else payload

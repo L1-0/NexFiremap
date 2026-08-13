@@ -1,4 +1,20 @@
-"""Local drone-image evidence, georeferencing and deterministic mosaics."""
+"""Local drone-image evidence, georeferencing and deterministic mosaics.
+
+Handles three things for operator-flown drone imagery: (1) storing the
+original image plus a thumbnail as tactical evidence tied to a mission, (2)
+optionally georeferencing it from four operator-supplied WGS84 corner
+points into a GeoTIFF (a simple GCP warp - not photogrammetric bundle
+adjustment, see ``_write_geotiff``), and (3) combining several georeferenced
+frames into one mosaic via a deterministic "first wins" merge so overlap
+resolution never depends on filesystem iteration order.
+
+Georeferencing here is intentionally low-tech: no feature matching, no
+camera-model correction, just the four corners the operator affirms are
+correct for a nadir or already-orthorectified image. That's a real accuracy
+ceiling (documented on every mosaic/asset's metadata, not hidden), but it
+needs no internet connectivity and no photogrammetry pipeline - the
+appropriate trade-off for imagery captured and processed in the field.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +43,7 @@ from .operations import NotFoundError, OperationsStore, utcnow
 
 
 class DroneError(ValueError):
-    pass
+    """Invalid drone mission/image/mosaic input, or an unsafe/corrupt file."""
 
 
 MEDIA_TYPES = {"JPEG": "image/jpeg", "PNG": "image/png", "TIFF": "image/tiff"}
@@ -38,6 +54,8 @@ def _text(value: Any, limit: int) -> str:
 
 
 def _json_field(row: Any) -> dict[str, Any]:
+    """SQLite row -> API dict, expanding the ``*_json`` columns back into
+    nested objects (mirrors telemetry.py's ``_row`` for the same reason)."""
     item = dict(row)
     for field in ("corners_json", "footprint_json", "metadata_json", "asset_ids_json"):
         if field in item:
@@ -59,6 +77,11 @@ def _validate_time(value: Any) -> str | None:
 
 
 def _corners(value: Any) -> list[list[float]] | None:
+    """Validate operator-supplied georeferencing corners: exactly four
+    WGS84 [lon, lat] positions, ordered TL/TR/BR/BL, forming a real
+    (non-degenerate, non-self-intersecting) quadrilateral within a sane
+    size. ``None`` in, ``None`` out - georeferencing is optional; an asset
+    can be stored as plain unreferenced evidence."""
     if value in (None, ""):
         return None
     if not isinstance(value, list) or len(value) != 4:
@@ -74,6 +97,9 @@ def _corners(value: Any) -> list[list[float]] | None:
         if not (math.isfinite(lon) and math.isfinite(lat) and -180 <= lon <= 180 and -90 <= lat <= 90):
             raise DroneError("corner is outside WGS84 bounds")
         result.append([lon, lat])
+    # Shoelace formula: a near-zero signed area means the four points are
+    # (near-)collinear rather than a real quadrilateral - the corners the
+    # operator entered can't be a sane georeference in that case.
     area = sum(result[i][0] * result[(i + 1) % 4][1] - result[(i + 1) % 4][0] * result[i][1] for i in range(4)) / 2
     if abs(area) < 1e-12:
         raise DroneError("corners form a zero-area footprint")
@@ -81,6 +107,11 @@ def _corners(value: Any) -> list[list[float]] | None:
         def side(p: list[float], q: list[float], r: list[float]) -> float:
             return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
         return side(a, b, c) * side(a, b, d) < 0 and side(c, d, a) * side(c, d, b) < 0
+    # Checking the two diagonal-adjacent edge pairs for a crossing catches a
+    # "bowtie" quadrilateral - e.g. corners entered as TL/BR/TR/BL instead
+    # of the required TL/TR/BR/BL winding order, which the area check alone
+    # wouldn't reliably flag (a self-intersecting shape can still have a
+    # sizeable signed area).
     if crossed(result[0], result[1], result[2], result[3]) or crossed(result[1], result[2], result[3], result[0]):
         raise DroneError("corner order creates a self-intersecting footprint")
     if max(p[0] for p in result) - min(p[0] for p in result) > 5 or max(p[1] for p in result) - min(p[1] for p in result) > 5:
@@ -89,11 +120,22 @@ def _corners(value: Any) -> list[list[float]] | None:
 
 
 class DroneManager:
+    """Missions group imagery by flight; assets are individual images (each
+    optionally georeferenced on ingest); mosaics combine several
+    georeferenced assets into one merged raster. Georeferenced assets and
+    mosaics are stored through ``OfflineSourceManager`` so they're
+    automatically servable as map layers and included in map-pack coverage -
+    plain (unreferenced) assets are evidence files only, kept solely on
+    local disk under ``self.root``."""
+
     def __init__(self, store: OperationsStore, offline: OfflineSourceManager, settings: Settings) -> None:
         self.store, self.db, self.offline, self.settings = store, store.db, offline, settings
         self.root = settings.drone_dir.resolve()
 
     def _path(self, relative: str) -> Path:
+        """Resolve a stored-relative path under the drone evidence root,
+        rejecting anything that would escape it (defence against a crafted
+        stored path, however that path was set)."""
         path = (self.root / relative).resolve()
         if not path.is_relative_to(self.root):
             raise DroneError("invalid drone evidence path")
@@ -132,6 +174,16 @@ class DroneManager:
         ).fetchall()]
 
     def _write_geotiff(self, image: Image.Image, corners: list[list[float]], partial: Path) -> dict[str, Any]:
+        """Warp the raw image into a georeferenced GeoTIFF using the four
+        operator-supplied corners as Ground Control Points - the ``gcp-
+        warp-v1`` algorithm, deliberately the simplest thing that can
+        produce a usable overlay: no lens-distortion correction, no
+        orthorectification against a DEM, just a bilinear resample from
+        image space into the corners' WGS84 quadrilateral. A per-pixel
+        alpha (band 4) marks which output pixels actually came from source
+        image data versus fill, so the result composites cleanly over a
+        basemap without a rectangular black/white border where the source
+        image doesn't reach the raster's bounding box."""
         rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         height, width = rgb.shape[:2]
         gcps = [GroundControlPoint(row=0, col=0, x=corners[0][0], y=corners[0][1]),
@@ -158,6 +210,15 @@ class DroneManager:
 
     def ingest_image(self, incident_id: str, mission_id: str, filename: str, content: bytes,
                      data: dict[str, Any], actor: str) -> dict[str, Any]:
+        """Store one uploaded image as evidence, optionally georeferencing
+        it. Decoded twice on purpose: ``verify()`` alone (Pillow's own
+        integrity check) doesn't fully decode pixel data, so a second
+        ``Image.open`` + real decode is needed to catch a payload that
+        passes the header-level check but is malformed/hostile at the pixel
+        level (a decompression-bomb-style image, for instance - caught here
+        via ``DecompressionBombError`` and the explicit pixel-count check
+        below, run both before *and* after EXIF auto-rotation since
+        rotation can change which dimension is width vs. height)."""
         self.get_mission(incident_id, mission_id)
         if not content or len(content) > self.settings.drone_max_upload_mb * 1024 * 1024:
             raise DroneError(f"image must be between 1 byte and {self.settings.drone_max_upload_mb} MiB")
@@ -231,6 +292,14 @@ class DroneManager:
                 self.db.conn.commit()
             return self.get_asset(incident_id, mission_id, asset_id)
         except Exception:
+            # Everything above (writing the original/thumbnail files,
+            # creating an offline_sources record for a georeferenced asset)
+            # happens outside the database transaction - a SQLite rollback
+            # alone wouldn't undo any of it. On any failure past this point,
+            # manually unwind in reverse: drop the offline source record (if
+            # one was created), delete the evidence files, and remove the
+            # now-empty asset directory - so a failed ingest leaves no
+            # orphaned files behind.
             if offline_source_id:
                 self.offline.remove(offline_source_id)
             for path in (thumbnail, original):
@@ -267,6 +336,15 @@ class DroneManager:
         return path, media, filename
 
     def create_mosaic(self, incident_id: str, mission_id: str, name: str, asset_ids: list[str], actor: str) -> dict[str, Any]:
+        """Merge several already-georeferenced assets into one raster.
+        ``method="first"`` (rasterio's merge) means overlap is resolved by
+        whichever source dataset covers a pixel first in the input list -
+        deterministic because ``assets`` is built from *sorted* asset ids,
+        not upload/request order, so the same asset set always produces a
+        byte-identical mosaic regardless of how the ids were passed in.
+        This is a purely visual composite, not a photogrammetric blend
+        (no seam-line feathering, no exposure/colour matching) - documented
+        on the resulting record's ``limitations`` field."""
         self.get_mission(incident_id, mission_id)
         if not name.strip() or not 1 <= len(asset_ids) <= 500 or len(set(asset_ids)) != len(asset_ids):
             raise DroneError("mosaic requires a name and 1 to 500 unique assets")
@@ -333,7 +411,17 @@ class DroneManager:
         ).fetchall()]
 
     def sensor_manifest(self, incident_id: str) -> dict[str, Any]:
-        """Hash every external sensor file needed beside a database handover."""
+        """Hash every external sensor file needed beside a database handover.
+
+        The database only stores paths/hashes for drone assets and
+        georeferenced mosaics/rasters, not the file bytes themselves (unlike
+        e.g. incident_products) - handing off an incident package therefore
+        means copying the drone root and tile-cache offline_sources
+        directories *alongside* the database file. This manifest is the
+        checklist for doing that correctly: every external file's expected
+        path, size and SHA-256, so the receiving side can verify nothing was
+        missed or corrupted in transit, plus a reminder to rotate feed
+        tokens (a handover is also a good moment to rotate credentials)."""
         self.store.get_incident(incident_id)
         files: list[dict[str, Any]] = []
         seen_offline: set[str] = set()

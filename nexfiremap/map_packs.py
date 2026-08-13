@@ -28,7 +28,7 @@ WEB_MERCATOR_LIMIT = 85.05112878
 
 
 class MapPackError(ValueError):
-    pass
+    """Invalid map-pack request or a manifest that fails validation/verification."""
 
 
 def _now() -> str:
@@ -44,11 +44,18 @@ def _sha256(path: Path) -> str:
 
 
 def _tile_x(lon: float, zoom: int) -> int:
+    """Standard slippy-map longitude -> tile column, clamped to the valid
+    ``[0, 2^zoom - 1]`` range so a boundary longitude never yields an
+    off-grid tile index."""
     count = 1 << zoom
     return min(count - 1, max(0, int(math.floor((lon + 180.0) / 360.0 * count))))
 
 
 def _tile_y(lat: float, zoom: int) -> int:
+    """Standard slippy-map (Web Mercator) latitude -> tile row. Latitude is
+    clamped to +-85.0511 degrees first - the projection is undefined beyond
+    that (it's where the Mercator y-coordinate goes to infinity), matching
+    every other Web Mercator tile source."""
     lat = max(-WEB_MERCATOR_LIMIT, min(WEB_MERCATOR_LIMIT, lat))
     radians = math.radians(lat)
     count = 1 << zoom
@@ -58,6 +65,9 @@ def _tile_y(lat: float, zoom: int) -> int:
 
 def expected_tiles(bbox: list[float] | tuple[float, ...], min_zoom: int,
                    max_zoom: int) -> Iterator[tuple[int, int, int]]:
+    """Every (zoom, x, y) tile coordinate a full-coverage download of
+    ``bbox`` across ``[min_zoom, max_zoom]`` would need - the manifest's
+    "expected" set that "present" is checked against."""
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         raise MapPackError("bbox must contain west, south, east, north")
     try:
@@ -80,12 +90,26 @@ def expected_tiles(bbox: list[float] | tuple[float, ...], min_zoom: int,
 
 
 class MapPackManager:
+    """Builds and verifies map-pack manifests: a manifest lists exactly
+    which tiles (or, for a local raster source, the source file itself)
+    an AOI/zoom-range/layer selection needs, and whether each one is
+    currently present and unmodified. ``create`` also pins those tiles
+    against the tile cache's normal LRU eviction (see ``TileCache.
+    _pinned_paths``) so building a pack doesn't get quietly undone by
+    routine cache pruning."""
+
     def __init__(self, tiles: TileCache, offline_sources: OfflineSourceManager | None = None) -> None:
         self.tiles = tiles
         self.offline_sources = offline_sources
         self.directory = (tiles.dir / "manifests").resolve()
 
     def _layer(self, layer_id: str) -> dict[str, Any] | None:
+        """Resolve a layer id to its metadata, whichever of the two very
+        different backing stores it comes from: an online-capable layer
+        from ``TileCache`` (``BASEMAPS``/``OVERLAYS``), or a locally
+        imported ``mbtiles-<source_id>`` layer from ``OfflineSourceManager``
+        - the ``local_offline`` flag on the returned dict tells callers
+        which path produced it."""
         online = self.tiles.layer(layer_id)
         if online is not None:
             return {**online, "local_offline": False}
@@ -105,6 +129,10 @@ class MapPackManager:
                 "source_size_bytes": path.stat().st_size, "source_sha256": _sha256(path)}
 
     def _manifest_path(self, manifest_id: str) -> Path:
+        """Manifest id -> file path, rejecting anything that isn't a plain
+        32-hex-digit id (blocks path traversal via a crafted id) and
+        double-checking the resolved path still lands inside the manifest
+        directory as defence in depth."""
         if not MANIFEST_ID_RE.fullmatch(manifest_id):
             raise MapPackError("invalid map-pack manifest id")
         path = (self.directory / f"{manifest_id}.json").resolve()
@@ -114,6 +142,12 @@ class MapPackManager:
 
     def create(self, name: str, bbox: list[float], layer_ids: list[str],
                min_zoom: int, max_zoom: int) -> dict[str, Any]:
+        """Build and persist a manifest: validate the requested layers/zoom
+        range against each layer's own supported range, enumerate every
+        tile the AOI needs, check which are actually present right now
+        (three different storage backends depending on layer kind - see the
+        loop below), and write the result out atomically (temp file +
+        rename) so a crash mid-write never leaves a corrupt manifest on disk."""
         clean_name = str(name or "").strip()[:200] or "Offline AOI check"
         if not isinstance(layer_ids, list) or not layer_ids:
             raise MapPackError("at least one cached layer is required")
@@ -140,6 +174,12 @@ class MapPackManager:
                 layer.update({key: meta[key] for key in
                               ("source_id", "source_kind", "bounds", "source_size_bytes", "source_sha256")})
                 if meta.get("source_kind") == "raster":
+                    # A raster layer is served whole (see the "local_raster"
+                    # entry kind below, one entry per grid tile but all
+                    # backed by the same single file) - unlike an mbtiles
+                    # source there's no way to have partial tile coverage,
+                    # so the check here is a hard AOI-vs-raster-bounds
+                    # containment test rather than a per-tile presence check.
                     bounds = meta.get("bounds")
                     if not bounds or not (bounds[0] <= bbox[0] and bounds[1] <= bbox[1]
                                           and bounds[2] >= bbox[2] and bounds[3] >= bbox[3]):
@@ -210,6 +250,8 @@ class MapPackManager:
 
     @staticmethod
     def _summary(expected: int, present: int, total_bytes: int, modified: int) -> dict[str, Any]:
+        """Roll raw counts into the completeness stats shown in the UI -
+        shared by the overall manifest and by each per-zoom/layer breakdown row."""
         return {
             "expected": expected, "present": present, "missing": expected - present,
             "modified": modified, "bytes": total_bytes,
@@ -219,6 +261,9 @@ class MapPackManager:
 
     @classmethod
     def _breakdown(cls, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Per (zoom, layer) completeness rows, so the UI can show exactly
+        which zoom level of which layer still has gaps rather than only an
+        undifferentiated overall percentage."""
         groups: dict[tuple[int, str], list[dict[str, Any]]] = {}
         for entry in entries:
             groups.setdefault((int(entry["z"]), str(entry["layer"])), []).append(entry)
@@ -231,6 +276,9 @@ class MapPackManager:
         return rows
 
     def load(self, manifest_id: str) -> dict[str, Any]:
+        """Read one manifest back from disk, rejecting anything that isn't
+        this module's own schema (e.g. a stray/foreign JSON file that
+        somehow ended up in the manifest directory)."""
         path = self._manifest_path(manifest_id)
         if not path.is_file():
             raise FileNotFoundError(manifest_id)
@@ -243,6 +291,13 @@ class MapPackManager:
         return value
 
     def verify(self, manifest_id: str) -> dict[str, Any]:
+        """Re-check every tile a manifest recorded, after the fact - "is the
+        offline coverage this manifest promised actually still there and
+        unmodified". Handles the same three storage kinds as ``create``
+        (single-file raster, mbtiles, individual tile-cache files), hashing
+        a raster source only once per verify run (``raster_hashes``) since
+        every "tile" entry for that layer resolves to the same underlying
+        file rather than re-hashing a potentially large file once per grid cell."""
         manifest = self.load(manifest_id)
         expected = len(manifest.get("tiles", []))
         present = modified = total_bytes = 0
@@ -305,6 +360,7 @@ class MapPackManager:
         }
 
     def list(self) -> list[dict[str, Any]]:
+        """Summary rows (no per-tile detail) for every manifest, newest first."""
         if not self.directory.is_dir():
             return []
         rows = []

@@ -85,6 +85,11 @@ SEVERITY_THRESHOLDS = (0.10, 0.27, 0.66)
 
 
 def _catalog() -> pystac_client.Client:
+    """Open a STAC client with Planetary Computer's SAS-signing modifier
+    pre-attached, so every item this client returns already has its assets
+    signed and ready to open directly - callers never need to remember to
+    call ``pc.sign`` themselves except for the one-off case in
+    ``_asset_href`` below."""
     return pystac_client.Client.open(STAC_URL, modifier=pc.sign_inplace, timeout=STAC_TIMEOUT_S)
 
 
@@ -96,6 +101,10 @@ def find_best_scene(
     collection: str,
     max_cloud: float = MAX_CLOUD_PCT,
 ):
+    """Least-cloudy scene covering ``bbox`` within the given date range and
+    cloud-cover ceiling, or ``None`` if nothing qualifies. Sorting
+    server-side by cloud cover means only the single best candidate needs
+    inspecting, not the whole result set."""
     search = catalog.search(
         collections=[collection],
         bbox=list(bbox),

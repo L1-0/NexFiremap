@@ -166,6 +166,11 @@ def search_recent_products(
     products = []
     for feat in payload.get("features", []):
         props = feat.get("properties", {})
+        # The search API's "date" property is an ISO 8601 interval
+        # ("start/end") for a 10-minute product's sensing window - only the
+        # end matters here since that's what "freshness" is measured
+        # against, but a bare timestamp (no "/") is tolerated too in case a
+        # future product reports it differently.
         date_range = props.get("date", "")
         end_iso = date_range.split("/")[-1] if "/" in date_range else date_range
         try:

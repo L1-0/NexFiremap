@@ -60,6 +60,12 @@ def public_layer(layer: dict) -> dict:
 
 
 class TileCache:
+    """Fetch-through disk cache for one server's worth of basemap/overlay
+    tiles. ``get()`` is the hot path (cache hit, cache miss + fetch, or
+    stale-fallback), everything below the "upkeep" marker runs on a
+    background timer to keep the cache within its configured TTL/size
+    budget without blocking tile requests."""
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.dir = settings.tile_cache_dir
@@ -82,14 +88,18 @@ class TileCache:
         self._pin_cache: set[Path] = set()
 
     def layer(self, layer_id: str) -> dict | None:
+        """Layer metadata by id, or ``None`` for an unknown/removed layer."""
         return _ALL_LAYERS.get(layer_id)
 
     def path_for(self, layer_id: str, z: int, x: int, y: int) -> Path:
+        """On-disk path for one tile - layer/z/x/y.ext, mirroring the usual
+        XYZ tile URL structure so the cache layout is easy to inspect by hand."""
         meta = self.layer(layer_id)
         ext = meta.get("tile_ext", "png") if meta else "png"
         return self.dir / layer_id / str(z) / str(x) / f"{y}.{ext}"
 
     async def start(self) -> None:
+        """Launch the background prune loop; call once at server startup."""
         self._prune_task = asyncio.create_task(self._prune_loop(), name="tile-prune")
 
     async def stop(self) -> None:
@@ -100,6 +110,9 @@ class TileCache:
         await self._client.aclose()
 
     async def get(self, layer_id: str, z: int, x: int, y: int) -> bytes | None:
+        """Serve one tile: fresh cache hit, else fetch upstream and cache it,
+        else fall back to a stale cached copy, else give up (``None``, and
+        the caller serves ``TRANSPARENT_PNG``)."""
         meta = self.layer(layer_id)
         if meta is None:
             return None
@@ -148,6 +161,9 @@ class TileCache:
         return await asyncio.to_thread(path.read_bytes)
 
     async def _fetch(self, meta: dict, z: int, x: int, y: int) -> bytes | None:
+        """Fetch one tile from upstream; ``None`` on any network/HTTP
+        failure so the caller can fall back to a stale copy instead of the
+        request failing outright."""
         subdomains = meta.get("subdomains") or "a"
         url = (
             meta["url"]
@@ -155,7 +171,7 @@ class TileCache:
             .replace("{z}", str(z))
             .replace("{x}", str(x))
             .replace("{y}", str(y))
-            .replace("{r}", "")
+            .replace("{r}", "")  # retina-suffix placeholder some providers use ("@2x") - always blank, standard-density only
         )
         async with self._sem:
             try:
@@ -170,6 +186,9 @@ class TileCache:
 
     @staticmethod
     def _write(path: Path, data: bytes) -> None:
+        """Write-then-rename so a concurrent reader (or a crash mid-write)
+        never observes a partially-written tile file - ``replace()`` is
+        atomic on the same filesystem, an ordinary ``write_bytes`` isn't."""
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_bytes(data)
@@ -188,6 +207,11 @@ class TileCache:
                 log.exception("Tile prune error")
 
     def prune_now(self) -> dict:
+        """Run one prune pass: clear orphaned temp files, evict tiles past
+        their TTL (unless pinned by a map-pack manifest), then evict more
+        (oldest-fetched first, still skipping pinned tiles) if the cache is
+        still over its size budget. Safe to call directly (used by
+        /api/status-style manual triggers) as well as from the timer loop."""
         ttl = self.settings.tile_cache_days * 86400
         cap = self.settings.tile_cache_max_mb * 1024 * 1024
         now = time.time()
@@ -294,6 +318,7 @@ class TileCache:
         return pinned
 
     def stats(self) -> dict:
+        """Point-in-time cache size/hit-rate summary for the status endpoint."""
         total_bytes = 0
         total_files = 0
         for path in _iter_tile_files(self.dir):
