@@ -45,6 +45,11 @@ ERROR_RETRY_SECONDS = 15 * 60
 
 @dataclass(order=True)
 class FetchTask:
+    """One queued FIRMS fetch: a (source, cell, day-chunk) unit of work. Only
+    ``priority`` participates in comparison (the other fields are marked
+    ``compare=False``) so the priority queue orders purely by freshness/urgency
+    without needing every field to be orderable."""
+
     priority: int
     source: str = field(compare=False)
     cell: tuple[int, int] = field(compare=False)
@@ -53,16 +58,26 @@ class FetchTask:
 
     @property
     def key(self) -> tuple[str, int, int, str, str]:
+        """Identity used for in-flight/dedup tracking - two tasks for the same
+        source/cell/day-range are the same unit of work even if queued at
+        different priorities or attempt counts."""
         return (self.source, self.cell[0], self.cell[1], self.days[0], self.days[-1])
 
 
 def utc_today() -> date:
+    """Today's date in UTC - FIRMS day windows are UTC-relative, so every
+    "how many days back" calculation in this module anchors on this rather
+    than local server time."""
     return datetime.now(timezone.utc).date()
 
 
 def clamp_bbox(
     bbox: tuple[float, float, float, float]
 ) -> tuple[float, float, float, float]:
+    """Clamp a (west, south, east, north) bbox to valid lat/lon ranges and fix
+    an inverted south/north pair. West/east are intentionally left unswapped
+    even if west > east, since that's a legitimate antimeridian-crossing bbox
+    (handled by ``geo.split_antimeridian``), not an error to correct here."""
     west, south, east, north = bbox
     south = max(-90.0, min(90.0, south))
     north = max(-90.0, min(90.0, north))
@@ -133,6 +148,11 @@ def chunk_days(days: Sequence[str], max_span: int) -> list[list[str]]:
 
 
 class CacheManager:
+    """Owns the FIRMS fetch queue, its worker pool, and the periodic refresh/
+    purge loops. Callers ask it to ``ensure_cached`` a viewport/time window;
+    it works out what's missing against the coverage grid in ``db`` and queues
+    only that, so repeated requests for an already-covered area cost nothing."""
+
     def __init__(self, settings: Settings, db: Database) -> None:
         self.settings = settings
         self.db = db
@@ -160,6 +180,10 @@ class CacheManager:
     # ------------------------------------------------------------- lifecycle
 
     async def start(self) -> None:
+        """Spin up the fetch worker pool and the refresh/purge background
+        loops, run one purge immediately (so stale data doesn't linger from a
+        previous run until the first hourly purge fires), then optionally
+        warm the cache for a configured startup bbox/day window."""
         for index in range(self.settings.max_concurrent_fetches):
             self._workers.append(asyncio.create_task(self._worker(index), name=f"fetch-{index}"))
         self._background.append(asyncio.create_task(self._refresh_loop(), name="refresh"))
@@ -178,6 +202,9 @@ class CacheManager:
             )
 
     async def stop(self) -> None:
+        """Cancel every worker and background task and wait for them to unwind,
+        then close the HTTP client - used on app shutdown so nothing keeps a
+        connection or an event loop task alive past process exit."""
         self._stopping = True
         for task in [*self._workers, *self._background]:
             task.cancel()
@@ -187,11 +214,23 @@ class CacheManager:
     # ------------------------------------------------------------- planning
 
     def active_sources(self) -> list[str]:
+        """Configured sources minus any FIRMS has told us are unusable
+        (`disabled_sources`, set by `_run_task` on a `FirmsSourceError`)."""
         return [s for s in self.settings.sources if s not in self.disabled_sources]
 
     def _days_needing_fetch(
         self, source: str, cell: tuple[int, int], days: Sequence[str]
     ) -> list[str]:
+        """Cache-invalidation core: decide which of ``days`` still need a FIRMS
+        request for this (source, cell). A day is considered covered either by
+        its own cell's record or by a prior whole-world fetch that already
+        swept it (checking ``world`` avoids re-fetching per-cell what a
+        zoomed-out request already covered). Three triggers put a day back on
+        the "missing" list: never fetched, fetched but errored more than
+        ``ERROR_RETRY_SECONDS`` ago, or fetched ok but within the "hot" window
+        (`hot_days`) and past its short TTL - recent days keep receiving new
+        detections from ongoing satellite passes, so a stale "ok" there isn't
+        actually complete data."""
         own = self.db.coverage_state(source, cell[0], cell[1], days)
         world = (
             self.db.coverage_state(source, WORLD_CELL[0], WORLD_CELL[1], days)
@@ -294,6 +333,8 @@ class CacheManager:
 
     @property
     def pending(self) -> int:
+        """Queued-but-not-started plus currently-running fetches - the count
+        that matters to a caller deciding whether to wait for more data."""
         return self._queue.qsize() + self.active
 
     @property
@@ -301,6 +342,10 @@ class CacheManager:
         return self.pending > 0
 
     async def _worker(self, index: int) -> None:
+        """One of the fixed-size fetch worker pool: pulls tasks off the shared
+        priority queue forever until shutdown. Exceptions from a single task
+        are logged and swallowed rather than propagated, so one bad fetch
+        can't kill the worker and shrink the pool."""
         while not self._stopping:
             task = await self._queue.get()
             self.active += 1
@@ -317,12 +362,22 @@ class CacheManager:
                 self._queue.task_done()
 
     async def _requeue(self, task: FetchTask) -> None:
+        """Put a task (typically a retry or a split-up chunk) back on the
+        queue, re-marking it in-flight if it had already been discarded from
+        that set - keeps the in-flight/dedup bookkeeping consistent for tasks
+        that re-enter the queue instead of being freshly created."""
         async with self._lock:
             if task.key not in self._inflight:
                 self._inflight.add(task.key)
             self._queue.put_nowait(task)
 
     async def _run_task(self, task: FetchTask) -> None:
+        """Execute one fetch task against FIRMS and route the outcome: success
+        writes rows and marks coverage "ok"; each FIRMS error type gets its
+        own recovery strategy (see inline comments below) rather than one
+        generic retry, since "day range too wide", "rate limited", "source
+        unusable", "auth failure", and "transient error" all call for
+        different responses."""
         # Respect an active rate-limit backoff.
         wait = self.rate_limited_until - time.time()
         if wait > 0:
@@ -356,6 +411,9 @@ class CacheManager:
                 await self._mark(task, 0, "error", str(exc))
             return
         except FirmsRateLimitError as exc:
+            # Back off every worker (not just this task) for a while, then
+            # give this task a generous number of retries since a rate limit
+            # is expected to clear on its own rather than indicate bad input.
             self.rate_limited_until = time.time() + 120
             self._note_error(exc)
             if task.attempt < 5:
@@ -366,15 +424,21 @@ class CacheManager:
                 await self._mark(task, 0, "error", str(exc))
             return
         except FirmsSourceError as exc:
+            # This source itself is unusable (e.g. revoked/invalid for the
+            # configured key) - retrying the same request would just fail
+            # again, so disable it outright rather than burning retries.
             self.disabled_sources[task.source] = str(exc)
             self._note_error(exc)
             await self._mark(task, 0, "error", str(exc))
             return
         except FirmsAuthError as exc:
+            # A bad map key won't fix itself on retry either.
             self._note_error(exc)
             await self._mark(task, 0, "error", str(exc))
             return
         except FirmsError as exc:
+            # Catch-all for other/transient FIRMS errors: a couple of quick
+            # retries is enough to ride out a blip without hammering the API.
             self._note_error(exc)
             if task.attempt < 2:
                 task.attempt += 1
@@ -403,6 +467,9 @@ class CacheManager:
     async def _mark(
         self, task: FetchTask, row_count: int, status: str, note: str | None
     ) -> None:
+        """Persist the outcome of a fetch task to the coverage grid (off the
+        event loop, since this is a blocking DB write) so future
+        `_days_needing_fetch` calls see it."""
         await asyncio.to_thread(
             self.db.mark_coverage,
             task.source,
@@ -415,6 +482,9 @@ class CacheManager:
         )
 
     def _note_error(self, exc: Exception) -> None:
+        """Record the most recent fetch error for `/api/status` and the logs -
+        shared by every error branch in `_run_task` so status reporting stays
+        consistent regardless of which FIRMS error type occurred."""
         self.last_error = str(exc)
         self.last_error_at = time.time()
         log.warning("FIRMS fetch problem: %s", exc)
@@ -468,6 +538,9 @@ class CacheManager:
         return queued
 
     async def _purge_loop(self) -> None:
+        """Hourly background sweep that drops data older than the retention
+        window - keeps the DB from growing without bound on a long-running
+        instance, independent of whatever viewports happen to get requested."""
         while not self._stopping:
             try:
                 await asyncio.sleep(3600)
@@ -478,6 +551,9 @@ class CacheManager:
                 log.exception("Purge loop error")
 
     def purge_now(self) -> tuple[int, int]:
+        """Delete detections and coverage records older than `cache_days`.
+        Synchronous/blocking - callers run it via `asyncio.to_thread` (or, at
+        `start()`, before the event loop has other work competing for it)."""
         cutoff = utc_today() - timedelta(days=self.settings.cache_days)
         detections, coverage = self.db.purge_older_than(cutoff)
         if detections or coverage:
@@ -492,6 +568,8 @@ class CacheManager:
     # --------------------------------------------------------------- status
 
     def status(self) -> dict[str, Any]:
+        """Snapshot of cache-manager state for `/api/status` - a plain dict
+        rather than a dataclass since it's serialized straight to JSON."""
         return {
             "pending": self.pending,
             "active": self.active,

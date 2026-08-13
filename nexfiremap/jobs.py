@@ -108,6 +108,9 @@ class JobContext:
 
     @property
     def result_path(self) -> Path:
+        """Directory a job function should write large outputs into (rasters,
+        GeoJSON, ...). Created on first access so job code never has to
+        remember to `mkdir` before writing."""
         path = Path(self.result_dir)
         path.mkdir(parents=True, exist_ok=True)
         return path
@@ -170,6 +173,11 @@ register_kind("demo", _demo_job)
 
 
 class JobManager:
+    """Owns the process pool, the run-slot/queue-depth limits, and the submit/
+    cancel/status API that every phase module drives its background compute
+    through. One instance per running server; see the module docstring for
+    the overall design this class implements."""
+
     def __init__(self, settings: Settings, db: Database) -> None:
         self.settings = settings
         self.db = db
@@ -199,6 +207,8 @@ class JobManager:
         self._stopping = False
 
     async def start(self) -> None:
+        """Start the hourly prune loop and clean up after an unclean previous
+        shutdown."""
         self._prune_task = asyncio.create_task(self._prune_loop(), name="job-prune")
         # Anything left "running" from a previous, uncleanly-stopped process
         # can never finish - mark it failed rather than have it hang forever.
@@ -300,6 +310,10 @@ class JobManager:
         await asyncio.to_thread(old_pool.shutdown, wait=False, cancel_futures=True)
 
     def _requeue_orphans(self) -> None:
+        """Called once at `start()`: any job still marked "running" in the DB
+        must be left over from a process that died or was killed without
+        going through `stop()` - there's no worker actually executing it
+        anymore, so it can only ever be marked failed, never resumed."""
         for row in self.db.list_jobs(status="running", limit=1000):
             self.db.update_job(
                 row["id"],
@@ -311,6 +325,9 @@ class JobManager:
     # ------------------------------------------------------------- submit
 
     async def submit(self, kind: str, params: dict[str, Any]) -> int:
+        """Create a job row (status "queued") and start its tracking task.
+        Raises ``JobQueueFull`` if too many jobs are already queued/running -
+        see the queue-depth backstop in the nested ``_create`` below."""
         if kind not in KIND_REGISTRY:
             raise ValueError(f"Unknown job kind: {kind!r}")
 
@@ -362,6 +379,10 @@ class JobManager:
         return True
 
     async def _run(self, job_id: int, kind: str, params: dict[str, Any]) -> None:
+        """Task wrapper around `_run_inner`: exists solely to give cancellation
+        a single place to mark the DB row before propagating - see the inline
+        comment in the except block below for why that has to live here
+        rather than inside `_run_inner`."""
         func = KIND_REGISTRY[kind]
         ctx = JobContext(
             job_id=job_id,
@@ -392,6 +413,9 @@ class JobManager:
     async def _run_inner(
         self, job_id: int, kind: str, params: dict[str, Any], func: JobFunc, ctx: JobContext
     ) -> None:
+        """Acquire a run slot, execute the job in the process pool with a
+        timeout, and update the DB row for every possible outcome (timeout,
+        broken pool, arbitrary worker exception, or success)."""
         # Wait for one of worker_count slots rather than submitting straight
         # into the pool: the job's DB row stays "queued" (its status since
         # create_job) for as long as this genuinely has to wait its turn,
@@ -477,6 +501,7 @@ class JobManager:
     # -------------------------------------------------------------- upkeep
 
     async def _prune_loop(self) -> None:
+        """Hourly background sweep - see `_prune_now` for what it removes."""
         interval = 3600
         while not self._stopping:
             try:
@@ -488,6 +513,11 @@ class JobManager:
                 log.exception("Job prune error")
 
     def _prune_now(self) -> int:
+        """Delete job rows past `job_retention_days` and then sweep
+        `job_dir` for leftover result directories whose row is already gone
+        - a directory can outlive its row if a previous prune pass deleted
+        the row but was interrupted (crash, restart) before removing the
+        files, so this check is what catches that on the next pass."""
         removed = self.db.purge_old_jobs(self.settings.job_retention_days * 86400)
         for child in self.job_dir.iterdir():
             if not child.is_dir():
@@ -503,6 +533,7 @@ class JobManager:
     # --------------------------------------------------------------- status
 
     def status(self) -> dict[str, Any]:
+        """Snapshot of job-queue health for `/api/status`."""
         now = time.time()
         recent_replacements = sum(
             1 for t in self._pool_replacements if now - t < POOL_CHURN_WINDOW_S

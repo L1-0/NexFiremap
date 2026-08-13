@@ -12,9 +12,14 @@ from .operations import NotFoundError, OperationsStore
 
 
 class WindError(ValueError):
+    """Raised for bad wind input/params (unparsable time, out-of-range bbox or
+    grid, ...) - a ``ValueError`` subclass so callers that already catch
+    ``ValueError`` around this module keep working without special-casing."""
     pass
 
 
+# 16-point compass rose, in degrees clockwise from true north - the standard
+# METAR/synoptic textual convention observers actually write down.
 CARDINAL = {
     "N": 0.0, "NNE": 22.5, "NE": 45.0, "ENE": 67.5, "E": 90.0,
     "ESE": 112.5, "SE": 135.0, "SSE": 157.5, "S": 180.0,
@@ -23,7 +28,17 @@ CARDINAL = {
 }
 
 
+# ---- time/unit/direction parsing ----
+
+
 def _time(value: str | None, *, default: float | None = None) -> tuple[str, float]:
+    """Parse a caller-supplied ISO 8601 timestamp into ``(normalized_iso,
+    epoch_seconds)``, both in UTC. With no value given, returns "now" (or
+    ``default`` if provided) instead of raising - callers use this both to
+    validate a required field and to fill in an optional one. A timezone is
+    required on any explicit value: an incident's tactical features may be
+    entered by observers in different local time zones, so a naive timestamp
+    would be ambiguous rather than just "assume UTC"."""
     if not value:
         epoch = datetime.now(timezone.utc).timestamp() if default is None else default
         return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="seconds"), epoch
@@ -38,6 +53,14 @@ def _time(value: str | None, *, default: float | None = None) -> tuple[str, floa
 
 
 def _speed(value: Any) -> tuple[float | None, str | None]:
+    """Parse a wind speed into m/s, converting from km/h or knots if the
+    value carries an explicit unit suffix. A bare number (numeric or
+    unit-less text) is assumed to already be m/s, since that's this module's
+    internal/API convention - the returned ``assumption`` string records
+    which case applied so callers can surface it (see
+    ``unit_interpretation`` in ``_observations``) rather than silently
+    guessing wrong on a misentered field. Returns ``(None, None)`` for
+    anything unparsable."""
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return float(value), "numeric_assumed_m_s"
     raw = str(value or "").strip().lower().replace(",", ".")
@@ -45,12 +68,16 @@ def _speed(value: Any) -> tuple[float | None, str | None]:
     if not match:
         return None, None
     number, unit = float(match.group(1)), match.group(2)
-    if unit in {"km/h", "kmh"}: number /= 3.6
-    elif unit in {"kt", "kts", "knot", "knots"}: number *= 0.514444
+    if unit in {"km/h", "kmh"}: number /= 3.6  # km/h -> m/s
+    elif unit in {"kt", "kts", "knot", "knots"}: number *= 0.514444  # kt -> m/s
     return number, "explicit_unit" if unit else "text_assumed_m_s"
 
 
 def _direction(value: Any) -> float | None:
+    """Parse a wind-FROM direction into degrees clockwise from true north,
+    normalized to [0, 360). Accepts a raw number, a 16-point compass label
+    (``CARDINAL``), or a numeric string with an optional "deg"/"°" suffix.
+    Returns ``None`` if none of those match."""
     if isinstance(value, (int, float)) and math.isfinite(float(value)):
         return float(value) % 360
     raw = str(value or "").strip().upper().replace("°", "").replace("DEG", "").strip()
@@ -63,13 +90,22 @@ def _direction(value: Any) -> float | None:
         return None
 
 
+# ---- vector math ----
+
+
 def components(speed_ms: float, wind_from_deg: float) -> tuple[float, float]:
     """Meteorological FROM bearing to east/north motion components."""
     radians = math.radians(wind_from_deg)
+    # Meteorological convention gives the direction wind blows FROM, but a
+    # motion vector needs where the air is actually moving TO - hence the
+    # negation on both components (wind from the north moves air southward).
     return -speed_ms * math.sin(radians), -speed_ms * math.cos(radians)
 
 
 def meteorological(u_east_ms: float, v_north_ms: float) -> tuple[float, float]:
+    """Inverse of ``components``: east/north motion vector -> (speed,
+    wind-FROM bearing in degrees). Returns ``(0.0, 0.0)`` for a
+    near-zero vector rather than an undefined/noisy ``atan2`` direction."""
     speed = math.hypot(u_east_ms, v_north_ms)
     if speed < 1e-12:
         return 0.0, 0.0
@@ -77,6 +113,9 @@ def meteorological(u_east_ms: float, v_north_ms: float) -> tuple[float, float]:
 
 
 def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in km via the haversine formula (Earth mean
+    radius 6371.0088 km) - close enough for weighting nearby observations at
+    incident scale, no need for an ellipsoidal geodesic here."""
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp, dl = p2 - p1, math.radians(lon2 - lon1)
     term = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
@@ -86,6 +125,22 @@ def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 def interpolate_vectors(samples: list[dict[str, Any]], lat: float, lon: float,
                         target_epoch: float, half_life_hours: float,
                         background: tuple[float, float] | None = None) -> dict[str, Any]:
+    """Estimate the wind vector at one (lat, lon, time) point from nearby
+    observations, an optional AOI-wide model ``background`` vector, or both.
+
+    With no observations, the point simply gets the background vector
+    verbatim (``support_count`` 0 signals that to callers). With
+    observations, this is inverse-distance-weighted (IDW) in space and
+    exponentially time-decayed (half-life ``half_life_hours``) - the ``+
+    0.01`` in the spatial weight keeps a sample essentially on top of the
+    query point from producing a division blow-up, and the small floor on
+    ``half_life_hours`` guards the same for a caller-supplied window near
+    zero. When a background is present, observations are blended as
+    *residuals* from it (``u - background[0]``, etc.) and the background is
+    added back in afterward - this lets a handful of local observations
+    nudge a broader model field rather than have to fully override it once
+    they're distant/old and their weight decays away.
+    """
     if not samples and background is None:
         raise WindError("no wind input is available")
     if not samples:
@@ -105,6 +160,9 @@ def interpolate_vectors(samples: list[dict[str, Any]], lat: float, lon: float,
     total = sum(row[0] for row in weighted)
     mean_u = sum(w * u for w, u, _v, _d in weighted) / total
     mean_v = sum(w * v for w, _u, v, _d in weighted) / total
+    # Weighted spread of the vector components around their mean - a rough
+    # "how much do nearby observations disagree" signal surfaced to callers
+    # as vector_disagreement_ms, not a formal confidence interval.
     disagreement = math.sqrt(sum(w * ((u - mean_u) ** 2 + (v - mean_v) ** 2)
                                      for w, u, v, _d in weighted) / total)
     if background is not None:
@@ -117,10 +175,28 @@ def interpolate_vectors(samples: list[dict[str, Any]], lat: float, lon: float,
 
 
 class WindManager:
+    """Derives an incident's wind field entirely from data already retained
+    for it - tactical wind observations/weather-station features and any
+    attached model run's recorded weather provenance - never a live external
+    forecast fetch. See ``field()`` for the entry point and the module
+    docstring for the overall offline-derivation intent."""
+
     def __init__(self, store: OperationsStore) -> None:
         self.store, self.db = store, store.db
 
+    # ---- data loading ----
+
     def _observations(self, incident_id: str, target_epoch: float, window_hours: float) -> tuple[list[dict[str, Any]], int, int]:
+        """Load and validate wind observations for an incident within
+        ``window_hours`` before ``target_epoch``, returning
+        ``(accepted, rejected_count, omitted_count)``. Rejects rows with an
+        unparsable time, malformed geometry, or a speed/direction that fails
+        to parse or falls outside a plausible 0-150 m/s range - bad input
+        from a hand-entered tactical feature shouldn't corrupt the whole
+        field, so it's dropped and counted rather than raising. Sorted
+        newest-first and capped at 500 rows as a processing bound; anything
+        past that is reported via ``omitted_count`` rather than silently
+        dropped."""
         rows = self.db.conn.execute(
             "SELECT * FROM tactical_features WHERE incident_id=? AND feature_type IN ('wind_observation','weather_station') "
             "AND deleted_at IS NULL ORDER BY observed_at,id", (incident_id,)
@@ -159,6 +235,14 @@ class WindManager:
         return accepted[:500], rejected, omitted
 
     def _background(self, incident_id: str, target_epoch: float, scenario_id: str | None) -> dict[str, Any] | None:
+        """Find the most recent attached model run (optionally restricted to
+        ``scenario_id``) whose recorded weather provenance is valid at or
+        before ``target_epoch``, and return its wind as a background vector
+        for ``field()`` to blend local observations against. A run whose
+        ``reference_at`` is in the future relative to ``target_epoch`` is
+        excluded outright (not just penalized) - it can't describe the
+        requested moment. Among eligible runs, the most recent one wins.
+        Returns ``None`` if no attached run has usable weather provenance."""
         sql = "SELECT * FROM incident_model_runs WHERE incident_id=?"
         params: list[Any] = [incident_id]
         if scenario_id:
@@ -185,8 +269,20 @@ class WindManager:
                 "sources": provenance.get("sources", []), "warnings": provenance.get("warnings", []),
                 "limitations": provenance.get("limitations", "")}
 
+    # ---- public entry point ----
+
     def field(self, incident_id: str, bbox: tuple[float, float, float, float], *, at: str | None,
               window_hours: float, grid: int, scenario_id: str | None = None) -> dict[str, Any]:
+        """Build a gridded wind-vector field over ``bbox`` at time ``at``
+        (default now) for the map to render, plus the raw observation points
+        and background model vector it was derived from. ``grid`` is the
+        number of cells per side (bounded 2-30) and ``window_hours`` how far
+        back observations may be drawn from (bounded 0.25-72h) - both capped
+        to keep a single request's interpolation work and result size
+        bounded regardless of what a client asks for. Picks a `method` label
+        from whichever inputs are actually available (observations, model
+        background, or both) so the response is honest about how each vector
+        was derived rather than presenting every case identically."""
         incident = self.store.get_incident(incident_id)
         west, south, east, north = bbox
         if not (-180 <= west < east <= 180 and -90 <= south < north <= 90):
@@ -206,6 +302,9 @@ class WindManager:
         method = ("background_plus_observation_residual_idw" if background and observations else
                   "uniform_model_background" if background else
                   "uniform_single_observation" if len(observations) == 1 else "observation_idw")
+        # Half the observation window: recent-enough samples still carry
+        # meaningful weight by the time they reach the edge of the window
+        # rather than being decayed to near-zero right as they'd be excluded.
         half_life = max(.25, window_hours / 2)
         features = []
         for row_index in range(grid):

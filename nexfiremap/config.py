@@ -74,17 +74,23 @@ def _load_dotenv(path: Path) -> None:
 
 
 def _env_str(name: str, default: str) -> str:
+    """Read a string env var, falling back to ``default`` when unset or blank."""
     value = os.environ.get(name, "").strip()
     return value or default
 
 
 def _env_bool(name: str, default: bool) -> bool:
+    """Read a boolean-ish env var (``1``/``true``/``yes``/``on``, case-insensitive);
+    anything else, including an unset/blank var, falls back to ``default``."""
     value = os.environ.get(name, "").strip().lower()
     if not value: return default
     return value in {"1", "true", "yes", "on"}
 
 
 def _env_int(name: str, default: int, *, low: int, high: int) -> int:
+    """Read an int env var and clamp it into ``[low, high]``. A missing or
+    unparsable value silently falls back to ``default`` rather than raising -
+    a malformed .env entry should degrade to a sane setting, not crash startup."""
     try:
         value = int(os.environ.get(name, "").strip())
     except (TypeError, ValueError):
@@ -93,6 +99,7 @@ def _env_int(name: str, default: int, *, low: int, high: int) -> int:
 
 
 def _env_float(name: str, default: float, *, low: float, high: float) -> float:
+    """Float counterpart of ``_env_int`` - same clamp-and-fall-back-silently behaviour."""
     try:
         value = float(os.environ.get(name, "").strip())
     except (TypeError, ValueError):
@@ -101,6 +108,10 @@ def _env_float(name: str, default: float, *, low: float, high: float) -> float:
 
 
 def _env_list(name: str, default: list[str]) -> list[str]:
+    """Read a comma-separated list of FIRMS source keys, uppercased and filtered
+    against ``SOURCES``. Falls back to ``default`` if the var is unset or every
+    listed item turns out to be unknown - guards against a typo silently leaving
+    the app with zero data sources."""
     raw = os.environ.get(name, "").strip()
     if not raw:
         return list(default)
@@ -110,6 +121,12 @@ def _env_list(name: str, default: list[str]) -> list[str]:
 
 @dataclass(frozen=True)
 class Settings:
+    """Immutable, process-wide snapshot of all runtime configuration, built once
+    by `load_settings()` at startup. Frozen so that nothing downstream can
+    mutate a live setting out from under another part of the app - anything
+    that needs to change behaviour at runtime does so by constructing a new
+    `Settings` (e.g. in tests), not by patching an attribute in place."""
+
     map_key: str
     host: str
     port: int
@@ -194,8 +211,17 @@ class Settings:
     drone_max_pixels: int = 200_000_000
     drone_mosaic_max_pixels: int = 100_000_000
 
+    # --- LAN access / authentication --------------------------------------
     # Loopback remains frictionless single-user mode. LAN exposure is an
     # explicit fail-closed mode requiring a local administrator credential.
+    # These four fields are the safety gate: `lan_mode` is what actually
+    # flips the server from binding loopback-only to binding the configured
+    # `host` (see load_settings()/wherever the server is started), and it is
+    # meant to be paired with a real `admin_password` plus a bounded
+    # `session_minutes` so a LAN-exposed instance still requires auth and
+    # expires idle sessions rather than staying open indefinitely. The TLS
+    # file paths are optional but recommended alongside `lan_mode`, since
+    # credentials would otherwise cross the LAN in plaintext.
     lan_mode: bool = False
     admin_password: str = ""
     session_minutes: int = 30
@@ -211,10 +237,16 @@ class Settings:
 
     @property
     def has_map_key(self) -> bool:
+        """Whether a FIRMS map key was configured - callers use this to decide
+        whether FIRMS-backed features can run at all instead of letting every
+        fetch attempt fail with an auth error."""
         return bool(self.map_key)
 
     @property
     def has_eumetsat_key(self) -> bool:
+        """Whether both EUMETSAT consumer credentials are present. Both halves
+        are required to request an access token, so a partially-configured key
+        pair is treated as "not configured" rather than attempted and failed."""
         return bool(self.eumetsat_consumer_key and self.eumetsat_consumer_secret)
 
     @property
@@ -227,6 +259,10 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    """Build the single `Settings` instance for this process: seed `os.environ`
+    from `.env` (without clobbering real env vars), then read/validate/clamp
+    every individual setting via the `_env_*` helpers above. Called once at
+    startup - the result is meant to be passed around, not re-loaded."""
     _load_dotenv(ROOT_DIR / ".env")
 
     cache_days = _env_int("NEXFIREMAP_CACHE_DAYS", 30, low=1, high=60)
@@ -242,6 +278,8 @@ def load_settings() -> Settings:
             west, south, east, north = (float(p) for p in raw_bbox.split(","))
             startup_bbox = (west, south, east, north)
         except ValueError:
+            # Malformed bbox string - fall back to "no startup bbox" rather
+            # than failing app startup over a bad env var.
             startup_bbox = None
 
     return Settings(

@@ -192,6 +192,30 @@ def main() -> None:
             time.sleep(.5); cdp.evaluate("document.querySelector('#btn-approve-scenario').click()")
             cdp.wait("document.querySelector('#ops-scenario-status')?.value==='approved'")
 
+            # wireControls() wires every operations-panel control exactly
+            # once, in init(). A regression here (e.g. init() accidentally
+            # calling it twice, as it did until this test was added - see
+            # nexfiremap/static/js/operations.js) would double-register
+            # every listener in the panel and silently double-fire every
+            # click/change/keydown handler: duplicate saves, doubled
+            # revision bumps, double undo/redo on Ctrl+Z. Check structurally
+            # via the DevTools listener inspector rather than relying on a
+            # visible symptom, since most double-fired handlers are
+            # otherwise hard to notice (idempotent GETs, fire-and-forget
+            # writes). Checked here, after the reload above has re-run
+            # init() end-to-end and every awaited step in it has resolved,
+            # so this can't race init() the way checking right after page
+            # load would. `includeCommandLineAPI` is required for
+            # getEventListeners to exist in this evaluation context.
+            listeners = cdp.call("Runtime.evaluate", {
+                "expression": "getEventListeners(document.querySelector('#btn-new-incident')).click.length",
+                "includeCommandLineAPI": True, "returnByValue": True,
+            })["result"]["value"]
+            assert listeners == 1, (
+                f"#btn-new-incident has {listeners} click listener(s), expected 1 - "
+                "wireControls() is being called more than once during init()"
+            )
+
             stop(server); server = None
             cdp.wait("document.querySelector('#ops-connectivity')?.textContent.includes('disconnected')", 25)
             server = start_server(root, app_port)

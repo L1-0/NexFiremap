@@ -612,6 +612,10 @@ _DETECTION_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("raw_json", "TEXT"),
 )
 
+# Bumped whenever SCHEMA/`_DETECTION_MIGRATIONS` gain something an existing
+# database file won't already have. `_init_schema` compares this against the
+# file's own `PRAGMA user_version` to decide whether a pre-migration backup
+# is warranted before applying the (idempotent) SCHEMA script.
 SCHEMA_VERSION = 4
 
 
@@ -619,7 +623,15 @@ class Database:
     """Thin sqlite3 wrapper with a connection per thread."""
 
     def __init__(self, path: Path) -> None:
+        """Open (creating if needed) the sqlite file at ``path`` and bring its
+        schema up to date. Cheap to call more than once per process - each
+        thread that touches this object lazily gets its own connection via
+        the ``conn`` property below rather than sharing one across threads."""
         self.path = path
+        # Recorded before the file is touched below: `_init_schema` needs to
+        # know whether this is a brand-new database (nothing to migrate, no
+        # backup needed) or a pre-existing one that might be on an older
+        # schema version.
         self._database_existed = path.is_file() and path.stat().st_size > 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
@@ -641,6 +653,10 @@ class Database:
 
     @property
     def conn(self) -> sqlite3.Connection:
+        """The calling thread's own sqlite3 connection, creating it on first
+        use. sqlite3 connections aren't safe to share across threads for
+        concurrent use, so each pool/worker thread gets a private one instead
+        of contending on a single shared connection."""
         # Fast path: this thread already has a connection, no lock needed -
         # threading.local() itself keeps that read race-free per thread.
         conn = getattr(self._local, "conn", None)
@@ -665,9 +681,18 @@ class Database:
         return conn
 
     def _init_schema(self) -> None:
+        """Create any missing tables/indexes and apply column-level
+        migrations, backing up the file first if it's an older, pre-existing
+        database. Safe to run on every startup: `CREATE TABLE IF NOT EXISTS`
+        and the `_DETECTION_MIGRATIONS` existence check both make this
+        idempotent, so a database already on the current schema just gets a
+        cheap no-op pass."""
         with self._write_lock:
             current = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
             if current > SCHEMA_VERSION:
+                # A newer file opened by older code would otherwise be
+                # silently "migrated" backwards by the executescript below -
+                # refuse instead of risking data loss from a downgrade.
                 raise RuntimeError(
                     f"database schema {current} is newer than supported schema {SCHEMA_VERSION}"
                 )
@@ -697,6 +722,9 @@ class Database:
             self.conn.commit()
 
     def close(self) -> None:
+        """Close every connection this Database has ever handed out (across
+        all threads) and mark it closed so `conn` refuses to hand out new
+        ones afterwards."""
         with self._registry_lock:
             self._closed = True
             for conn in self._connections:
@@ -756,6 +784,11 @@ class Database:
         daynight: str | None = None,
         limit: int = 20000,
     ) -> list[sqlite3.Row]:
+        """Detections matching every supplied filter (all optional and
+        AND-ed together), newest first, capped at ``limit`` rows for the
+        map/table views. Builds the WHERE clause piece by piece so that an
+        omitted filter costs nothing rather than turning into an always-true
+        condition."""
         where: list[str] = []
         params: list[Any] = []
 
@@ -770,6 +803,8 @@ class Database:
             west, south, east, north = bbox
             where.append("latitude BETWEEN ? AND ?")
             params.extend([south, north])
+            # Longitude needs its own helper (rather than a plain BETWEEN)
+            # because a bbox can straddle the antimeridian, where west > east.
             lon_clause, lon_params = lon_range_sql("longitude", west, east)
             where.append(lon_clause)
             params.extend(lon_params)
@@ -807,6 +842,10 @@ class Database:
         end_ts: int | None = None,
         sources: Sequence[str] | None = None,
     ) -> list[sqlite3.Row]:
+        """Per-day detection counts and summed FRP for the same filters as
+        ``query_detections``, used to draw the activity histogram - grouping
+        in SQL instead of pulling every row into Python keeps that cheap even
+        for a long time range."""
         where: list[str] = []
         params: list[Any] = []
         if start_ts is not None:
@@ -839,6 +878,11 @@ class Database:
     def coverage_state(
         self, source: str, cell_x: int, cell_y: int, days: Iterable[str]
     ) -> dict[str, sqlite3.Row]:
+        """Known coverage rows for one (source, cell) across ``days``, keyed
+        by day. cache.py's planner calls this before enqueueing a fetch, so a
+        day missing from the returned dict (never fetched) or with
+        ``status`` other than ``'ok'`` (errored last time) is what tells it a
+        gap still needs filling."""
         day_list = list(days)
         if not day_list:
             return {}
@@ -861,6 +905,11 @@ class Database:
         status: str = "ok",
         note: str | None = None,
     ) -> None:
+        """Record that (source, cell) was fetched for each of ``days``,
+        overwriting any prior attempt for that day rather than accumulating -
+        a re-fetch (e.g. a hot-day refresh, or a retry after an earlier
+        error) fully supersedes what came before, so the old row_count/
+        status/note would just be stale noise if kept."""
         if not days:
             return
         now = int(time.time())
@@ -1004,10 +1053,16 @@ class Database:
         return max(det, 0), max(cov, 0)
 
     def vacuum(self) -> None:
+        """Reclaim space left by purged rows by rewriting the whole file.
+        Exclusive and can take a while on a large database, so callers only
+        run this from an explicit maintenance action, never on a hot path."""
         with self._write_lock:
             self.conn.execute("VACUUM")
 
     def stats(self) -> dict[str, Any]:
+        """Summary counters for the admin/status view: total detections and
+        their date range, a per-source breakdown, how many coverage cells
+        have been recorded, and on-disk file size."""
         row = self.conn.execute(
             "SELECT COUNT(*) AS total, MIN(acq_date) AS first_day, "
             "MAX(acq_date) AS last_day FROM detections"
@@ -1033,10 +1088,13 @@ class Database:
     # ------------------------------------------------------------------ meta
 
     def get_meta(self, key: str) -> str | None:
+        """A single string value from the small ``meta`` key/value table used
+        for miscellaneous process-wide bookkeeping, or None if unset."""
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else None
 
     def set_meta(self, key: str, value: str) -> None:
+        """Set (or overwrite) a ``meta`` key/value pair."""
         with self._write_lock:
             self.conn.execute(
                 "INSERT INTO meta (key, value) VALUES (?, ?) "
@@ -1048,6 +1106,10 @@ class Database:
     # -------------------------------------------------------------------- tle
 
     def get_tle(self, satellite: str, max_age_seconds: int) -> sqlite3.Row | None:
+        """The cached TLE for ``satellite`` if one exists and is still fresh
+        enough to trust, else None so the caller knows to re-fetch. Orbital
+        elements drift in accuracy over time, so a stale row is treated the
+        same as no row at all rather than being handed back anyway."""
         row = self.conn.execute(
             "SELECT * FROM tle WHERE satellite = ?", (satellite,)
         ).fetchone()
@@ -1058,6 +1120,8 @@ class Database:
         return row
 
     def set_tle(self, satellite: str, line1: str, line2: str) -> None:
+        """Cache a freshly-fetched TLE, replacing whatever was stored for
+        that satellite before."""
         with self._write_lock:
             self.conn.execute(
                 "INSERT INTO tle (satellite, line1, line2, fetched_at) VALUES (?, ?, ?, ?) "
@@ -1070,6 +1134,9 @@ class Database:
     # ---------------------------------------------------------- swath coverage
 
     def swath_computed(self, satellite: str, day: str) -> bool:
+        """Whether any swath cell has been recorded for (satellite, day) -
+        a cheap existence check for callers that don't need the timestamp
+        `swath_computed_at` returns."""
         row = self.conn.execute(
             "SELECT 1 FROM swath_coverage WHERE satellite = ? AND day = ? LIMIT 1",
             (satellite, day),
@@ -1093,7 +1160,12 @@ class Database:
         day: str,
         cells: dict[tuple[int, int], tuple[int, int, int]],
     ) -> None:
-        """``cells`` maps (cell_x, cell_y) -> (pass_count, first_ts, last_ts)."""
+        """Record a satellite's computed swath footprint for one day.
+        ``cells`` maps (cell_x, cell_y) -> (pass_count, first_ts, last_ts).
+        Each call replaces the whole (satellite, cell, day) row rather than
+        merging - the caller (orbits.py) recomputes pass counts/timing from
+        the full set of orbit passes each time, so the incoming value is
+        already the complete, authoritative one for that key."""
         if not cells:
             return
         now = int(time.time())
@@ -1123,6 +1195,12 @@ class Database:
         first_ts/last_ts across satellites so *how recently* is what the UI
         actually shows."""
         west, south, east, north = bbox
+        # Same cell-indexing scheme as cache.py's cells_for_bbox: shifting by
+        # +180/+90 before dividing turns lon/lat into non-negative grid
+        # coordinates, so cell (0, 0) is the SW corner of the world. The
+        # tiny epsilon on the upper edge keeps a bbox edge that lands exactly
+        # on a cell boundary from spilling into one extra cell to the
+        # east/north.
         x0 = int(math.floor((west + 180.0) / cell_size))
         x1 = int(math.floor((east + 180.0 - 1e-9) / cell_size))
         y0 = int(math.floor((south + 90.0) / cell_size))
@@ -1142,6 +1220,8 @@ class Database:
         bbox: tuple[float, float, float, float] | None = None,
         limit: int = 100,
     ) -> list[sqlite3.Row]:
+        """Fire events (see events.py), most recently active first, optionally
+        limited to those whose bbox overlaps ``bbox``."""
         where: list[str] = []
         params: list[Any] = []
         if bbox is not None:
@@ -1157,9 +1237,12 @@ class Database:
         ).fetchall()
 
     def get_event(self, event_id: int) -> sqlite3.Row | None:
+        """A single event's summary row, or None if no such event exists."""
         return self.conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
 
     def event_detections(self, event_id: int) -> list[sqlite3.Row]:
+        """Every detection belonging to an event, oldest first, joined
+        through `event_members` back to their full `detections` rows."""
         return self.conn.execute(
             "SELECT d.* FROM detections d "
             "JOIN event_members m ON m.detection_id = d.id "
@@ -1213,6 +1296,10 @@ class Database:
         return self.conn.execute(sql, params).fetchall()
 
     def eumetsat_latest_product_end_ts(self) -> float | None:
+        """Acquisition-window end of the most recently ingested EUMETSAT
+        product, or None if none have been ingested yet - the autofetch job
+        uses this as its high-water mark so it only asks the Data Store for
+        products newer than what's already cached."""
         row = self.conn.execute("SELECT MAX(end_ts) FROM eumetsat_products").fetchone()
         return float(row[0]) if row and row[0] is not None else None
 
@@ -1225,6 +1312,10 @@ class Database:
     # jobs.py instead, which open their own short-lived connection.
 
     def create_job(self, kind: str, params: dict[str, Any]) -> int:
+        """Enqueue a background job (``queued`` status) and return its id.
+        ``params`` is stored as JSON so job kinds can carry arbitrary
+        argument shapes without schema changes; a worker process picks the
+        row up and updates it via the standalone helpers in jobs.py."""
         with self._write_lock:
             cur = self.conn.execute(
                 "INSERT INTO jobs (kind, params_json, status, created_at) "
@@ -1235,11 +1326,16 @@ class Database:
             return int(cur.lastrowid)
 
     def get_job(self, job_id: int) -> sqlite3.Row | None:
+        """A single job's current row (status/progress/result/error), or
+        None if no such job exists. Polled by the API to report progress
+        back to the client."""
         return self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
 
     def list_jobs(
         self, *, status: str | None = None, kind: str | None = None, limit: int = 100
     ) -> list[sqlite3.Row]:
+        """Jobs newest-first, optionally filtered by status and/or kind, for
+        the jobs list view."""
         where: list[str] = []
         params: list[Any] = []
         if status:
@@ -1255,6 +1351,11 @@ class Database:
         ).fetchall()
 
     def update_job(self, job_id: int, **fields: Any) -> None:
+        """Patch arbitrary columns on a job row, e.g.
+        ``update_job(id, status="done", progress=100)``. The column names
+        themselves are interpolated directly into the SQL (only the values
+        are parameterised), which is only safe because every caller is
+        trusted code passing hardcoded keyword names, never user input."""
         if not fields:
             return
         set_clause = ", ".join(f"{key} = ?" for key in fields)

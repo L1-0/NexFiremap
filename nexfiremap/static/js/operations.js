@@ -19,11 +19,24 @@
     featureLayer: null, resourceLayer: null, vehicleLayer: null, vehicleTrackLayer: null,
     windLayer: null, windObservationLayer: null,
     sketchLayer: null, progressionLayer: null,
+    // Mutually exclusive: at most one of these is ever non-null at a time.
+    // `drawing` means "collecting vertices for a brand-new geometry" (see
+    // startDraw()); `editingFeatureId` means "editing an existing saved
+    // feature's record fields" (see editFeature()). Both startDraw() and
+    // editFeature() call cancelDraw()/cancelEdit() on entry precisely to
+    // preserve that exclusivity - see the drawing/sketch state machine
+    // section below, and persistSketchDraft()'s crash-recovery use of it.
     drawing: null, editingFeatureId: null,
     latestPackId: null, latestBackupName: null, pendingFieldImport: null, pendingMerge: null,
     droneMissions: [], droneAssets: [],
     auth: { enabled: false, username: "local operator", role: "administrator", csrf: "" },
   };
+  // localStorage key for the in-progress-sketch/edit crash-recovery draft
+  // (see persistSketchDraft()/restoreSketchDraft() below). Contract: the key
+  // holds at most one draft, written on every edit and removed the moment
+  // that edit either lands successfully or is deliberately cancelled - so
+  // its mere presence at startup means the browser closed (crash, power
+  // loss, accidental tab close) while something was genuinely unsaved.
   const SKETCH_DRAFT_KEY = "nexfiremap.unsavedSketch.v1";
 
   const PLAN_TYPES = new Set([
@@ -55,10 +68,17 @@
     resource_position: "Resource position report",
   };
 
+  // ------------------------------------------------------ request helpers
+
   function operator() {
     return $("#ops-operator").value.trim() || "local operator";
   }
 
+  /** Thin fetch() wrapper shared by every API call in this file: attaches
+   * the operator identity + CSRF header, JSON-encodes a non-string body,
+   * and turns a non-2xx response into a thrown Error carrying `.status`/
+   * `.payload` (so callers can e.g. special-case 409 revision conflicts -
+   * see handleRecordError() below). */
   async function api(url, options = {}) {
     const headers = { "X-Operator": operator(), ...(options.headers || {}) };
     if (state.auth.csrf && !["GET", "HEAD", "OPTIONS"].includes((options.method || "GET").toUpperCase())) {
@@ -80,6 +100,8 @@
     return payload;
   }
 
+  // -------------------------------------------------- authentication & accounts
+
   function applyIdentity(payload) {
     state.auth = payload;
     $("#auth-identity").hidden = !payload.enabled;
@@ -91,6 +113,20 @@
     $("#ops-account-admin").hidden = !payload.enabled || payload.role !== "administrator";
   }
 
+  /** Establishes the operator's session before anything else in the app can
+   * safely run, blocking on a real login if there isn't one yet.
+   *
+   * A plain session check (GET /api/auth/session) either succeeds - nothing
+   * more to do - or, on a 401, opens the login `<dialog>` and *awaits a
+   * Promise that only resolves once the dialog's submit handler has
+   * actually logged the operator in*. That Promise never rejects on a bad
+   * password: the submit handler catches the login failure itself, shows
+   * `#auth-error`, and leaves the Promise pending so the operator can just
+   * retry in place, as many times as it takes - only a *successful* login
+   * calls resolve() and closes the dialog. init() below `await`s this
+   * function before touching any incident data specifically so that no
+   * authenticated-only API call can ever fire with no session behind it;
+   * the whole app is otherwise inert until a real identity exists. */
   async function ensureAuth() {
     const response = await fetch("/api/auth/session", { cache: "no-store" });
     if (response.ok) {
@@ -147,6 +183,8 @@
     await loadAccounts(); $("#ops-account-status").textContent = `${username} created with ${role} role.`;
   }
 
+  // ------------------------------------------------------- public session
+
   async function showPublicProducts() {
     $(".operations-block").hidden = true; $("#public-products-view").hidden = false;
     // The app switcher (app.js) offers NexIncidentCommand/NexIngest/
@@ -166,6 +204,8 @@
     });
     if (!products.length) list.textContent = "No public-information product has been released.";
   }
+
+  // ------------------------------- incident / period / scenario selection
 
   function setStatus(text, error = false) {
     const el = $("#ops-status");
@@ -200,6 +240,13 @@
     else await selectIncident("");
   }
 
+  /** Switches the active incident (or clears it for id=""), tearing down
+   * every per-incident map layer/draft/telemetry state first so nothing
+   * from the previous incident bleeds into the new one, then reloads the
+   * whole workspace and its dependent panels from the server. `discardDraft:
+   * false` on cancelDraw() here is deliberate: switching incidents is not a
+   * deliberate cancel of an in-progress sketch, so any localStorage draft
+   * for a *different* incident is left alone rather than deleted. */
   async function selectIncident(id) {
     cancelDraw({ discardDraft: false });
     state.progressionLayer?.clearLayers(); state.vehicleLayer?.clearLayers();
@@ -268,6 +315,12 @@
     $("#ops-copy-scenario-name").value = `${scenario?.name || "Plan"} carry-forward`;
   }
 
+  // -------------------------------------------- feature styling & records
+
+  // Colour-codes a map feature by its worst/most-notable status or type -
+  // status (breached/completed/proposed) takes priority over the feature's
+  // base type, since a stale or broken plan element needs to read
+  // differently from a healthy one regardless of what kind of object it is.
   function featureColour(properties) {
     const type = properties.feature_type;
     const status = properties.status;
@@ -341,6 +394,19 @@
     $("#ops-valid-from").value = ""; $("#ops-valid-to").value = "";
     if (!keepTitle) $("#ops-feature-title").value = "";
   }
+
+  // --------------------------------------------- sketch draft persistence
+  //
+  // Crash-recovery for an in-progress sketch or record edit: every
+  // keystroke/vertex is mirrored into localStorage (persistSketchDraft())
+  // so a browser crash, power loss, or accidental tab close mid-edit
+  // doesn't silently lose field-collected work. The contract is a single
+  // slot (SKETCH_DRAFT_KEY, declared near the top of this file) that is
+  // removed the instant the in-progress work is resolved one way or the
+  // other - a successful save (saveGeometry()/saveFeatureRecord()) or a
+  // deliberate cancel (cancelDraw()/cancelEdit()) - so anything still in
+  // that slot at the next startup (restoreSketchDraft(), called from
+  // init()) really was abandoned mid-edit and is worth offering to recover.
 
   function sketchFields() {
     const selectors = ["#ops-feature-type", "#ops-feature-title", "#ops-feature-status", "#ops-source",
@@ -420,6 +486,16 @@
     setStatus(`Recovered unsaved sketch · ${d.points.length} vertex/vertices. Finish or cancel explicitly.`, true);
   }
 
+  // --------------------------------------- drawing / sketch state machine
+  //
+  // startDraw() begins collecting vertices for a brand-new feature into
+  // state.drawing; editFeature() opens an existing feature's record fields
+  // for editing via state.editingFeatureId. The two are mutually exclusive
+  // (see the state object's own comment near the top of this file) -
+  // startDraw() calls cancelEdit() first and editFeature() calls
+  // cancelDraw() first, so entering one path always cleanly exits the
+  // other rather than letting both be active at once.
+
   function pointMarker(feature, latlng) {
     const p = feature.properties;
     const label = (TYPE_LABELS[p.feature_type] || p.feature_type).split(/\s+/).map((x) => x[0]).join("").slice(0, 2).toUpperCase();
@@ -467,6 +543,9 @@
     return null;
   }
 
+  // Begins a new geometry sketch. Enforces the drawing/editing exclusivity
+  // invariant up front (bails out of any in-progress record edit before
+  // starting), then resets any leftover drawing state before beginning.
   function startDraw() {
     if (!state.incidentId || !state.periodId) return setStatus("Select an incident and operational period first.", true);
     if (state.editingFeatureId) cancelEdit();
@@ -484,6 +563,10 @@
     setStatus(geometry === "Point" ? "Click the object location." : "Click vertices; press Enter or Finish when done.");
   }
 
+  // Map click handler while a sketch is active (wired/unwired by
+  // startDraw()/cancelDraw()). A Point geometry saves itself immediately on
+  // the first click - there's nothing to "finish" - everything else just
+  // appends a vertex and redraws the in-progress outline.
   function drawClick(event) {
     const d = state.drawing;
     if (!d) return;
@@ -493,6 +576,9 @@
     redrawSketch();
   }
 
+  // Re-renders the dashed white in-progress outline from state.drawing's
+  // current vertex list - called after every vertex add/undo/restore so the
+  // on-map preview always matches state.
   function redrawSketch() {
     const d = state.drawing;
     state.sketchLayer.clearLayers();
@@ -509,6 +595,10 @@
     setStatus(`${state.drawing.points.length} vert${state.drawing.points.length === 1 ? "ex" : "ices"} in current sketch.`);
   }
 
+  // Ends vertex collection for a Polygon/LineString sketch and hands the
+  // finished geometry to saveGeometry(). A polygon ring must be closed
+  // (first point repeated as the last) for valid GeoJSON, so that's added
+  // here rather than requiring the operator to click the start point again.
   function finishDraw() {
     const d = state.drawing;
     if (!d) return;
@@ -520,6 +610,11 @@
     } else saveGeometry({ type: "LineString", coordinates: d.points });
   }
 
+  // Persists the finished geometry as a new operational feature. Plan-type
+  // features (PLAN_TYPES, or a proposed/planned/under_construction status)
+  // are treated as forecast/proposed work rather than an observation: no
+  // observed_at/confidence defaulting, and they're tied to the current
+  // scenario so switching scenarios shows only that plan's own objects.
   async function saveGeometry(geometry) {
     const d = state.drawing;
     if (!d) return;
@@ -546,6 +641,12 @@
     } catch (error) { setStatus(error.message, true); }
   }
 
+  // Tears down any in-progress sketch (unhook the map click handler, clear
+  // the preview layer, hide/show the relevant buttons). `discardDraft:
+  // false` is used by callers (e.g. selectIncident()) that need this reset
+  // for bookkeeping reasons but are not the operator deliberately
+  // abandoning their sketch - the localStorage crash-recovery draft stays
+  // in that case; a true deliberate cancel (the default) clears it.
   function cancelDraw({ discardDraft = true } = {}) {
     if (!state.map) return;
     state.map.off("click", drawClick);
@@ -559,6 +660,10 @@
     if (discardDraft) clearSketchDraft();
   }
 
+  // Opens an existing feature's record fields for editing. Enforces the
+  // drawing/editing exclusivity invariant up front (cancels any in-progress
+  // sketch before switching into edit mode) - the geometry itself is not
+  // editable here, only the record fields (title, status, hazards, etc).
   async function editFeature(id) {
     const feature = state.workspace.features.features.find((f) => f.properties.id === id);
     if (!feature) return;
@@ -623,6 +728,8 @@
     await selectIncident(state.incidentId);
   }
 
+  // ------------------------------------- safety checklist & plan approval
+
   async function loadSafety() {
     const container = $("#ops-safety"); container.replaceChildren();
     if (!state.periodId) return;
@@ -685,6 +792,8 @@
     }
   }
 
+  // ---------------------------------------- resources & vehicle telemetry
+
   function renderResources() {
     state.resourceLayer.clearLayers();
     const list = $("#ops-resource-list"); list.replaceChildren();
@@ -702,6 +811,24 @@
     });
   }
 
+  /** Pulls the latest known position for every vehicle and redraws the
+   * vehicle layer, colour-coding each marker by how much to trust it.
+   *
+   * The server attaches a `quality` object per position with three
+   * independent red flags, any one of which marks the fix as a warning
+   * (drawn red, ahead of the normal fresh/stale colouring below):
+   *  - `implausible_speed`: the implied speed since the previous fix for
+   *    this vehicle exceeds a sane ground-vehicle/aircraft bound - GPS
+   *    jump, clock skew, or a swapped/relayed identity.
+   *  - `poor_accuracy`: the report's own claimed accuracy radius is too
+   *    coarse to trust for tactical positioning.
+   *  - `out_of_order`: this fix's timestamp is older than one already
+   *    recorded for the same vehicle - a delayed/replayed report arriving
+   *    after a newer one, so "latest" can't be taken at face value.
+   * A quality warning is reported to the operator (status line + red
+   * marker) but never silently dropped - the position still renders, since
+   * a suspicious-but-real fix is still better tactical information than no
+   * fix at all. */
   async function refreshVehicleTelemetry() {
     state.vehicleLayer.clearLayers(); state.vehicleTrackLayer.clearLayers();
     const status = $("#ops-vehicle-status");
@@ -732,10 +859,25 @@
     status.textContent = `${fresh} fresh · ${stale} stale · ${warnings} quality warning(s) · threshold ${latest.freshness_threshold_seconds} s`;
   }
 
+  // ----------------------------------------------------------- wind field
+
   function windColour(speed) {
     return speed >= 10 ? "#ff493d" : (speed >= 5 ? "#ffb547" : "#19d3c5");
   }
 
+  /** Fetches an interpolated wind field for the current viewport and draws
+   * it as arrow markers, plus the raw measurements that fed it.
+   *
+   * The server reports `wind_to_deg` - the compass bearing the wind is
+   * blowing *towards* (0deg = north, measured clockwise), which is the
+   * natural quantity for "which way will the fire run". The CSS rotation
+   * applied to the arrow glyph is `wind_to_deg - 90`: CSS/SVG rotation angle
+   * 0 points along +x (east, i.e. compass 90deg), so converting a compass
+   * bearing to a screen rotation is a fixed -90deg offset - without it every
+   * arrow would point 90deg away (e.g. a wind blowing towards north would
+   * draw pointing east). The tooltip separately reports `wind_from_deg`
+   * (the traditional meteorological "wind FROM" bearing meteorologists
+   * and radio traffic actually say aloud), which is not the angle drawn. */
   async function showWindMap() {
     if (!state.incidentId) throw new Error("Select an incident first.");
     const bounds = state.map.getBounds(), at = isoDateTime("#ops-wind-time") || new Date().toISOString();
@@ -773,6 +915,8 @@
     state.windLayer?.clearLayers(); state.windObservationLayer?.clearLayers();
     if ($("#ops-wind-status")) $("#ops-wind-status").textContent = "No wind field displayed.";
   }
+
+  // --------------------------------------------- drone missions & mosaics
 
   async function loadDroneMissions(preferId = "") {
     const select = $("#ops-drone-mission");
@@ -813,6 +957,11 @@
     if (!state.droneAssets.length) list.textContent = missionId ? "No retained frames." : "Create or select a mission.";
   }
 
+  // Ground corners (a manual georeference) and the georeference-type
+  // selector are two halves of one optional input: either both are given
+  // (an operator manually pinned the image to the ground) or neither is -
+  // one without the other is a half-finished georeference the server
+  // couldn't act on, so it's rejected client-side rather than uploaded.
   async function uploadDroneImage() {
     const missionId = $("#ops-drone-mission").value, file = $("#ops-drone-file").files?.[0];
     if (!missionId || !file) throw new Error("Select a mission and image.");
@@ -842,6 +991,8 @@
     $("#ops-drone-status").textContent = `Mosaic created with ${assetIds.length} frame(s), hash ${product.sha256.slice(0, 12)}…; reload layer controls to display it.`;
   }
 
+  // ----------------------------------------------------- position reports
+
   async function savePositionReport() {
     const resourceId = $("#ops-position-resource").value || null;
     const resource = state.workspace.resources.find((item) => item.id === resourceId);
@@ -856,6 +1007,8 @@
     }});
     await selectIncident(state.incidentId); $("#ops-position-status").textContent = `${callsign} position recorded and audited.`;
   }
+
+  // ------------------------------------------------------- record editing
 
   async function saveIncidentRecord() {
     const incident = state.workspace.incident;
@@ -897,12 +1050,20 @@
     } catch (error) { await handleRecordError(error, "scenario"); }
   }
 
+  // Shared 409-conflict handler for the optimistic-concurrency pattern used
+  // throughout this file: every PATCH sends `expected_revision`, and the
+  // server rejects with 409 if another operator saved a newer revision
+  // first. Rather than silently overwriting that newer save, this reloads
+  // the workspace (discarding this operator's conflicting edit) so the
+  // operator sees the current state and can redo their change against it.
   async function handleRecordError(error, label) {
     if (error.status === 409) {
       setStatus(`${label} conflict: the newer saved revision was kept. Review it and retry.`, true);
       await selectIncident(state.incidentId);
     } else setStatus(error.message, true);
   }
+
+  // -------------------------------------------------------- resource CRUD
 
   function clearResourceForm() {
     $("#ops-resource-id").value = ""; $("#ops-resource-callsign").value = ""; $("#ops-resource-type").value = "";
@@ -942,6 +1103,8 @@
     } catch (error) { await handleRecordError(error, "resource"); }
   }
 
+  // --------------------------------- creating incidents/periods/scenarios
+
   async function createIncident() {
     const name = prompt("Incident name"); if (!name) return;
     const number = prompt("Incident identifier / number (optional)", "") || "";
@@ -979,6 +1142,8 @@
     state.scenarioId = scenario.id; await selectIncident(state.incidentId);
   }
 
+  // ------------------------------------- snapshots, products & model runs
+
   async function createSnapshot() {
     const name = prompt("Snapshot name", `${currentPeriod()?.name || "Incident"} handover`); if (name === null) return;
     await api(`/api/operations/incidents/${state.incidentId}/snapshots`, {
@@ -1014,6 +1179,10 @@
     });
   }
 
+  // Attached model runs carry server-computed provenance (reference time,
+  // staleness, warnings) rather than raw model output - this panel is an
+  // audit trail of *which* model results a scenario's plan actually relied
+  // on, not a live re-run of the model itself.
   async function loadModelRuns() {
     const list = $("#ops-model-run-list"); list.replaceChildren();
     if (!state.incidentId || !state.scenarioId) {
@@ -1066,6 +1235,8 @@
       (examples ? ` ${examples}${result.changes.length > 5 ? "…" : ""}` : " No operational differences.");
   }
 
+  // ----------------------------------------------------------- print view
+
   // "Print this view" now has a trigger in every app (see app.js's topbar
   // button, wired to window.NexPrintView below), not just the
   // incident-command output row this originally lived in - so a missing
@@ -1100,6 +1271,8 @@
     setTimeout(() => window.print(), 150);
   }
 
+  // --------------------------------- backups, recovery & offline packages
+
   async function loadBackupStatus() {
     const payload = await api("/api/operations/backups");
     const status = payload.status, el = $("#ops-backup-status");
@@ -1124,6 +1297,10 @@
     } finally { button.disabled = false; }
   }
 
+  // A recovery copy is a separate, independently integrity-checked database
+  // file made *from* the latest backup - not the live database and not the
+  // backup itself - so it can be handed off/downloaded and restored without
+  // any risk of touching the running system's own data.
   async function createRecovery() {
     if (!state.latestBackupName) return setStatus("Create a verified backup before making a recovery copy.", true);
     $("#ops-recovery-status").textContent = "Creating a separate verified recovery database…";
@@ -1174,6 +1351,16 @@
     link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     $("#ops-terrain-status").textContent = `Terrain package created · ${(blob.size / 1048576).toFixed(1)} MB · SHA-256 ${response.headers.get("X-Content-SHA256") || "see manifest"}`;
   }
+
+  // --------------------------------------------------------- field import
+  //
+  // Two-step preview-then-apply flow for importing field-collected data
+  // (GeoJSON/GPX/KML/KMZ/GeoPackage/CSV) gathered offline: previewFieldImport()
+  // validates format/geometry/AOI/confirmation requirements against the
+  // server without changing anything, then applyFieldImport() commits using
+  // the exact same payload plus any operator acknowledgements the preview
+  // flagged as required (features outside the reviewed map view, or
+  // confirmed-status observations needing a named reason).
 
   function fieldImportPayload(file, content, contentBase64 = "") {
     const bounds = state.map.getBounds();
@@ -1234,6 +1421,8 @@
     setStatus(`Imported ${result.feature_ids.length} field observation(s); original bytes and SHA-256 retained.`);
   }
 
+  // ------------------------------------ progression & tactical assessment
+
   async function showProgression() {
     const from = isoDateTime("#ops-progression-from"), to = isoDateTime("#ops-progression-to");
     if (!from || !to) return setStatus("Choose both progression times.", true);
@@ -1250,6 +1439,13 @@
     state.progressionLayer.clearLayers(); $("#ops-progression-status").textContent = "";
   }
 
+  // Runs the server's tactical screening rules (line/area measurements plus
+  // doctrine-based warnings, e.g. missing escape routes) over the current
+  // period/scenario's objects. Warnings persist as active until explicitly
+  // acknowledged with a reason (acknowledgeTacticalWarning()) - they are
+  // never auto-dismissed just because the underlying condition might have
+  // changed, since only a human reviewing the specific warning can know
+  // whether the mitigation actually addressed it.
   async function assessTactics() {
     if (!state.periodId) return;
     const result = await api(`/api/operations/incidents/${state.incidentId}/tactical-assessment?period_id=${encodeURIComponent(state.periodId)}&scenario_id=${encodeURIComponent(state.scenarioId || "")}`);
@@ -1295,6 +1491,8 @@
     $("#ops-calculator-status").textContent = `${Object.entries(result.output).map(([key, value]) => `${key}: ${value}`).join(" · ")} · ${result.formula} · ${result.warning}`;
   }
 
+  // ---------------------------------------------- copy scenario to period
+
   async function copyScenarioToPeriod() {
     const targetId = $("#ops-copy-target-period").value;
     const target = state.workspace.operational_periods.find((period) => period.id === targetId);
@@ -1307,6 +1505,26 @@
     setStatus(`Copied ${result.feature_ids.length} tactical object(s) into ${target.name}; source period unchanged.`);
   }
 
+  // ----------------------------------- incident import & merge resolution
+  //
+  // Importing an incident package (typically produced by another
+  // NexFiremap installation for offline field data exchange) has three
+  // possible outcomes, decided server-side by /api/operations/import/preview
+  // and acted on here without ever mutating anything until the operator
+  // explicitly confirms:
+  //   1. Invalid package (`!report.valid`) - rejected outright, nothing to
+  //      resolve.
+  //   2. New incident (`report.can_apply`) - no existing local record
+  //      conflicts, so a plain confirm() is enough before applying atomically.
+  //   3. Conflicts with an existing local incident (`!report.can_apply`,
+  //      mode "existing_incident") - the interesting case: the package is
+  //      staged server-side (both the local and incoming versions preserved
+  //      untouched) and renderMerge()/resolveMerge() below drive a
+  //      per-conflict decision UI rather than picking a side automatically.
+  //      Only conflicts the server can't resolve unambiguously
+  //      (classification "divergent"/"incoming_newer"/"local_newer") need an
+  //      operator choice; identical or genuinely-new records apply on their
+  //      own once resolved.
   async function importIncidentFile(file) {
     if (!file) return;
     if (file.size > 50 * 1024 * 1024) throw new Error("Incident package exceeds the 50 MB browser import limit.");
@@ -1338,6 +1556,11 @@
     setStatus(`Imported ${report.incident_name}: ${summary}.`);
   }
 
+  // Renders one "local" vs "incoming" choice per unresolved conflict from a
+  // staged merge. Only the three ambiguous classifications are shown here -
+  // conflicts the server already classified as identical or unambiguously
+  // new don't need an operator decision and aren't listed, keeping this
+  // form scoped to exactly the decisions that matter.
   function renderMerge(staged) {
     state.pendingMerge = staged;
     const container = $("#ops-merge-conflicts"); container.replaceChildren();
@@ -1353,6 +1576,10 @@
     $("#ops-merge-status").textContent = `${conflicts.length} decision(s) required. New records apply automatically; identical records remain unchanged.`;
   }
 
+  // Submits the operator's local-vs-incoming choice for every staged
+  // conflict in one atomic call. Requires every listed conflict to have a
+  // choice (no partial resolution) so the merge either fully applies with
+  // a complete, auditable decision for each divergence, or not at all.
   async function resolveMerge() {
     if (!state.pendingMerge) return;
     const choices = {};
@@ -1366,6 +1593,13 @@
     setStatus(`Package resolved by ${result.resolved_by}; selected changes and provenance are in the audit trail.`);
   }
 
+  // ------------------------------------------------------ map-pack export
+
+  // Renders a map-pack coverage report (tile counts, completeness percent,
+  // per-zoom breakdown) shared by both createMapPackManifest() (build a new
+  // manifest and check coverage) and verifyMapPackManifest() (re-check an
+  // existing one against what's actually cached) - `verb` only changes the
+  // wording, the coverage-summary rendering itself is identical either way.
   function showPackResult(result, verb = "checked") {
     const summary = result.summary;
     $("#ops-pack-status").textContent = `${result.name || "AOI"} ${verb}: ${summary.present}/${summary.expected} tiles present ` +
@@ -1399,7 +1633,17 @@
     showPackResult(result, "verified");
   }
 
+  // ------------------------------------------------------- control wiring
+  //
+  // Everything below just registers listeners - no state lives here. Each
+  // handler either calls straight into a named function above, or wraps
+  // one in `.catch(showError)` because addEventListener never awaits its
+  // callback: an unhandled rejection from a bare `async` listener fails
+  // silently (see the #ops-period/#ops-scenario comment just below for the
+  // bug that pattern caused historically), so every async action taken
+  // from a listener here is deliberately routed through showError.
   function wireControls() {
+    // ---- incident / period / scenario selection ----
     $("#ops-incident").addEventListener("change", (e) => selectIncident(e.target.value).catch(showError));
     // Unlike the incident-switch handler right above, these two used to be
     // `async` listeners with no .catch() anywhere - addEventListener never
@@ -1418,14 +1662,24 @@
       (async () => { await loadSafety(); await loadModelRuns(); })().catch(showError);
     });
     $("#ops-operator").addEventListener("change", (e) => localStorage.setItem("nexfiremap.operator", e.target.value));
+
+    // ---- authentication & account management ----
     $("#btn-auth-logout").addEventListener("click", () => logout().catch(showError));
     $("#btn-create-account").addEventListener("click", () => createAccount().catch(showError));
+
+    // ---- creating / saving incidents, periods & scenarios ----
     $("#btn-new-incident").addEventListener("click", () => createIncident().catch(showError));
     $("#btn-next-period").addEventListener("click", () => createNextPeriod().catch(showError));
     $("#btn-new-scenario").addEventListener("click", () => createScenario().catch(showError));
     $("#btn-save-incident").addEventListener("click", () => saveIncidentRecord().catch(showError));
     $("#btn-save-period").addEventListener("click", () => savePeriodRecord().catch(showError));
     $("#btn-save-scenario").addEventListener("click", () => saveScenarioRecord().catch(showError));
+
+    // ---- draw / sketch controls ----
+    // See the drawing/sketch state machine section above: these map
+    // directly onto startDraw()/finishDraw()/undoDraw()/cancelDraw()/
+    // saveFeatureRecord()/cancelEdit(), which themselves enforce the
+    // state.drawing / state.editingFeatureId exclusivity invariant.
     $("#btn-start-draw").addEventListener("click", startDraw);
     $("#btn-save-record").addEventListener("click", () => saveFeatureRecord().catch(showError));
     $("#btn-cancel-edit").addEventListener("click", cancelEdit);
@@ -1433,26 +1687,44 @@
     $("#btn-undo-draw").addEventListener("click", undoDraw);
     $("#btn-cancel-draw").addEventListener("click", cancelDraw);
     $("#btn-approve-scenario").addEventListener("click", () => approveScenario(false));
+
+    // ---- resource roster ----
     $("#btn-save-resource").addEventListener("click", () => saveResource().catch(showError));
     $("#btn-cancel-resource").addEventListener("click", clearResourceForm);
+
+    // ---- snapshots & printing ----
     $("#btn-snapshot").addEventListener("click", () => createSnapshot().catch(showError));
     $("#btn-compare-snapshots").addEventListener("click", () => compareSnapshots().catch(showError));
     $("#btn-print-operations").addEventListener("click", printOperationsMap);
+
+    // ---- backups, recovery copies & offline data sources ----
     $("#btn-backup-now").addEventListener("click", () => createBackup().catch(showError));
     $("#btn-create-recovery").addEventListener("click", () => createRecovery().catch(showError));
     $("#btn-import-mbtiles").addEventListener("click", () => importMbtiles().catch(showError));
     $("#btn-terrain-package").addEventListener("click", () => createTerrainPackage().catch(showError));
+
+    // ---- field import (offline-collected data) ----
     $("#btn-preview-field-import").addEventListener("click", () => previewFieldImport().catch(showError));
     $("#btn-apply-field-import").addEventListener("click", () => applyFieldImport().catch(showError));
+
+    // ---- resource positions & vehicle telemetry ----
     $("#btn-save-position").addEventListener("click", () => savePositionReport().catch(showError));
     $("#btn-refresh-vehicles").addEventListener("click", () => refreshVehicleTelemetry().catch(showError));
     $("#ops-show-vehicle-tracks").addEventListener("change", () => refreshVehicleTelemetry().catch(showError));
+
+    // ---- drone missions, imagery & mosaics ----
     $("#btn-create-drone-mission").addEventListener("click", () => createDroneMission().catch(showError));
     $("#ops-drone-mission").addEventListener("change", () => loadDroneAssets().catch(showError));
     $("#btn-upload-drone-image").addEventListener("click", () => uploadDroneImage().catch(showError));
     $("#btn-create-drone-mosaic").addEventListener("click", () => createDroneMosaic().catch(showError));
+
+    // ---- wind field ----
     $("#btn-show-wind").addEventListener("click", () => showWindMap().catch(showError));
     $("#btn-clear-wind").addEventListener("click", clearWindMap);
+
+    // Autofills the position-report form from a selected roster resource's
+    // last-known callsign/coordinates - a convenience default, not a lock;
+    // the fields stay freely editable for an ad hoc/unlisted report.
     $("#ops-position-resource").addEventListener("change", (event) => {
       const resource = state.workspace?.resources.find((item) => item.id === event.target.value);
       if (resource) {
@@ -1461,10 +1733,14 @@
         if (resource.longitude != null) $("#ops-position-lon").value = resource.longitude;
       }
     });
+
+    // ---- progression, tactical assessment & calculator ----
     $("#btn-show-progression").addEventListener("click", () => showProgression().catch(showError));
     $("#btn-clear-progression").addEventListener("click", clearProgression);
     $("#btn-assess-tactics").addEventListener("click", () => assessTactics().catch(showError));
     $("#btn-run-calculator").addEventListener("click", () => runTacticalCalculator().catch(showError));
+
+    // ---- plan copy, model provenance, products & merge resolution ----
     $("#btn-copy-scenario").addEventListener("click", () => copyScenarioToPeriod().catch(showError));
     $("#btn-attach-model").addEventListener("click", () => attachModelRun().catch(showError));
     $("#btn-create-product").addEventListener("click", () => createProduct().catch(showError));
@@ -1472,6 +1748,8 @@
     $("#ops-product-type").addEventListener("change", (event) => {
       if (event.target.value === "public_information") $("#ops-product-classification").value = "public";
     });
+
+    // ---- incident import/export & offline map-pack controls ----
     $("#btn-import-incident").addEventListener("click", () => $("#ops-import-file").click());
     $("#btn-create-pack").addEventListener("click", () => createMapPackManifest().catch(showError));
     $("#btn-verify-pack").addEventListener("click", () => verifyMapPackManifest().catch(showError));
@@ -1481,6 +1759,12 @@
     $("#btn-export-incident").addEventListener("click", () => {
       if (state.incidentId) window.location.href = `/api/operations/incidents/${state.incidentId}/export`;
     });
+
+    // ---- keyboard shortcuts ----
+    // Escape backs out of whichever of drawing/editing is active (the two
+    // are mutually exclusive - see the state object's own comment); Enter
+    // finishes a non-Point sketch in progress; Ctrl/Cmd+Z undoes the last
+    // vertex of an in-progress sketch (not a general undo).
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape") { if (state.editingFeatureId) cancelEdit(); else cancelDraw(); }
       if (event.key === "Enter" && state.drawing && state.drawing.geometry !== "Point") finishDraw();
@@ -1488,19 +1772,31 @@
         event.preventDefault(); undoDraw();
       }
     });
+
+    // Delegated clicks for buttons rendered dynamically inside popup/list
+    // HTML (popupHtml(), the tactical-warnings list) - those buttons don't
+    // exist yet when wireControls() runs, so they're matched by data
+    // attribute at document level instead of getting their own listener.
     document.addEventListener("click", (event) => {
       const edit = event.target.closest("[data-ops-edit]"); if (edit) editFeature(edit.dataset.opsEdit).catch(showError);
       const del = event.target.closest("[data-ops-delete]"); if (del) removeFeature(del.dataset.opsDelete).catch(showError);
       const warning = event.target.closest("[data-warning-ack]"); if (warning) acknowledgeTacticalWarning(warning.dataset.warningAck).catch(showError);
     });
+
+    // Every record-form field feeds the sketch-draft crash-recovery
+    // snapshot (see persistSketchDraft() above) on each keystroke, not just
+    // on save - so a crash mid-edit loses at most the last keystroke.
     ["#ops-feature-type", "#ops-feature-title", "#ops-feature-status", "#ops-source", "#ops-confidence", "#ops-observed-at", "#ops-observer",
       "#ops-valid-from", "#ops-valid-to", ...Object.values(RECORD_FIELDS)].forEach((selector) =>
       $(selector).addEventListener("input", persistSketchDraft));
+
     window.addEventListener("afterprint", () => {
       $("#ops-print-title").setAttribute("aria-hidden", "true");
       setTimeout(() => state.map.invalidateSize(), 50);
     });
   }
+
+  // ------------------------------------------------------ errors & connectivity
 
   function showError(error) { console.error(error); setStatus(error.message || String(error), true); }
 
@@ -1516,6 +1812,8 @@
       pill.textContent = "local server disconnected"; pill.className = "pill warn";
     }
   }
+
+  // ----------------------------------------------------------------- init
 
   async function init(map) {
     state.map = map;
@@ -1567,7 +1865,18 @@
     const progressionEnd = new Date(), progressionStart = new Date(progressionEnd.getTime() - 24 * 3600000);
     $("#ops-progression-from").value = localDateTime(progressionStart.toISOString());
     $("#ops-progression-to").value = localDateTime(progressionEnd.toISOString());
-    wireControls();
+    // wireControls() already ran once above, before ensureAuth() - it must
+    // not run again here. Every handler it registers only touches
+    // state/DOM lazily when it fires, never at attachment time, so a
+    // second call here was never load-bearing for anything created since
+    // the first call - it only doubled every listener in the operations
+    // panel (draw/incident/period/scenario/resource/backup/drone/wind/
+    // field-import/merge/map-pack controls, plus the document-level
+    // delegated click handler), making every click or keydown fire its
+    // handler twice: duplicate saves/PATCHes, doubled revision bumps,
+    // double undo/redo on Ctrl+Z. Confirmed pre-existing in the baseline
+    // (predates this file's comment pass) via `git show` on the initial
+    // commit - not something introduced here.
     await loadAccounts();
     await loadIncidents();
     await restoreSketchDraft();

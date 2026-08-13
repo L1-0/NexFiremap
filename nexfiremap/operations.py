@@ -21,6 +21,12 @@ from .db import Database
 from .provenance import from_job
 
 
+# ------------------------------------------------------------ domain vocabulary
+# The fixed vocabularies below are enforced on every write (see the validators
+# in OperationsStore and the module-level helpers) so that a package produced
+# on one machine can be merged into another without silently inventing new
+# enum values. Treat these tuples/sets as the single source of truth: add a
+# feature type, status, etc. here first, then teach the UI about it.
 SAFETY_CHECKS: tuple[tuple[str, str], ...] = (
     ("hazards", "Hazards identified"),
     ("lookouts", "Lookouts assigned"),
@@ -52,6 +58,9 @@ AREA_TYPES = {
     "uncertainty_area",
 }
 FEATURE_TYPES = POINT_TYPES | LINE_TYPES | AREA_TYPES
+# Subset of feature types that represent an observed fact about fire behaviour
+# (as opposed to a plan/resource marker); used by progression() to build a
+# time-sliced view of what was known to be true at a given moment.
 OBSERVATION_TYPES = {
     "confirmed_perimeter", "fire_perimeter", "active_edge", "inactive_edge",
     "spot_fire", "smoke_report", "wind_observation", "burn_area",
@@ -69,39 +78,70 @@ FEATURE_STATUSES = {
 }
 
 
+# ----------------------------------------------------------------------- errors
 class OperationsError(ValueError):
     """A request cannot be applied to the operational record."""
 
 
 class NotFoundError(OperationsError):
+    """The referenced incident/period/scenario/feature/... row does not exist
+    (or does not belong to the parent it was requested under)."""
     pass
 
 
 class RevisionConflict(OperationsError):
+    """Raised when a write's `expected_revision` no longer matches the row's
+    current `revision`. This is the optimistic-concurrency signal used
+    throughout the store: every mutable row carries a monotonically
+    increasing `revision`, callers must load-then-send-back that number, and
+    a mismatch here means someone else (another operator, another device)
+    changed the record first. `entity` carries the current, authoritative
+    row so the caller can show the operator what changed instead of just
+    failing."""
+
     def __init__(self, entity: dict[str, Any]) -> None:
         super().__init__("record changed since it was loaded")
         self.entity = entity
 
 
 class PackageConflict(OperationsError):
+    """Raised by import_bundle() when an incoming incident package overlaps
+    an existing incident and cannot be merged automatically. `report` is the
+    same structure preview_import() returns, so the caller can present the
+    conflicts for manual resolution rather than losing data by guessing."""
+
     def __init__(self, report: dict[str, Any]) -> None:
         super().__init__("incident package cannot be applied without conflict resolution")
         self.report = report
 
 
+# ---------------------------------------------------------------- small helpers
 def utcnow() -> str:
+    """Current UTC time as an ISO 8601 string, second precision. Used for every
+    created_at/updated_at/changed_at stamp so audit trails and revision
+    history sort and compare consistently regardless of the host machine's
+    local timezone."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _id() -> str:
+    """New random identifier for a record. UUIDs (rather than autoincrement
+    ids) let two disconnected installations generate records independently
+    without colliding when their packages are later merged."""
     return str(uuid4())
 
 
 def _clean_text(value: Any, limit: int = 10000) -> str:
+    """Coerce to a trimmed string and cap its length. Applied to every
+    user-supplied text field so free-text notes can't blow past sane storage
+    limits or carry stray whitespace into equality/audit comparisons."""
     return str(value or "").strip()[:limit]
 
 
 def _json_load(value: str | None, default: Any) -> Any:
+    """Best-effort JSON decode that falls back to `default` instead of
+    raising, since stored JSON blobs (geometry/properties/payload columns)
+    should never be allowed to take down a read path."""
     try:
         return json.loads(value) if value else default
     except (TypeError, json.JSONDecodeError):
@@ -109,10 +149,16 @@ def _json_load(value: str | None, default: Any) -> Any:
 
 
 def _plain(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    """Convert a sqlite3.Row to a plain dict, or pass through None."""
     return dict(row) if row is not None else None
 
 
 def _feature(row: sqlite3.Row) -> dict[str, Any]:
+    """Reassemble a tactical_features row into a GeoJSON Feature. Geometry and
+    free-form properties are stored as JSON columns for flexibility, but
+    everything else on the row (status, revision, timestamps, ...) is also
+    folded into `properties` so API consumers only ever deal with one
+    GeoJSON Feature shape rather than a database row shape."""
     data = dict(row)
     geometry = _json_load(data.pop("geometry_json", None), None)
     properties = _json_load(data.pop("properties_json", None), {})
@@ -121,6 +167,12 @@ def _feature(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _validate_geometry(geometry: Any, feature_type: str) -> dict[str, Any]:
+    """Validate that `geometry` is a well-formed GeoJSON geometry of the kind
+    required by `feature_type` (point features need Point geometry, etc.),
+    and that every coordinate is a plausible lon/lat(/altitude) position.
+    Raises OperationsError with a human-readable reason on the first problem
+    found; this is the single gate features pass through on create/update so
+    bad geometry can never reach the map or a shared package."""
     if not isinstance(geometry, dict):
         raise OperationsError("geometry must be a GeoJSON geometry object")
     kind = geometry.get("type")
@@ -134,6 +186,8 @@ def _validate_geometry(geometry: Any, feature_type: str) -> dict[str, Any]:
     if not isinstance(coordinates, list) or len(coordinates) < minimum:
         raise OperationsError(f"invalid {kind} coordinates")
     if kind == "Polygon":
+        # GeoJSON polygon rings must be closed (first position == last) and
+        # need at least 4 positions to describe a non-degenerate ring.
         if any(not isinstance(ring, list) or len(ring) < 4 or ring[0] != ring[-1] for ring in coordinates):
             raise OperationsError("polygon rings require four positions and must be closed")
         positions = [p for ring in coordinates for p in ring]
@@ -150,22 +204,45 @@ def _validate_geometry(geometry: Any, feature_type: str) -> dict[str, Any]:
 
 
 class OperationsStore:
+    """SQLite-backed store for incident-command operational data: incidents,
+    operational periods, plan scenarios, tactical features, resources,
+    safety checklists and their audit trail. All mutations go through
+    revision-checked helpers (see _apply_revision_update) so concurrent edits
+    from different operators/devices are detected instead of silently
+    clobbered, and every mutation is mirrored into incident_audit_log so the
+    incident record has a durable history of who changed what and when.
+    """
+
+    # ----------------------------------------------------------------- setup
     def __init__(self, db: Database) -> None:
         self.db = db
         with self.db._write_lock:
             row = self.db.conn.execute("SELECT value FROM meta WHERE key='installation_id'").fetchone()
             if row is None:
+                # Generated once per database file and never changed; used to
+                # tell "this installation's own records" apart from records
+                # that arrived via an imported package (see export_bundle).
                 self.db.conn.execute("INSERT INTO meta (key,value) VALUES ('installation_id',?)", (_id(),))
                 self.db.conn.commit()
 
     @property
     def installation_id(self) -> str:
+        """Stable identifier for this SQLite database, set once on first use.
+        Recorded on every exported package so a re-imported bundle can be
+        traced back to the machine it originated from."""
         return str(self.db.conn.execute("SELECT value FROM meta WHERE key='installation_id'").fetchone()[0])
 
+    # ----------------------------------------------- revision-checked writes
     def _audit(
         self, incident_id: str, entity_type: str, entity_id: str,
         action: str, revision: int, payload: dict[str, Any], actor: str,
     ) -> None:
+        """Append one row to incident_audit_log and bump the parent incident's
+        updated_at. This is the append-only trail behind every create/update/
+        delete/approve/import/copy action in this module; it is intentionally
+        never rewritten, only ever appended to, so it stays a trustworthy
+        record even across imported packages (see export_bundle/import_bundle).
+        Caller is expected to be inside the write lock/transaction already."""
         changed_at = utcnow()
         self.db.conn.execute(
             "INSERT INTO incident_audit_log "
@@ -184,6 +261,17 @@ class OperationsStore:
         expected_revision: int, changes: dict[str, Any], *, incident_table: bool = False,
         actor: str = "local operator",
     ) -> dict[str, Any]:
+        """Shared optimistic-concurrency update path used by most `update_*`
+        methods. The caller must supply the revision it last read
+        (`expected_revision`); if the stored row has since moved to a
+        different revision, this raises RevisionConflict with the current row
+        instead of applying the change, so an operator's edit never silently
+        overwrites someone else's newer edit. The UPDATE statement itself
+        also filters on `revision=?` as a second, race-proof check (belt and
+        suspenders against another writer sneaking in between the SELECT
+        above and this UPDATE); rowcount != 1 means that race happened, so we
+        roll back and re-report the conflict against the now-current row.
+        """
         owner_column = "id" if incident_table else "incident_id"
         row = self.db.conn.execute(
             f"SELECT * FROM {table} WHERE id=? AND {owner_column}=?", (entity_id, incident_id)
@@ -203,6 +291,9 @@ class OperationsStore:
                 [*changes.values(), entity_id, expected_revision],
             )
             if result.rowcount != 1:
+                # Another writer updated (and bumped) the row between our
+                # SELECT and this UPDATE; surface the conflict instead of
+                # silently losing that write.
                 fresh = self.db.conn.execute(f"SELECT * FROM {table} WHERE id=?", (entity_id,)).fetchone()
                 self.db.conn.rollback()
                 raise RevisionConflict(dict(fresh))
@@ -211,7 +302,12 @@ class OperationsStore:
             self.db.conn.commit()
         return fresh
 
+    # ------------------------------------------------------------- incidents
     def create_incident(self, data: dict[str, Any], actor: str = "local operator") -> dict[str, Any]:
+        """Create a new incident record (revision 1) and log its creation.
+        The incident is the root of everything else in this module -
+        periods, scenarios, features, resources - so this is usually the
+        first call made for a new fire."""
         name = _clean_text(data.get("name"), 300)
         if not name:
             raise OperationsError("incident name is required")
@@ -238,12 +334,15 @@ class OperationsStore:
         return values
 
     def list_incidents(self, include_closed: bool = False) -> list[dict[str, Any]]:
+        """List incidents, most recently updated first. Closed incidents are
+        hidden by default to keep the day-to-day incident picker short."""
         clause = "" if include_closed else "WHERE status != 'closed'"
         return [dict(r) for r in self.db.conn.execute(
             f"SELECT * FROM incidents {clause} ORDER BY updated_at DESC"
         ).fetchall()]
 
     def get_incident(self, incident_id: str) -> dict[str, Any]:
+        """Fetch one incident by id, or raise NotFoundError."""
         row = self.db.conn.execute("SELECT * FROM incidents WHERE id=?", (incident_id,)).fetchone()
         if row is None:
             raise NotFoundError("incident not found")
@@ -251,6 +350,9 @@ class OperationsStore:
 
     def update_incident(self, incident_id: str, data: dict[str, Any], expected_revision: int,
                         actor: str = "local operator") -> dict[str, Any]:
+        """Patch the incident's editable fields. Only keys present in `data`
+        are touched; `expected_revision` must match the currently stored
+        revision or this raises RevisionConflict (see _apply_revision_update)."""
         current = self.get_incident(incident_id)
         changes: dict[str, Any] = {}
         for key, limit in (("name", 300), ("incident_number", 100), ("timezone", 80), ("notes", 10000)):
@@ -277,7 +379,11 @@ class OperationsStore:
             incident_table=True, actor=actor,
         )
 
+    # --------------------------------------------------- operational periods
     def create_period(self, incident_id: str, data: dict[str, Any], actor: str = "local operator") -> dict[str, Any]:
+        """Create a new operational period (revision 1) under an incident.
+        Operational periods are the standard ICS time-boxing unit that
+        scenarios, features and safety checklists are scoped to."""
         self.get_incident(incident_id)
         name = _clean_text(data.get("name"), 300)
         starts = _clean_text(data.get("starts_at"), 80)
@@ -304,6 +410,7 @@ class OperationsStore:
         return values
 
     def list_periods(self, incident_id: str) -> list[dict[str, Any]]:
+        """List an incident's operational periods, most recent start first."""
         self.get_incident(incident_id)
         return [dict(r) for r in self.db.conn.execute(
             "SELECT * FROM operational_periods WHERE incident_id=? ORDER BY starts_at DESC", (incident_id,)
@@ -311,6 +418,10 @@ class OperationsStore:
 
     def update_period(self, incident_id: str, period_id: str, data: dict[str, Any],
                       expected_revision: int, actor: str = "local operator") -> dict[str, Any]:
+        """Patch an operational period's editable fields, revision-checked
+        against `expected_revision`. Re-validates the start/end ordering
+        using whichever of starts_at/ends_at end up in effect (either the
+        incoming change or, if unchanged, the current stored value)."""
         row = self.db.conn.execute(
             "SELECT * FROM operational_periods WHERE id=? AND incident_id=?", (period_id, incident_id)
         ).fetchone()
@@ -340,7 +451,13 @@ class OperationsStore:
             expected_revision, changes, actor=actor,
         )
 
+    # ------------------------------------------------------------- scenarios
     def create_scenario(self, incident_id: str, period_id: str, data: dict[str, Any], actor: str = "local operator") -> dict[str, Any]:
+        """Create a new plan scenario (revision 1) under an operational
+        period. A scenario is one hypothesis for how the period will play out
+        (primary/contingency/alternative/worst_case, see SCENARIO_KINDS) and
+        starts in "draft" status until it passes the safety approval
+        workflow (see approve_scenario)."""
         period = self.db.conn.execute(
             "SELECT * FROM operational_periods WHERE id=? AND incident_id=?", (period_id, incident_id)
         ).fetchone()
@@ -368,13 +485,22 @@ class OperationsStore:
         return values
 
     def list_scenarios(self, period_id: str) -> list[dict[str, Any]]:
+        """List a period's scenarios, primary first, then contingency, then
+        everything else, most recently updated within each group first."""
         return [dict(r) for r in self.db.conn.execute(
             "SELECT * FROM plan_scenarios WHERE period_id=? ORDER BY CASE kind WHEN 'primary' THEN 0 WHEN 'contingency' THEN 1 ELSE 2 END, updated_at DESC",
             (period_id,),
         ).fetchall()]
 
+    # -------------------------------------------------- model run provenance
     def attach_model_run(self, incident_id: str, scenario_id: str, job_id: int,
                          actor: str = "local operator") -> dict[str, Any]:
+        """Link a fire-behaviour model job's output to a scenario so the plan
+        can show where its projected spread came from. Re-attaching the same
+        (scenario_id, job_id) pair updates the existing link instead of
+        duplicating it. Provenance is derived from the job via from_job() and
+        raises OperationsError if the job isn't in a state that can be
+        attached (e.g. still running or failed)."""
         scenario = self.db.conn.execute(
             "SELECT id FROM plan_scenarios WHERE id=? AND incident_id=?", (scenario_id, incident_id)
         ).fetchone()
@@ -412,6 +538,8 @@ class OperationsStore:
                 "attached_by": _clean_text(actor, 200), "attached_at": now}
 
     def list_model_runs(self, incident_id: str, scenario_id: str | None = None) -> list[dict[str, Any]]:
+        """List model runs attached to an incident, optionally filtered to one
+        scenario, most recently attached first."""
         sql = "SELECT * FROM incident_model_runs WHERE incident_id=?"
         params: list[Any] = [incident_id]
         if scenario_id:
@@ -422,8 +550,17 @@ class OperationsStore:
             item = dict(row); item["provenance"] = json.loads(item.pop("provenance_json")); result.append(item)
         return result
 
+    # -------------------------------------------------------- scenario edits
     def update_scenario(self, incident_id: str, scenario_id: str, data: dict[str, Any],
                         expected_revision: int, actor: str = "local operator") -> dict[str, Any]:
+        """Patch a scenario's editable fields, revision-checked against
+        `expected_revision`. Status cannot be set to "approved" here - that
+        requires going through approve_scenario() so the safety checklist is
+        reviewed - and any substantive edit (name/kind/description/
+        assumptions) to a scenario that was already approved automatically
+        demotes it back to "draft" and clears its approval, because an
+        approval is a statement about the plan as it existed at approval
+        time and must not silently keep covering a changed plan."""
         row = self.db.conn.execute(
             "SELECT * FROM plan_scenarios WHERE id=? AND incident_id=?", (scenario_id, incident_id)
         ).fetchone()
@@ -451,6 +588,10 @@ class OperationsStore:
             changes["status"] = status
         substantive = any(key in changes for key in ("name", "kind", "description", "assumptions"))
         if current["status"] == "approved" and substantive:
+            # An approval certifies a specific plan; changing the plan's
+            # substance invalidates that certification, so force it back
+            # through the safety approval workflow rather than leaving a
+            # stale "approved" label on an edited scenario.
             changes.update({"status": "draft", "approved_by": None, "approved_at": None,
                             "warning_acknowledged": 0})
         return self._apply_revision_update(
@@ -458,7 +599,14 @@ class OperationsStore:
             expected_revision, changes, actor=actor,
         )
 
+    # ----------------------------------------------------- tactical features
     def create_feature(self, incident_id: str, data: dict[str, Any], actor: str = "local operator") -> dict[str, Any]:
+        """Create a new tactical/observational map feature (revision 1) - an
+        anchor point, perimeter line, evacuation area, etc. Geometry is
+        validated against `feature_type` (see _validate_geometry) and, if a
+        period/scenario is given, both must actually belong to this incident
+        (and the scenario to the given period) so a feature can never point
+        at a parent outside its own incident."""
         self.get_incident(incident_id)
         feature_type = _clean_text(data.get("feature_type"), 80)
         if feature_type not in FEATURE_TYPES:
@@ -509,6 +657,10 @@ class OperationsStore:
 
     def list_features(self, incident_id: str, period_id: str | None = None,
                       scenario_id: str | None = None, include_deleted: bool = False) -> list[dict[str, Any]]:
+        """List an incident's features as GeoJSON Features, optionally
+        narrowed to one period/scenario. Deleted features (see
+        delete_feature) are soft-deleted rows and excluded by default so the
+        normal map/API views never see them."""
         where, params = ["incident_id=?"], [incident_id]
         if period_id:
             where.append("period_id=?"); params.append(period_id)
@@ -522,6 +674,11 @@ class OperationsStore:
         return [_feature(r) for r in rows]
 
     def progression(self, incident_id: str, from_time: str, to_time: str) -> dict[str, Any]:
+        """Build a before/after/new-since view of observed fire behaviour
+        (see OBSERVATION_TYPES) between two points in time, for animating or
+        reviewing how the incident developed. `from_time`/`to_time` must be
+        timezone-aware ISO 8601 strings so comparisons against stored
+        timestamps are unambiguous regardless of the reporting timezone."""
         self.get_incident(incident_id)
         try:
             start = datetime.fromisoformat(from_time.replace("Z", "+00:00"))
@@ -536,6 +693,8 @@ class OperationsStore:
                         item["properties"].get("feature_type") in OBSERVATION_TYPES]
 
         def timestamp(item: dict[str, Any]) -> datetime:
+            # Prefer the reported observation time; fall back to when the
+            # record was entered if the observer didn't supply one.
             raw = item["properties"].get("observed_at") or item["properties"].get("created_at")
             try:
                 value = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
@@ -557,6 +716,11 @@ class OperationsStore:
 
     def update_feature(self, incident_id: str, feature_id: str, data: dict[str, Any],
                        expected_revision: int, actor: str = "local operator") -> dict[str, Any]:
+        """Patch a feature's editable fields (and optionally its geometry/
+        properties), revision-checked against `expected_revision`. This
+        method inlines its own optimistic-concurrency UPDATE rather than
+        going through _apply_revision_update because it needs to re-validate
+        geometry against the feature's existing feature_type first."""
         current_row = self.db.conn.execute(
             "SELECT * FROM tactical_features WHERE id=? AND incident_id=?", (feature_id, incident_id)
         ).fetchone()
@@ -601,6 +765,10 @@ class OperationsStore:
 
     def delete_feature(self, incident_id: str, feature_id: str, expected_revision: int,
                        actor: str = "local operator") -> dict[str, Any]:
+        """Soft-delete a feature: mark it inactive and stamp deleted_at rather
+        than removing the row, so the audit trail and any package that
+        already references this feature's id stay consistent. Revision-
+        checked like the other mutators; see RevisionConflict."""
         row = self.db.conn.execute(
             "SELECT * FROM tactical_features WHERE id=? AND incident_id=?", (feature_id, incident_id)
         ).fetchone()
@@ -622,8 +790,14 @@ class OperationsStore:
             self.db.conn.commit()
         return _feature(fresh)
 
+    # ---------------------------------- safety checklist & scenario approval
     def set_safety_checks(self, incident_id: str, period_id: str, scenario_id: str | None,
                           checks: Iterable[dict[str, Any]], actor: str = "local operator") -> list[dict[str, Any]]:
+        """Upsert one or more entries in the operational-period (optionally
+        scenario-scoped) safety checklist (see SAFETY_CHECKS for the fixed
+        set of keys). This is plain upsert-by-key rather than
+        revision-checked, since checklist items are independent booleans an
+        operator ticks off rather than a single record edited as a whole."""
         if not self.db.conn.execute(
             "SELECT 1 FROM operational_periods WHERE id=? AND incident_id=?", (period_id, incident_id)
         ).fetchone():
@@ -647,6 +821,9 @@ class OperationsStore:
         return self.get_safety_checks(period_id, scenario_id)
 
     def get_safety_checks(self, period_id: str, scenario_id: str | None = None) -> list[dict[str, Any]]:
+        """Return the full safety checklist for a period/scenario, always in
+        SAFETY_CHECKS order with every key present (defaulting to unchecked)
+        so callers never have to special-case a key that was never touched."""
         sid = scenario_id or ""
         stored = {r["check_key"]: dict(r) for r in self.db.conn.execute(
             "SELECT * FROM safety_checks WHERE period_id=? AND scenario_id=?", (period_id, sid)
@@ -658,6 +835,16 @@ class OperationsStore:
     def approve_scenario(self, incident_id: str, scenario_id: str, approver: str,
                          acknowledge_warnings: bool = False,
                          expected_revision: int | None = None) -> dict[str, Any]:
+        """Approve a scenario, the terminal step of the safety workflow. If
+        any SAFETY_CHECKS item is unticked, approval is refused unless the
+        caller passes `acknowledge_warnings=True` - this forces an explicit,
+        auditable decision to proceed with known gaps rather than letting an
+        incomplete checklist block operations silently or be approved by
+        accident. Which checks (if any) were outstanding at approval time is
+        recorded both on the row (`warning_acknowledged`) and in the audit
+        payload. `expected_revision` is optional here (unlike other
+        mutators) since approval is commonly triggered from a checklist view
+        that may not be tracking the scenario's own revision."""
         row = self.db.conn.execute(
             "SELECT * FROM plan_scenarios WHERE id=? AND incident_id=?", (scenario_id, incident_id)
         ).fetchone()
@@ -677,6 +864,9 @@ class OperationsStore:
                  revision, scenario_id, int(row["revision"])),
             )
             if result.rowcount != 1:
+                # Scenario moved (edited or approved elsewhere) between our
+                # read and this write; don't approve a plan the operator
+                # never actually saw.
                 fresh = self.db.conn.execute("SELECT * FROM plan_scenarios WHERE id=?", (scenario_id,)).fetchone()
                 self.db.conn.rollback()
                 raise RevisionConflict(dict(fresh))
@@ -687,7 +877,12 @@ class OperationsStore:
         fresh["safety_warnings"] = missing
         return fresh
 
+    # ------------------------------------------------------------- resources
     def create_resource(self, incident_id: str, data: dict[str, Any], actor: str = "local operator") -> dict[str, Any]:
+        """Create a new incident resource (crew, engine, aircraft, ...) at
+        revision 1. `callsign` and `unit_type` are the only required fields;
+        everything else (position, capabilities, assignment) can be filled
+        in as it becomes known."""
         self.get_incident(incident_id)
         callsign, unit_type = _clean_text(data.get("callsign"), 100), _clean_text(data.get("unit_type"), 100)
         if not callsign or not unit_type:
@@ -708,12 +903,17 @@ class OperationsStore:
         return values
 
     def list_resources(self, incident_id: str) -> list[dict[str, Any]]:
+        """List an incident's resources, alphabetical by callsign."""
         return [dict(r) for r in self.db.conn.execute(
             "SELECT * FROM incident_resources WHERE incident_id=? ORDER BY callsign", (incident_id,)
         ).fetchall()]
 
     def update_resource(self, incident_id: str, resource_id: str, data: dict[str, Any],
                         expected_revision: int, actor: str = "local operator") -> dict[str, Any]:
+        """Patch a resource's editable fields, revision-checked against
+        `expected_revision`. Numeric fields (crew size, water capacity,
+        position) are range-checked together at the end so a single
+        malformed value doesn't silently corrupt an otherwise-valid update."""
         row = self.db.conn.execute(
             "SELECT * FROM incident_resources WHERE id=? AND incident_id=?", (resource_id, incident_id)
         ).fetchone()
@@ -751,8 +951,15 @@ class OperationsStore:
             expected_revision, changes, actor=actor,
         )
 
+    # --------------------------------------------------------- scenario copy
     def copy_scenario(self, incident_id: str, scenario_id: str, target_period_id: str,
                       name: str, actor: str = "local operator") -> dict[str, Any]:
+        """Clone a scenario (and all of its features) into a different
+        operational period, e.g. to carry a contingency plan forward into the
+        next period. The clone always starts fresh at revision 1 in "draft"
+        status - approvals do not carry over, since the copy is a new plan
+        that hasn't itself been reviewed. Runs as a single transaction so a
+        partially-copied scenario can never be left behind on failure."""
         source = self.db.conn.execute(
             "SELECT * FROM plan_scenarios WHERE id=? AND incident_id=?", (scenario_id, incident_id)
         ).fetchone()
@@ -765,6 +972,10 @@ class OperationsStore:
             raise OperationsError("target period must differ from source period")
         new_scenario_id, now = _id(), utcnow()
         source_features = self.list_features(incident_id, source["period_id"], scenario_id)
+        # Pre-allocate every cloned feature's new id up front so that feature-
+        # to-feature references ("links", e.g. a trigger point pointing at a
+        # safety zone) can be rewritten to point at the *copies* below,
+        # rather than dangling on the originals.
         id_map = {item["properties"]["id"]: _id() for item in source_features}
         with self.db._write_lock:
             try:
@@ -776,17 +987,26 @@ class OperationsStore:
                 )
                 for feature in source_features:
                     props = feature["properties"]
+                    # Only carry over custom/free-form properties; the "core"
+                    # columns below are recomputed per-copy (new id, new
+                    # parent scenario/period, fresh revision, etc.).
                     core = {"id", "incident_id", "period_id", "scenario_id", "feature_type", "title", "status",
                             "observed_at", "source", "observer", "confidence", "valid_from", "valid_to", "created_by",
                             "created_at", "updated_at", "revision", "deleted_at"}
                     custom = {key: value for key, value in props.items() if key not in core}
                     links = custom.get("links")
                     if isinstance(links, dict):
+                        # Remap any link that points at another feature being
+                        # copied in this same batch; leave unrelated ids as-is.
                         custom["links"] = {key: id_map.get(str(value), value) for key, value in links.items()}
                     custom["copied_from_feature_id"] = props["id"]
                     new_id = id_map[props["id"]]
                     self.db.conn.execute(
                         "INSERT INTO tactical_features (id,incident_id,period_id,scenario_id,feature_type,title,status,geometry_json,properties_json,observed_at,source,observer,confidence,valid_from,valid_to,created_by,created_at,updated_at,revision) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
+                        # A copy is a fresh plan, not a report of completed
+                        # work, so most statuses reset to "proposed"; genuinely
+                        # terminal statuses (completed/held) are preserved
+                        # since they describe a fact rather than a plan step.
                         (new_id, incident_id, target_period_id, new_scenario_id, props["feature_type"], props["title"],
                          "proposed" if props["status"] not in {"completed", "held"} else props["status"],
                          json.dumps(feature["geometry"], separators=(",", ":")), json.dumps(custom, separators=(",", ":")),
@@ -804,7 +1024,16 @@ class OperationsStore:
         return {"scenario": dict(self.db.conn.execute("SELECT * FROM plan_scenarios WHERE id=?", (new_scenario_id,)).fetchone()),
                 "feature_ids": list(id_map.values()), "source_feature_ids": list(id_map)}
 
+    # ---------------------------------------- export, snapshots & comparison
     def export_bundle(self, incident_id: str) -> dict[str, Any]:
+        """Serialise an entire incident - periods, scenarios, features,
+        resources, safety checks, source imports, model-run provenance,
+        warning acknowledgements and the full audit log - into one
+        self-contained package. This is the shape shared between
+        installations (see preview_import/import_bundle) and the shape
+        stored verbatim inside a snapshot (see create_snapshot), so it is
+        also, effectively, the incident's on-disk schema version: any field
+        added here needs matching support on the import/validation side."""
         incident = self.get_incident(incident_id)
         periods = self.list_periods(incident_id)
         scenarios = [dict(r) for r in self.db.conn.execute(
@@ -850,6 +1079,12 @@ class OperationsStore:
 
     def create_snapshot(self, incident_id: str, name: str, period_id: str | None,
                         classification: str, actor: str = "local operator") -> dict[str, Any]:
+        """Freeze the incident's current export_bundle() into an immutable,
+        named snapshot - e.g. "what the plan looked like when it was
+        released to the public" - stored verbatim as JSON so it can later be
+        diffed against (see compare_snapshots) or re-examined even after the
+        live records have moved on. `classification` gates how freely the
+        snapshot may be shared (draft/operational/public)."""
         if classification not in {"draft", "operational", "public"}:
             raise OperationsError("invalid snapshot classification")
         bundle = self.export_bundle(incident_id)
@@ -869,12 +1104,18 @@ class OperationsStore:
         return {k: v for k, v in values.items() if k != "payload_json"}
 
     def list_snapshots(self, incident_id: str) -> list[dict[str, Any]]:
+        """List an incident's snapshots (metadata only, not the payload),
+        newest first."""
         return [dict(r) for r in self.db.conn.execute(
             "SELECT id,incident_id,period_id,name,classification,created_by,created_at FROM incident_snapshots WHERE incident_id=? ORDER BY created_at DESC",
             (incident_id,),
         ).fetchall()]
 
     def _snapshot_bundle(self, incident_id: str, snapshot_id: str) -> dict[str, Any]:
+        """Load and sanity-check a stored snapshot's payload_json, confirming
+        it actually belongs to `incident_id` before handing it back - a
+        snapshot's JSON blob is otherwise opaque to the database, so this is
+        the one place that re-validates it matches its claimed owner."""
         row = self.db.conn.execute(
             "SELECT payload_json FROM incident_snapshots WHERE id=? AND incident_id=?",
             (snapshot_id, incident_id),
@@ -888,6 +1129,10 @@ class OperationsStore:
 
     @staticmethod
     def _comparison_summary(entity_type: str, item: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Reduce a full entity record to a small set of human-recognisable
+        fields for display in a diff (compare_snapshots), rather than
+        dumping the entire before/after record - operators reading a diff
+        want "scenario X went from draft to approved", not every column."""
         if item is None:
             return None
         value = item.get("properties", {}) if entity_type == "feature" else item
@@ -897,6 +1142,10 @@ class OperationsStore:
 
     @staticmethod
     def _comparison_value(entity_type: str, item: dict[str, Any]) -> dict[str, Any]:
+        """Normalise an entity record into the shape used to test equality
+        between two snapshots (or a snapshot and the live data) in
+        compare_snapshots(). See the inline note below on why updated_at is
+        stripped before comparing."""
         # updated_at is bookkeeping, not a command decision. In particular,
         # creating a snapshot updates the incident audit timestamp without
         # changing its revision - excluding it makes snapshot-vs-current stable.
@@ -910,6 +1159,13 @@ class OperationsStore:
 
     def compare_snapshots(self, incident_id: str, left_snapshot_id: str,
                           right_snapshot_id: str | None = None) -> dict[str, Any]:
+        """Diff one snapshot against another snapshot, or (when
+        `right_snapshot_id` is omitted) against the incident's current live
+        state, entity-type by entity-type. Every entity present on either
+        side is classified as added/removed/changed/unchanged using
+        _comparison_value() for equality, and only non-unchanged entities are
+        detailed in `changes` (via _comparison_summary) so the result stays
+        readable even for a busy incident."""
         self.get_incident(incident_id)
         left = self._snapshot_bundle(incident_id, left_snapshot_id)
         right = self._snapshot_bundle(incident_id, right_snapshot_id) if right_snapshot_id else self.export_bundle(incident_id)
@@ -923,6 +1179,9 @@ class OperationsStore:
             "safety_check": lambda bundle: bundle.get("safety_checks", []),
         }
 
+        # Safety checks have no id column of their own (they're keyed by
+        # period+scenario+check_key), and features nest their id under
+        # "properties" as GeoJSON does; every other entity type just uses "id".
         def entity_id(entity_type: str, item: dict[str, Any]) -> str:
             if entity_type == "feature":
                 return str(item.get("properties", {}).get("id"))
@@ -939,6 +1198,8 @@ class OperationsStore:
             type_counts = {key: 0 for key in counts}
             for item_id in sorted(set(left_map) | set(right_map)):
                 before, after = left_map.get(item_id), right_map.get(item_id)
+                # present only on the right/left/both sides -> added/removed;
+                # present on both but normalised values differ -> changed.
                 if before is None:
                     classification = "added"
                 elif after is None:
@@ -962,7 +1223,20 @@ class OperationsStore:
             "compared_at": utcnow(), "counts": counts, "by_type": by_type, "changes": changes,
         }
 
+    # -------------------------------------------------------- package import
     def preview_import(self, bundle: dict[str, Any]) -> dict[str, Any]:
+        """Validate an incident package (the shape produced by export_bundle)
+        and determine whether import_bundle() could apply it as-is, without
+        actually writing anything. This is a read-only dry run in three
+        phases: (1) structural validation of the package itself, (2) - for a
+        brand-new incident id - checking every contained record id for
+        collisions with existing rows, or (3) - for an incident id that
+        already exists locally - classifying every incoming record against
+        the local copy (new/identical/local_newer/incoming_newer/divergent)
+        by comparing revisions, since only the caller can decide how to
+        reconcile genuine conflicts. `can_apply` is only ever true for a
+        clean new-incident import; merging into an existing incident always
+        requires manual conflict resolution (see PackageConflict)."""
         errors: list[str] = []
         if not isinstance(bundle, dict) or bundle.get("schema") != "nexfiremap-incident/1":
             return {"valid": False, "can_apply": False, "mode": "invalid", "errors": ["unsupported or missing package schema"]}
@@ -989,6 +1263,11 @@ class OperationsStore:
         if errors:
             return {"valid": False, "can_apply": False, "mode": "invalid", "errors": errors}
 
+        # Phase 2: internal consistency - every id referenced by a child
+        # record (period/scenario/feature/resource/...) must resolve to
+        # something else inside this same package, and ids must be unique
+        # within their table, so the package can never describe a graph that
+        # points outside of itself.
         incident_id = str(incident["id"])
         period_ids = {str(p.get("id")) for p in periods if isinstance(p, dict)}
         scenario_ids = {str(s.get("id")) for s in scenarios if isinstance(s, dict)}
@@ -1037,6 +1316,9 @@ class OperationsStore:
                     raise ValueError("invalid id/incident")
                 source_import_ids.add(import_id)
                 raw = base64.b64decode(str(item["original_base64"]), validate=True)
+                # Confirm the embedded original file bytes weren't truncated
+                # or altered in transit/storage before trusting size_bytes/
+                # sha256 that a re-import might rely on later.
                 if len(raw) != int(item.get("size_bytes", -1)) or hashlib.sha256(raw).hexdigest() != item.get("sha256"):
                     raise ValueError("source bytes do not match size/hash")
             except (KeyError, TypeError, ValueError) as exc:
@@ -1064,6 +1346,12 @@ class OperationsStore:
             return {"valid": False, "can_apply": False, "mode": "invalid", "incident_id": incident_id,
                     "incident_name": incident.get("name"), "counts": counts, "errors": sorted(set(errors))}
 
+        # Phase 3a: brand-new incident. There is no local record to merge
+        # against, so the only remaining risk is one of this package's ids
+        # accidentally colliding with an unrelated existing row (e.g. two
+        # installations both generated the same feature id, astronomically
+        # unlikely with UUIDs but still checked). No collisions -> safe to
+        # apply verbatim.
         local = self.db.conn.execute("SELECT 1 FROM incidents WHERE id=?", (incident_id,)).fetchone()
         if local is None:
             collisions = []
@@ -1082,6 +1370,15 @@ class OperationsStore:
                     "new_records": 1 + sum(counts.values()), "identical_records": 0,
                     "conflicts": collisions, "errors": []}
 
+        # Phase 3b: incident already exists locally. Classify every incoming
+        # record against its local counterpart by comparing revisions rather
+        # than trusting timestamps (clocks across machines can't be trusted,
+        # but each device's own revision counter can): a strictly higher
+        # incoming revision means the other device edited a record we also
+        # have, a strictly lower one means our copy is ahead, and equal
+        # revisions with different content ("divergent") means both sides
+        # edited from the same base independently and need a human to pick a
+        # winner - none of these three are auto-applied (see can_apply below).
         local_bundle = self.export_bundle(incident_id)
         incoming_groups = {
             "incident": [incident], "period": periods, "scenario": scenarios,
@@ -1122,6 +1419,15 @@ class OperationsStore:
                 "errors": [], "reason": "existing incidents require side-by-side conflict resolution; no records were changed"}
 
     def import_bundle(self, bundle: dict[str, Any], actor: str = "local operator") -> dict[str, Any]:
+        """Apply an incident package produced by export_bundle(). Always
+        re-runs preview_import() first and refuses to write anything unless
+        `can_apply` is true - i.e. this only ever imports a brand-new
+        incident with no id collisions; importing into an incident that
+        already exists locally must go through manual conflict resolution
+        first (see PackageConflict/preview_import), never through this
+        method directly. All rows are inserted inside one transaction so a
+        failure partway through never leaves a half-imported incident
+        behind."""
         report = self.preview_import(bundle)
         if not report.get("can_apply"):
             raise PackageConflict(report)
@@ -1142,6 +1448,10 @@ class OperationsStore:
         feature_core = {"id", "incident_id", "period_id", "scenario_id", "feature_type", "title", "status", "observed_at", "source", "observer", "confidence", "valid_from", "valid_to", "created_by", "created_at", "updated_at", "revision", "deleted_at"}
 
         def insert_row(table: str, columns: tuple[str, ...], row: dict[str, Any]) -> None:
+            # Straight column-for-column insert; unlike copy_scenario, import
+            # preserves the incoming ids and revisions verbatim (this path is
+            # only reached for a brand-new incident, so nothing local is at
+            # risk of being overwritten - see preview_import's collision check).
             self.db.conn.execute(
                 f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
                 [row.get(column) for column in columns],
@@ -1214,7 +1524,11 @@ class OperationsStore:
         return {"imported": True, "report": report, "workspace": self.export_bundle(incident["id"])}
 
 
+# --------------------------------------------------------------------- defaults
 def default_period() -> dict[str, str]:
+    """Suggested values for a new operational period form: a 12-hour window
+    starting at the top of the current UTC hour. Convenience only - callers
+    are free to override any field before calling create_period()."""
     start = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     end = start + timedelta(hours=12)
     return {"name": start.strftime("Operational period %Y-%m-%d %H:%MZ"),

@@ -1,4 +1,21 @@
-"""HTTP API and static hosting for NexFiremap."""
+"""HTTP API and static hosting for NexFiremap.
+
+`create_app()` is the sole entry point - it builds one FastAPI app per call
+(settings and all per-app state are closed over rather than held at module
+scope, so tests can spin up independent instances). The app is: a single
+SecurityMiddleware doing auth/session/CSRF/role gating ahead of every
+route (see its own docstring for why the checks are ordered the way they
+are); a handful of `@app.exception_handler`s that keep every error response
+in the same ``{"detail": ...}`` JSON shape the frontend's fetch helpers all
+assume; and roughly 130 route handlers, grouped into the dash-comment
+delimited blocks below (meta, operations, detections, coverage, events,
+structures, industrial, eumetsat, cache, tiles, jobs, static) in roughly
+the same order the frontend tends to call them.
+Route handlers reach the long-lived services (Database, CacheManager,
+JobManager, ...) via ``request.app.state``, wired up once per app in
+`lifespan()` - see that function's docstring for the startup/shutdown
+contract and the ordering dependencies between those services.
+"""
 
 from __future__ import annotations
 
@@ -541,10 +558,49 @@ def _job_row_to_dict(row: Any) -> dict[str, Any]:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
+    """Build and return one fully wired NexFiremap FastAPI app.
+
+    Everything below is defined inside this function, not at module scope,
+    so each call gets its own closed-over `settings` and its own
+    `lifespan`/`SecurityMiddleware` - that's what lets tests build multiple
+    independent apps (e.g. one per settings fixture) without them sharing
+    module-level state. The pieces are assembled in this order: `lifespan`
+    (startup/shutdown of the manager singletons on `app.state`), the
+    `FastAPI(...)` instance itself, `SecurityMiddleware` (registered via
+    `add_middleware` - it still wraps every route regardless of where in
+    this function the routes themselves get declared, since the
+    middleware stack isn't built until the app actually starts serving
+    requests), exception handlers, then the route handlers grouped by
+    area. See the module docstring for the overall shape.
+    """
     settings = settings or load_settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        """Construct every long-lived service the route handlers rely on,
+        publish them onto `app.state` (the only channel a handler has to
+        reach them - see e.g. `request.app.state.db` throughout this file),
+        start the ones with a background loop/worker, `yield` for the
+        life of the server, then stop everything in reverse-ish order on
+        shutdown. FastAPI runs this exactly once per app instance around
+        the whole run, not per-request, so anything expensive to construct
+        (the sqlite connection, background threads) belongs here rather
+        than in a route handler.
+
+        Construction order below isn't arbitrary: `db` comes first because
+        almost everything else either takes it directly or takes
+        `app.state.operations`, which itself wraps `db` - and
+        `OperationsStore` has to exist before the incident-domain managers
+        (`telemetry`, `drone`, `wind`, `field_imports`, `tactics`,
+        `products`, `merges`) that are constructed from it a few lines
+        down. `offline_sources` similarly has to exist before `map_packs`
+        and `drone`, which both take it as a constructor argument.
+        `SecurityMiddleware` (added further below, outside this function)
+        reads `app.state.security` on every request, so it must already be
+        set by the time `yield` hands control back to Starlette - which it
+        is, since everything in this function runs to completion before
+        the `yield`.
+        """
         if settings.lan_mode and len(settings.admin_password) < 12:
             raise RuntimeError("LAN mode requires NEXFIREMAP_ADMIN_PASSWORD with at least 12 characters")
         db = Database(settings.db_path)
@@ -552,6 +608,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tiles = TileCache(settings)
         jobs = JobManager(settings, db)
         backups = BackupManager(settings, db)
+        # No corresponding `await geocode.start()` below - unlike
+        # cache/tiles/jobs/backups, GeocodeService has no background loop
+        # to start, only an HTTP client to close on shutdown (see
+        # `geocode.stop()` in the `finally` block).
         geocode = GeocodeService(settings)
         app.state.settings = settings
         app.state.db = db
@@ -561,7 +621,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.backups = backups
         app.state.geocode = geocode
         app.state.offline_sources = OfflineSourceManager(settings.tile_cache_dir)
+        # map_packs bundles tiles from both the live TileCache and any
+        # imported OfflineSourceManager layers, so it needs both to
+        # already exist.
         app.state.map_packs = MapPackManager(tiles, app.state.offline_sources)
+        # Every manager from here down is built on top of OperationsStore,
+        # which is why it's constructed first among them.
         app.state.operations = OperationsStore(db)
         app.state.telemetry = TelemetryManager(app.state.operations, settings)
         app.state.drone = DroneManager(app.state.operations, app.state.offline_sources, settings)
@@ -570,8 +635,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.tactics = TacticsManager(app.state.operations)
         app.state.products = ProductManager(db, app.state.operations)
         app.state.merges = MergeManager(app.state.operations)
+        # Independent of the operations/incident managers above - only
+        # needs settings and db - but must be set before `yield`, since
+        # SecurityMiddleware reads app.state.security on every request
+        # from here on.
         app.state.security = SecurityManager(settings, db)
         app.state.key_status = {"checked_at": 0.0, "payload": None}
+        # Only these four own a background loop/worker pool that needs
+        # explicitly starting; every other manager above does its work
+        # synchronously (via asyncio.to_thread from route handlers) and
+        # needs no start() call.
         await cache.start()
         await tiles.start()
         await jobs.start()
@@ -586,6 +659,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             yield
         finally:
+            # Runs even if startup above raised or the server is shutting
+            # down after a crash mid-request - `finally` guarantees every
+            # background loop gets a chance to stop cleanly and `db` gets
+            # closed, rather than leaking a worker thread or an open
+            # sqlite handle.
             await backups.stop()
             await cache.stop()
             await tiles.stop()
@@ -601,26 +679,85 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     class SecurityMiddleware(BaseHTTPMiddleware):
+        """The whole auth/session/CSRF/role gate for every request, in one
+        place so there's a single choke point to audit rather than each
+        route handler doing its own checks. The order of the checks below
+        matters: a session must be established before any role can be
+        read off it, the public-path allowlist has to be evaluated before
+        that (those paths are the ones a client hits *before* it has a
+        session at all - the login page, the login call itself, health
+        checks), and CSRF has to be checked before the write-permission
+        check so a request that isn't even a same-site request never gets
+        far enough to matter what role it would have needed.
+        """
+
         async def dispatch(self, request: Request, call_next):
+            # getattr with a default, not request.app.state.security
+            # directly - during the brief window before lifespan() has
+            # finished (or in a test app built without running lifespan
+            # at all) app.state.security may not exist yet.
             security: SecurityManager | None = getattr(request.app.state, "security", None)
             path = request.url.path
+            # The telemetry ingest endpoint authenticates each request with
+            # its own per-feed X-Feed-Token (checked inside the handler
+            # itself, see api_position_feed_ingest), not a session cookie -
+            # field devices posting positions have no browser session to
+            # send. It's carved out of the gate below rather than folded
+            # into the may_read/may_write role tables.
             feed_ingest = request.method == "POST" and path.startswith("/api/feeds/positions/")
+            # Everything else in this allowlist has to work before a
+            # client has ever logged in: the SPA shell and its assets, the
+            # health check (used by process supervisors, not a logged-in
+            # operator), the login call itself, and /api/config (the
+            # frontend reads it to render the login screen before any
+            # session exists).
             public_path = feed_ingest or path in {"/", "/health", "/service-worker.js", "/api/auth/login", "/api/config"} or path.startswith("/static/")
+            # security is None only in the getattr fallback above; when
+            # LAN mode is off, security.enabled is False and single-user
+            # loopback mode trusts every request the same way a local CLI
+            # tool would (see _require_administrator's docstring) - the
+            # entire gate below is skipped.
             if security and security.enabled and not public_path:
                 session = security.session(request.cookies.get("nexfiremap_session"))
                 if session is None:
                     return _json({"detail": "authentication required"}, 401)
+                # Stashed on request.state so route handlers (via
+                # _operator()/_require_administrator()) and the account-
+                # management check just below can read the caller's
+                # identity without re-parsing the cookie themselves.
                 request.state.identity = {"username": session.username, "role": session.role}
+                # Account management is administrator-only outright - it
+                # isn't expressed in the generic may_read/may_write role
+                # tables below, so it needs its own check, and that check
+                # has to come before the generic may_read call so a role
+                # that's otherwise allowed to GET most paths still can't
+                # list/create accounts.
                 if path.startswith("/api/auth/accounts") and session.role != "administrator":
                     return _json({"detail": "administrator role required"}, 403)
                 if request.method in {"GET", "HEAD"} and not security.may_read(session.role, path):
                     return _json({"detail": "role is not permitted to read this resource"}, 403)
                 if request.method not in {"GET", "HEAD", "OPTIONS"}:
+                    # Double-submit CSRF check: the token was handed to the
+                    # frontend at login (session.csrf) and must be echoed
+                    # back in a header on every state-changing request - a
+                    # cross-site form/script can forge the cookie-borne
+                    # session but has no way to read this header's value.
+                    # compare_digest avoids leaking the token a byte at a
+                    # time through response-timing differences.
                     if not hmac.compare_digest(request.headers.get("X-CSRF-Token", ""), session.csrf):
                         return _json({"detail": "CSRF token required"}, 403)
+                    # Logout is exempted from the write-permission table -
+                    # every authenticated role must always be able to log
+                    # itself out, even one with no other write permissions
+                    # at all.
                     if path != "/api/auth/logout" and not security.may_write(session.role, path):
                         return _json({"detail": "role is not permitted for this operation"}, 403)
             response = await call_next(request)
+            # These apply to every response that actually reaches a route
+            # handler (the 401/403s returned early above skip this and go
+            # out with only Starlette's default headers). setdefault, not
+            # a plain assignment, so a handler that already set one of
+            # these itself isn't overridden.
             response.headers.setdefault("X-Content-Type-Options", "nosniff")
             response.headers.setdefault("Referrer-Policy", "no-referrer")
             response.headers.setdefault("X-Frame-Options", "DENY")
@@ -1310,6 +1447,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> Response:
         store: OperationsStore = request.app.state.operations
         actor = _operator(request)
+        # A position report is always recorded as its own immutable
+        # tactical feature (the history of where things have been), and -
+        # only when it's tied to a known resource - *also* moves that
+        # resource's current position. The revision is read up front (not
+        # re-read after create_feature) so the update_resource call below
+        # uses an expected_revision from right before this request's own
+        # writes, same optimistic-concurrency contract every other
+        # PATCH in this file relies on.
         resource_row = None
         if body.resource_id:
             resource_row = store.db.conn.execute(
@@ -1328,6 +1473,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                            "horizontal_accuracy_m": body.accuracy_m},
         }, actor)
         if body.resource_id and resource_row is not None:
+            # Not wrapped in a single transaction with create_feature above -
+            # if another writer bumped this resource's revision in between
+            # (e.g. a concurrent manual edit), this raises RevisionConflict
+            # and the position report from above has already been
+            # committed. That's an accepted tradeoff, not an oversight: the
+            # report itself (the append-only history) is what matters most
+            # and is never lost even if the "current position" convenience
+            # update loses a race.
             await asyncio.to_thread(
                 store.update_resource, incident_id, body.resource_id,
                 {"latitude": body.latitude, "longitude": body.longitude, "position_at": body.observed_at},
