@@ -49,24 +49,49 @@
       def: (zone) => `+proj=utm +zone=${zone} +south +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs` },
   ];
 
+  /** Longitude to the standard 6°-wide UTM zone number (1-60), via the
+   * usual floor((lon+180)/6)+1 definition, clamped defensively at the
+   * antimeridian.
+   * @param {number} lon - Longitude in degrees.
+   * @returns {number} UTM zone number. */
   function utmZone(lon) {
     return Math.min(60, Math.max(1, Math.floor((lon + 180) / 6) + 1));
   }
 
+  /** Builds a proj4 definition string for a standard WGS84 UTM zone.
+   * @param {number} zone - UTM zone number (1-60).
+   * @param {boolean} southHemisphere - Whether to use the southern-hemisphere
+   *   false northing.
+   * @returns {string} proj4 definition string. */
   function utmDef(zone, southHemisphere) {
     return `+proj=utm +zone=${zone} +datum=WGS84 +units=m +no_defs${southHemisphere ? " +south" : ""}`;
   }
 
+  /** Looks up a national grid entry by id.
+   * @param {string} id - Grid id, e.g. "bng".
+   * @returns {?object} The matching NATIONAL_GRIDS entry, or null if unknown. */
   function findGrid(id) {
     return NATIONAL_GRIDS.find((grid) => grid.id === id) || null;
   }
 
+  /** Resolves a grid's proj4 definition, invoking its zone-selector
+   * function for zoned grids (e.g. GDA2020 MGA) since those need a
+   * longitude to know which UTM zone applies.
+   * @param {object} grid - A NATIONAL_GRIDS entry.
+   * @param {number} lon - Longitude in degrees, used only when the grid is zoned.
+   * @returns {string} proj4 definition string. */
   function gridDef(grid, lon) {
     return grid.zoned ? grid.def(utmZone(lon)) : grid.def;
   }
 
   // ------------------------------------------------------------- degrees
 
+  /** Formats a decimal-degree value as degrees/minutes/seconds, e.g.
+   * 48°51'23.4"N.
+   * @param {number} value - Signed decimal degrees.
+   * @param {string} positiveSuffix - Hemisphere letter used when value >= 0.
+   * @param {string} negativeSuffix - Hemisphere letter used when value < 0.
+   * @returns {string} Formatted DMS string. */
   function toDMS(value, positiveSuffix, negativeSuffix) {
     const suffix = value >= 0 ? positiveSuffix : negativeSuffix;
     const abs = Math.abs(value);
@@ -77,6 +102,12 @@
     return `${degrees}°${String(minutes).padStart(2, "0")}'${seconds.toFixed(1).padStart(4, "0")}"${suffix}`;
   }
 
+  /** Formats a decimal-degree value as degrees/decimal-minutes, e.g.
+   * 48°51.383'N.
+   * @param {number} value - Signed decimal degrees.
+   * @param {string} positiveSuffix - Hemisphere letter used when value >= 0.
+   * @param {string} negativeSuffix - Hemisphere letter used when value < 0.
+   * @returns {string} Formatted DDM string. */
   function toDDM(value, positiveSuffix, negativeSuffix) {
     const suffix = value >= 0 ? positiveSuffix : negativeSuffix;
     const abs = Math.abs(value);
@@ -85,10 +116,12 @@
     return `${degrees}°${minutes.toFixed(3)}'${suffix}`;
   }
 
+  /** Accepts decimal ("48.1234"), DMS ("48 51 23.4"), or DDM
+   * ("48 51.383") with any of °'" / spaces as separators, and either a
+   * trailing hemisphere letter (N/S/E/W) or a leading sign.
+   * @param {string} token - A single coordinate token (one axis).
+   * @returns {?number} Signed decimal degrees, or null if unparseable. */
   function parseDegreeToken(token) {
-    // Accepts decimal ("48.1234"), DMS ("48 51 23.4"), or DDM
-    // ("48 51.383") with any of °'" / spaces as separators, and either a
-    // trailing hemisphere letter (N/S/E/W) or a leading sign.
     const cleaned = token.trim();
     const hemisphereMatch = cleaned.match(/([NSEWnsew])\s*$/);
     const hemisphere = hemisphereMatch ? hemisphereMatch[1].toUpperCase() : null;
@@ -105,6 +138,10 @@
 
   // ------------------------------------------------------------- parsing
 
+  /** Parses a bare "lat, lon" decimal-degree pair.
+   * @param {string} text - Free-text input.
+   * @returns {?{lat: number, lon: number}} Parsed point, or null if it
+   *   doesn't match or is out of range. */
   function parseDecimalPair(text) {
     const match = text.trim().match(/^(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)$/);
     if (!match) return null;
@@ -114,9 +151,12 @@
     return { lat, lon };
   }
 
+  /** Two degree-ish tokens (DMS or DDM, each ending in a hemisphere
+   * letter) separated by a space or comma - "48°51'23\"N 2°17'40\"E".
+   * @param {string} text - Free-text input.
+   * @returns {?{lat: number, lon: number}} Parsed point, or null if it
+   *   doesn't match or is out of range. */
   function parseDmsPair(text) {
-    // Two degree-ish tokens (DMS or DDM, each ending in a hemisphere
-    // letter) separated by a space or comma - "48°51'23\"N 2°17'40\"E".
     const match = text.trim().match(/^(.+[NSns])[\s,]+(.+[EWew])$/);
     if (!match) return null;
     const lat = parseDegreeToken(match[1]);
@@ -125,6 +165,10 @@
     return { lat, lon };
   }
 
+  /** Parses an MGRS grid reference (requires the vendored mgrs library).
+   * @param {string} text - Free-text input.
+   * @returns {?{lat: number, lon: number}} Parsed point, or null if
+   *   unavailable or unparseable. */
   function parseMgrs(text) {
     if (typeof window.mgrs === "undefined") return null;
     const candidate = text.trim().toUpperCase().replace(/\s+/g, "");
@@ -137,6 +181,11 @@
     }
   }
 
+  /** Parses a "<zone><hemisphere> <easting> <northing>" UTM string, e.g.
+   * "33N 500000 4649776" (requires the vendored proj4 library).
+   * @param {string} text - Free-text input.
+   * @returns {?{lat: number, lon: number}} Parsed point, or null if
+   *   unavailable or unparseable. */
   function parseUtm(text) {
     if (typeof window.proj4 === "undefined") return null;
     const match = text.trim().match(/^(\d{1,2})\s*([NnSs])\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)$/);
@@ -152,6 +201,13 @@
     }
   }
 
+  /** Parses an easting/northing pair against a specific national (or
+   * custom) grid; not attempted for wgs84/utm/mgrs since those already
+   * have their own parsers above.
+   * @param {string} text - Free-text input.
+   * @param {?string} gridId - A NATIONAL_GRIDS id, or "custom".
+   * @returns {?{lat: number, lon: number}} Parsed point, or null if
+   *   unavailable or unparseable. */
   function parseGrid(text, gridId) {
     if (typeof window.proj4 === "undefined" || !gridId || gridId === "wgs84" || gridId === "utm" || gridId === "mgrs") return null;
     const match = text.trim().match(/^(-?\d+(?:\.\d+)?)\s*[,\s]\s*(-?\d+(?:\.\d+)?)$/);
@@ -199,6 +255,13 @@
 
   // ------------------------------------------------------------ formatting
 
+  /** Formats a WGS84 point for display in the given coordinate system.
+   * @param {number} lat - Latitude in degrees.
+   * @param {number} lon - Longitude in degrees.
+   * @param {?string} systemId - One of SYSTEMS' ids; defaults to wgs84
+   *   decimal degrees.
+   * @returns {string} Formatted coordinate string, or "" if the required
+   *   library is unavailable. */
   function format(lat, lon, systemId) {
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return "";
     switch (systemId) {
@@ -258,6 +321,9 @@
     { id: "custom", label: "Custom (EPSG/proj4 string)" },
   ];
 
+  /** Reads the user's last-selected coordinate system from localStorage.
+   * @returns {string} A SYSTEMS id, defaulting to "wgs84" if unset or
+   *   unavailable. */
   function currentSystem() {
     try {
       return localStorage.getItem("nexfiremap.coords.system") || "wgs84";
@@ -266,6 +332,8 @@
     }
   }
 
+  /** Persists the user's coordinate system choice for future sessions.
+   * @param {string} id - A SYSTEMS id. */
   function setSystem(id) {
     try {
       localStorage.setItem("nexfiremap.coords.system", id);

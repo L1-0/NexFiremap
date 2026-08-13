@@ -13,16 +13,27 @@
     { max: 48, color: "#9abf67", label: "≤48 h" },
   ];
 
+  /** Maps hours-to-impact to a ramp color; unreached/unknown structures
+   * render as neutral gray rather than falling off the end of the ramp.
+   * @param {?number} hours - Hours until modelled fire arrival, or null if not reached.
+   * @returns {string} A hex color. */
   function colorFor(hours) {
     if (hours == null) return "#7d8490";
     for (const step of ramp) if (hours <= step.max) return step.color;
     return "#7d8490";
   }
 
+  /** Escapes a value for safe interpolation into innerHTML.
+   * @param {*} value - Value to escape; nullish becomes an empty string.
+   * @returns {string} Escaped text. */
   function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   }
 
+  /** Fetches JSON and throws with the server's error detail (falling back
+   * to the HTTP status) on a non-OK response.
+   * @param {string} url - Request URL.
+   * @returns {Promise<object>} Parsed JSON payload. */
   async function fetchJson(url) {
     const response = await fetch(url);
     const payload = await response.json().catch(() => ({}));
@@ -30,6 +41,11 @@
     return payload;
   }
 
+  /** Polls a background job until it completes, tolerating transient
+   * network hiccups (see rationale below) rather than failing on the
+   * first blip.
+   * @param {string} jobId - Job id returned by the scan-trigger endpoint.
+   * @returns {Promise<void>} Resolves once the job reports status "done". */
   async function waitForJob(jobId) {
     const deadline = Date.now() + 120000;
     // A structure scan can run for a while (Overpass can be slow), so this
@@ -65,6 +81,9 @@
     throw new Error("timed out while caching structures");
   }
 
+  /** Builds the Leaflet popup HTML for a single structure feature.
+   * @param {object} feature - A GeoJSON feature from the exposure payload.
+   * @returns {string} Popup HTML. */
   function popup(feature) {
     const p = feature.properties;
     const timing = p.impact_hours == null ? "Not reached in the model surface" :
@@ -77,6 +96,8 @@
       `<br><small>Modelled scenario exposure only; not confirmed damage or evacuation status.</small></div>`;
   }
 
+  /** Redraws the structures layer from the current exposure payload and
+   * horizon slider, and refreshes the summary counts. */
   function render() {
     state.layer.clearLayers();
     if (!state.exposure || !$("#structures-toggle").checked) return;
@@ -107,6 +128,12 @@
       `<small>${allFinite.toLocaleString()} structures reached across the complete model horizon.</small>`;
   }
 
+  /** Loads (and optionally triggers an Overpass rescan for) building
+   * exposure for the current analysis, guarding against stale responses
+   * via state.token when the user switches analyses mid-request.
+   * @param {object} [options]
+   * @param {boolean} [options.scan=false] - Whether to trigger a fresh structure scan.
+   * @returns {Promise<void>} */
   async function loadExposure({ scan = false } = {}) {
     if (!state.analysis) return;
     const token = ++state.token;
@@ -137,6 +164,9 @@
     }
   }
 
+  /** Switches the active spread/ensemble analysis, resetting any
+   * in-flight exposure request and loading exposure for the new one.
+   * @param {?object} detail - The analysis detail (with jobId), or null to clear. */
   function setAnalysis(detail) {
     state.token += 1;
     state.analysis = detail;
@@ -147,6 +177,9 @@
     if (detail) loadExposure();
   }
 
+  /** Wires up the structures layer and controls once the map is ready;
+   * safe to call more than once since it re-enters only on the first call.
+   * @param {L.Map} map - The Leaflet map instance. */
   function init(map) {
     if (state.map) return;
     state.map = map;
