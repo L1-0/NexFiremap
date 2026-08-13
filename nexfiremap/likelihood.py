@@ -448,6 +448,9 @@ def probability_envelopes(
 
 
 def _ramp_color(t: float) -> tuple[int, int, int]:
+    """Linear RGB interpolation between the two ``FIRE_RAMP_RGB`` stops
+    bracketing ``t`` (0-1) - used once, up front, to build ``_RAMP_LUT``,
+    not called per-pixel at render time."""
     t = max(0.0, min(1.0, t))
     scaled = t * (len(FIRE_RAMP_RGB) - 1)
     i = min(len(FIRE_RAMP_RGB) - 2, int(scaled))

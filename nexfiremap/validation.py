@@ -143,6 +143,10 @@ def _xy_m(geom: dict[str, Any], lat: float, lon: float) -> tuple[float, float]:
 
 
 def _sample(raster: np.ndarray, geom: dict[str, Any], lat: float, lon: float) -> float:
+    """Nearest-cell value of ``raster`` at ``(lat, lon)`` - clamped to the
+    grid's own extent rather than raising, since a held-out detection can
+    legitimately fall just outside a per-split training-only grid built by
+    ``_train_grid_bbox``."""
     x, y = _xy_m(geom, lat, lon)
     col = int(np.clip(x / geom["width_m"] * geom["nx"], 0, geom["nx"] - 1))
     row = int(np.clip(y / geom["height_m"] * geom["ny"], 0, geom["ny"] - 1))
@@ -474,6 +478,9 @@ def score_prediction(
 
 
 def mean_of(key: str, rows: list[dict[str, Any]]) -> float | None:
+    """Mean of ``rows[*][key]``, skipping rows where it's ``None`` (a metric
+    that wasn't defined for that split, e.g. precision with zero predicted
+    positives) rather than letting one undefined split poison the average."""
     vals = [r[key] for r in rows if r.get(key) is not None]
     return round(float(np.mean(vals)), 4) if vals else None
 
@@ -525,6 +532,12 @@ def _missed_fronts(
     geom: dict[str, Any],
     threshold: float,
 ) -> int:
+    """Count of the module docstring's "missed disconnected fronts" metric:
+    cluster the held-out detections into their own spatially-distinct
+    groups (via ``events.cluster_detections``) and count how many of those
+    clusters have *no* member sampled above ``threshold`` in the
+    prediction - a whole separate front the model missed entirely, not
+    just a partial miss within a front it otherwise caught."""
     if not near_holdout:
         return 0
     clusters = cluster_detections(

@@ -123,6 +123,10 @@ def _snap_bbox(
 
 
 def build_overpass_query(bbox: tuple[float, float, float, float]) -> str:
+    """Overpass QL matching every ``STRONG_TAGS``/``MODERATE_TAGS`` pair as
+    either a node or a way within ``bbox``, with ``out center`` so a way's
+    result carries a single representative point rather than its full
+    geometry - all this module needs downstream."""
     west, south, east, north = bbox
     bbox_clause = f"({south},{west},{north},{east})"
     lines = ["[out:json][timeout:45];", "("]
@@ -148,6 +152,11 @@ _NON_COMBUSTION_GENERATOR_METHODS = {"photovoltaic", "wind_turbine", "water-stor
 
 
 def _is_combustion_generator(tags: dict[str, str]) -> bool:
+    """False only when OSM's own ``generator:source``/``generator:method``
+    tags positively identify a non-combustion method (see the comment
+    above); an untagged or unrecognised generator is assumed combustion
+    (the conservative direction here - see ``_evidence_class``, this only
+    gates the "moderate" bucket, not exclusion of a real candidate)."""
     source = tags.get("generator:source")
     method = tags.get("generator:method")
     if source is not None and source in _NON_COMBUSTION_GENERATOR_SOURCES:
@@ -158,6 +167,11 @@ def _is_combustion_generator(tags: dict[str, str]) -> bool:
 
 
 def _evidence_class(tags: dict[str, str]) -> str | None:
+    """"strong", "moderate", or ``None`` (no matching tag at all) for one
+    OSM element's tags. A ``power=generator`` match is downgraded from
+    "moderate" to no match when ``_is_combustion_generator`` says it's a
+    non-combustion source (solar/wind/hydro/...), rather than counting
+    every generator as thermal-source evidence."""
     for key, value in STRONG_TAGS:
         if tags.get(key) == value:
             return "strong"

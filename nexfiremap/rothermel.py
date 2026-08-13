@@ -112,6 +112,10 @@ class FuelModel:
 
 
 def anderson13(number: int) -> FuelModel:
+    """Look up one of the 13 standard fuel models by number and unpack its
+    raw ``_ANDERSON13_RAW`` tuple into a ``FuelModel`` - heat content is
+    broadcast to all 5 size classes (the table only carries one value per
+    fuel model, not per class) and converted from kBtu/lb to Btu/lb."""
     raw = _ANDERSON13_RAW[number]
     depth_ft, mext_pct, heat_kbtu = raw[0], raw[1], raw[2]
     return FuelModel(
@@ -164,6 +168,10 @@ _ZERO_NWS = NoWindNoSlope(0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0)
 
 
 def _moisture_damping(m_f: float, m_x: float) -> float:
+    """Rothermel's moisture damping coefficient (eta_m, sec.5): a cubic
+    falloff of reaction intensity as fuel moisture ``m_f`` approaches its
+    moisture of extinction ``m_x``, clamped to 0 once ``m_f`` reaches or
+    exceeds ``m_x`` (fuel that wet no longer supports combustion)."""
     if m_x <= 0.0:
         return 0.0
     r = min(1.0, max(0.0, m_f / m_x))

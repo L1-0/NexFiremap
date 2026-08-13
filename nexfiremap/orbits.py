@@ -54,6 +54,11 @@ EARTH_RADIUS_KM = 6371.0
 
 
 def parse_tle_text(text: str) -> tuple[str, str] | None:
+    """Pull the first (line-1, line-2) TLE pair out of Celestrak's raw
+    response. Celestrak's GP.php output leads with a name line before the
+    numeric pair, so this scans for the "1 "/"2 " prefixes rather than
+    assuming a fixed line offset. Returns ``None`` if no such pair is
+    found (empty body, an error page, ...)."""
     lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
     for i in range(len(lines) - 1):
         if lines[i].startswith("1 ") and lines[i + 1].startswith("2 "):
@@ -62,6 +67,10 @@ def parse_tle_text(text: str) -> tuple[str, str] | None:
 
 
 def fetch_tle_sync(client: httpx.Client, norad_id: int) -> tuple[str, str] | None:
+    """One Celestrak GP.php request for ``norad_id``'s current TLE. Returns
+    ``None`` (not a raised error) on any HTTP failure or an unparseable
+    response, so a transient Celestrak outage degrades to the caller's own
+    stale-TLE fallback (``ensure_tle``) instead of propagating."""
     url = CELESTRAK_URL.format(norad_id=norad_id)
     try:
         response = client.get(url, timeout=20.0)
@@ -73,6 +82,9 @@ def fetch_tle_sync(client: httpx.Client, norad_id: int) -> tuple[str, str] | Non
 
 
 async def fetch_tle_async(client: httpx.AsyncClient, norad_id: int) -> tuple[str, str] | None:
+    """Async twin of ``fetch_tle_sync`` for callers already running inside an
+    event loop (e.g. an API route) rather than a worker-process job body,
+    which only ever has plain sync sqlite3/httpx available."""
     url = CELESTRAK_URL.format(norad_id=norad_id)
     try:
         response = await client.get(url, timeout=20.0)
@@ -84,6 +96,9 @@ async def fetch_tle_async(client: httpx.AsyncClient, norad_id: int) -> tuple[str
 
 
 def _tle_from_db(conn: sqlite3.Connection, satellite: str, max_age: int) -> tuple[str, str] | None:
+    """Cached TLE for ``satellite`` if one exists and is younger than
+    ``max_age`` seconds, else ``None`` - callers decide what "else" means
+    (``ensure_tle`` re-fetches; other callers may want a stricter cutoff)."""
     row = conn.execute(
         "SELECT line1, line2, fetched_at FROM tle WHERE satellite = ?", (satellite,)
     ).fetchone()
@@ -96,6 +111,9 @@ def _tle_from_db(conn: sqlite3.Connection, satellite: str, max_age: int) -> tupl
 
 
 def _tle_to_db(conn: sqlite3.Connection, satellite: str, line1: str, line2: str) -> None:
+    """Upsert ``satellite``'s freshly-fetched TLE, stamping ``fetched_at``
+    with the current time so ``_tle_from_db``/``tle_age_days`` measure age
+    from this write, not from whatever epoch the TLE itself encodes."""
     conn.execute(
         "INSERT INTO tle (satellite, line1, line2, fetched_at) VALUES (?, ?, ?, ?) "
         "ON CONFLICT (satellite) DO UPDATE SET "
@@ -175,6 +193,10 @@ def tle_age_days(conn: sqlite3.Connection, satellite: str) -> float | None:
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in km between two lat/lon points - the same
+    formula as ``geo.haversine_km``, kept as a local copy so this module's
+    otherwise stdlib-plus-httpx dependency footprint doesn't pick up
+    ``geo.py``'s numpy import just for this one scalar formula."""
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)

@@ -125,6 +125,10 @@ ISOCHRONE_HOURS = (3, 6, 12, 24, 48)
 
 
 def _catalog() -> pystac_client.Client:
+    """Microsoft Planetary Computer STAC client, with the ``pc.sign_inplace``
+    modifier so every search result's asset hrefs come back pre-signed -
+    the DEM/WorldCover fetchers below can hand them straight to
+    ``read_band_on_grid`` without a separate signing step."""
     return pystac_client.Client.open(STAC_URL, modifier=pc.sign_inplace)
 
 
@@ -212,6 +216,10 @@ def fuel_model_grid(worldcover_classes: np.ndarray) -> np.ndarray:
 
 
 def circular_mean_deg(degrees: list[float]) -> float:
+    """Mean compass bearing, correctly wrapping the 0/360 seam - averaging
+    e.g. 350deg and 10deg naively gives 180deg (due south) instead of the
+    correct 0deg, so this averages the unit vectors (sin, cos) and converts
+    back rather than averaging the degree values directly."""
     radians = np.radians(degrees)
     mean_angle = math.atan2(float(np.mean(np.sin(radians))), float(np.mean(np.cos(radians))))
     return math.degrees(mean_angle) % 360.0
@@ -223,6 +231,11 @@ _HOURLY_FIELDS = "wind_speed_10m,wind_direction_10m,relative_humidity_2m,tempera
 def _fetch_open_meteo_hourly(
     url: str, lat: float, lon: float, extra_params: dict[str, Any]
 ) -> dict[str, list[Any]] | None:
+    """Shared GET against either Open-Meteo endpoint (archive or forecast)
+    for the fixed ``_HOURLY_FIELDS`` set - ``extra_params`` carries
+    whichever date/day-range parameters distinguish the two. Returns
+    ``None`` (not a raised error) on any request/parse failure, so
+    ``fetch_weather`` can treat the forecast backfill as best-effort."""
     try:
         response = httpx.get(
             url,
@@ -448,6 +461,12 @@ def isochrone_contours(
     hours: tuple[float, ...] = ISOCHRONE_HOURS,
     max_ros_m_min: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
+    """GeoJSON LineString contours of ``travel_time_s`` at each hour mark in
+    ``hours`` that's actually reached within the (barrier-excluded) grid -
+    marching-squares isolines, same technique as ``likelihood.
+    probability_envelopes`` but on arrival time rather than probability
+    mass. Hours beyond what the grid's own 99th-percentile travel time
+    covers are skipped rather than drawn as an empty or degenerate contour."""
     west, south, east, north = geom["bbox"]
     nx, ny = geom["nx"], geom["ny"]
     features = []
