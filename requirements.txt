@@ -1,0 +1,34 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+
+# background compute jobs (Phase 0)
+psutil>=6.0
+
+# orbital swath coverage (Phase 1)
+skyfield>=1.49
+
+# probabilistic reconstruction (Phase 2) - classical stats/geometry, no ML
+numpy>=2.0
+scipy>=1.13
+scikit-image>=0.24
+
+# optical burn-scar anchoring (Phase 3) - Sentinel-2/Landsat via Planetary Computer
+rasterio>=1.3
+matplotlib>=3.8
+pillow>=10.0
+pystac-client>=0.8
+planetary-computer>=1.0
+
+# physics-based propagation modelling - real Rothermel (1972, Albini 1976-corrected)
+# surface-fire kernel (nexfiremap/rothermel.py) + dead-fuel moisture conditioning
+# (nexfiremap/moisture.py), solved anisotropically via a pure-numpy/heapq graph
+# Dijkstra (nexfiremap/terrain.py) - no extra dependency beyond numpy/scipy above.
+# (scikit-fmm was used for an earlier isotropic-only solve; removed - see the
+# fire-propagation upgrade plan for why an anisotropic graph solve replaced it.)
+
+# EUMETSAT MTG/FCI active-fire corroboration (nexfiremap/eumetsat.py) - reads
+# the product's netCDF4/HDF5 file directly (GDAL's netCDF driver hit a real
+# _FillValue-type-mismatch bug on this specific product when tried via
+# rasterio, confirmed live - h5py sidesteps it and is otherwise unused here).
+h5py>=3.10

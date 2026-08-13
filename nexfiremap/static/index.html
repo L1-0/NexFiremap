@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NexFiremap</title>
+<link rel="icon" type="image/png" href="/static/img/nexfiremap-64.png">
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="/static/vendor/markercluster/MarkerCluster.css">
+<link rel="stylesheet" href="/static/vendor/markercluster/MarkerCluster.Default.css">
+<link rel="stylesheet" href="/static/vendor/maplibre/maplibre-gl.css">
+<link rel="stylesheet" href="/static/css/app.css">
+<link rel="manifest" href="/static/manifest.webmanifest">
+</head>
+<body>
+
+<dialog id="auth-dialog" class="auth-dialog" aria-labelledby="auth-title">
+  <form id="auth-form" method="dialog">
+    <h2 id="auth-title">Incident LAN sign in</h2>
+    <p>Use an account issued by the incident-system administrator. Credentials stay on this local server.</p>
+    <label class="field"><span>Username</span><input id="auth-username" autocomplete="username" required maxlength="100"></label>
+    <label class="field"><span>Password</span><input id="auth-password" type="password" autocomplete="current-password" required maxlength="1000"></label>
+    <p id="auth-error" class="auth-error" role="alert" aria-live="polite"></p>
+    <button class="btn" type="submit">Sign in</button>
+  </form>
+</dialog>
+
+<div id="map" role="application" aria-label="Fire detection map"></div>
+
+<div id="basemap-picker" class="basemap-picker">
+  <button id="basemap-toggle" class="basemap-toggle" type="button" aria-expanded="false"
+    aria-controls="basemap-flyout" title="Change basemap">
+    <span id="basemap-toggle-thumb" class="basemap-toggle-thumb" aria-hidden="true"></span>
+    <span class="basemap-toggle-badge" aria-hidden="true">🗺</span>
+  </button>
+  <div id="basemap-flyout" class="basemap-flyout" role="menu" aria-label="Basemap and overlays" hidden>
+    <div id="basemap-grid" class="basemap-grid" role="none"></div>
+    <div id="basemap-overlays" class="basemap-overlays" role="none"></div>
+  </div>
+</div>
+
+<div id="map3d-wrap" class="map3d-wrap" hidden>
+  <div id="map3d" role="application" aria-label="3D terrain view of the fire"></div>
+  <button id="btn-close-3d" class="btn ghost map3d-close" type="button">← back to 2D map</button>
+  <p class="hint map3d-hint" id="map3d-hint">
+    OpenTopoMap terrain (exaggerated for legibility) · drag to orbit, scroll to zoom, shift-drag to tilt.
+  </p>
+</div>
+
+<header class="topbar">
+  <div class="brand">
+    <img class="brand-mark" src="/static/img/nexfiremap-256.png" alt="" aria-hidden="true">
+    <div id="app-switcher" class="app-switcher">
+      <button id="app-switcher-toggle" class="app-switcher-toggle" type="button"
+        aria-expanded="false" aria-controls="app-switcher-menu" aria-haspopup="menu">
+        <span id="app-switcher-label">NexFiremap</span>
+        <span class="app-switcher-caret" aria-hidden="true">▾</span>
+      </button>
+      <ul id="app-switcher-menu" class="app-switcher-menu" role="menu" aria-label="Application" hidden>
+        <li role="none"><button type="button" role="menuitemradio" aria-checked="true" data-app-select="firemap">
+          <strong>NexFiremap</strong><small>Satellite fire detections, coverage, sources</small></button></li>
+        <li role="none"><button type="button" role="menuitemradio" aria-checked="false" data-app-select="incident-command">
+          <strong>NexIncidentCommand</strong><small>Plans, tactics, safety, resources, products</small></button></li>
+        <li role="none"><button type="button" role="menuitemradio" aria-checked="false" data-app-select="ingest">
+          <strong>NexIngest</strong><small>Telemetry, drone imagery, field data, imports</small></button></li>
+        <li role="none"><button type="button" role="menuitemradio" aria-checked="false" data-app-select="eventview">
+          <strong>NexEventView</strong><small>Fire event detection and behaviour analysis</small></button></li>
+      </ul>
+    </div>
+  </div>
+  <div id="map-search" class="map-search" role="search">
+    <span class="map-search-icon" aria-hidden="true">🔍</span>
+    <input id="map-search-input" type="text" autocomplete="off" spellcheck="false"
+      placeholder="Search places, or lat, lon" aria-label="Search places or coordinates"
+      role="combobox" aria-expanded="false" aria-controls="map-search-results" aria-autocomplete="list">
+    <button id="map-search-clear" class="map-search-clear" type="button" hidden aria-label="Clear search">✕</button>
+    <select id="coord-system-select" class="coord-system-select" title="Coordinate format for typed entry and shown coordinates" aria-label="Coordinate format"></select>
+    <input id="coord-custom-proj4" class="coord-custom-proj4" type="text" placeholder="Custom proj4 definition, e.g. +proj=utm +zone=32 +datum=WGS84 +units=m +no_defs" aria-label="Custom proj4 definition" hidden>
+    <ul id="map-search-results" class="map-search-results" role="listbox" aria-label="Search results" hidden></ul>
+  </div>
+  <div class="topbar-status">
+    <span id="auth-identity" class="pill muted" hidden></span>
+    <button id="btn-auth-logout" class="link-btn" type="button" hidden>sign out</button>
+    <span id="ops-connectivity" class="pill muted" title="Connection to the local command server">local server -</span>
+    <span id="fetch-indicator" class="pill" hidden>
+      <span class="spinner" aria-hidden="true"></span><span id="fetch-text">Fetching…</span>
+    </span>
+    <span id="cache-pill" class="pill muted" title="Rows held in the local cache">cache -</span>
+    <button id="btn-print-view" class="icon-btn" type="button" title="Print this view">🖨</button>
+    <button id="btn-panel" class="icon-btn" aria-expanded="true" aria-controls="panel" title="Toggle panel">☰</button>
+  </div>
+</header>
+
+<div id="setup" class="setup" hidden>
+  <h2>Add your NASA FIRMS map key</h2>
+  <p>
+    NexFiremap needs a free FIRMS map key before it can download any detections.
+  </p>
+  <ol>
+    <li>Request one at <a href="https://firms.modaps.eosdis.nasa.gov/api/map_key/" target="_blank" rel="noopener">firms.modaps.eosdis.nasa.gov/api/map_key</a></li>
+    <li>Copy <code>.env.example</code> to <code>.env</code></li>
+    <li>Set <code>FIRMS_MAP_KEY=your-key</code> and restart the server</li>
+  </ol>
+</div>
+
+<aside id="panel" class="panel" aria-label="Map controls">
+
+  <section id="public-products-view" class="block" hidden aria-labelledby="h-public-products">
+    <h2 id="h-public-products">Public incident information</h2>
+    <p class="hint">Only products explicitly generated with the public-information template appear here.</p>
+    <div id="public-product-list" class="ops-resource-list"></div>
+  </section>
+
+  <section class="block operations-block" aria-labelledby="h-operations" data-app="incident-command ingest eventview">
+    <div class="block-head">
+      <h2 id="h-operations">Incident command</h2>
+      <button id="btn-new-incident" class="link-btn" type="button">new incident</button>
+    </div>
+    <label class="field" data-app="incident-command ingest eventview">
+      <span>Active incident</span>
+      <select id="ops-incident"><option value="">No incident selected</option></select>
+    </label>
+    <div id="ops-workspace" hidden>
+      <div data-app="incident-command ingest eventview">
+        <label class="field"><span>Operator / unit</span><input id="ops-operator" maxlength="200" value="local operator"></label>
+        <div class="ops-context-grid">
+          <label class="field"><span>Operational period</span><select id="ops-period"></select></label>
+          <label class="field"><span>Plan scenario</span><select id="ops-scenario"></select></label>
+        </div>
+        <div class="button-row">
+          <button id="btn-next-period" class="btn ghost" type="button">next period</button>
+          <button id="btn-new-scenario" class="btn ghost" type="button">new scenario</button>
+        </div>
+      </div>
+
+      <details class="ops-details" id="ops-command-records" data-app="incident-command">
+        <summary>Incident, period and scenario records</summary>
+        <h4>Incident</h4>
+        <div class="ops-context-grid">
+          <label class="field"><span>Name</span><input id="ops-incident-name" maxlength="300"></label>
+          <label class="field"><span>Identifier</span><input id="ops-incident-number" maxlength="100"></label>
+          <label class="field"><span>Status</span><select id="ops-incident-status"><option>active</option><option>contained</option><option>closed</option></select></label>
+          <label class="field"><span>Timezone</span><input id="ops-incident-timezone" maxlength="80"></label>
+        </div>
+        <label class="field"><span>Incident notes</span><textarea id="ops-incident-notes" rows="2" maxlength="10000"></textarea></label>
+        <button id="btn-save-incident" class="btn ghost" type="button">save incident</button>
+
+        <h4>Operational period</h4>
+        <div class="ops-context-grid">
+          <label class="field"><span>Name</span><input id="ops-period-name" maxlength="300"></label>
+          <label class="field"><span>Status</span><select id="ops-period-status"><option>draft</option><option>active</option><option>closed</option></select></label>
+          <label class="field"><span>Starts</span><input id="ops-period-start" type="datetime-local"></label>
+          <label class="field"><span>Ends</span><input id="ops-period-end" type="datetime-local"></label>
+        </div>
+        <label class="field"><span>Objectives</span><textarea id="ops-period-objectives" rows="2" maxlength="10000"></textarea></label>
+        <button id="btn-save-period" class="btn ghost" type="button">save period</button>
+
+        <h4>Plan scenario</h4>
+        <div class="ops-context-grid">
+          <label class="field"><span>Name</span><input id="ops-scenario-name" maxlength="300"></label>
+          <label class="field"><span>Kind</span><select id="ops-scenario-kind"><option>primary</option><option>contingency</option><option>alternative</option><option>worst_case</option></select></label>
+          <label class="field"><span>Status</span><select id="ops-scenario-status"><option>draft</option><option disabled>approved</option><option>retired</option></select></label>
+        </div>
+        <label class="field"><span>Description</span><textarea id="ops-scenario-description" rows="2" maxlength="10000"></textarea></label>
+        <label class="field"><span>Assumptions</span><textarea id="ops-scenario-assumptions" rows="2" maxlength="10000"></textarea></label>
+        <button id="btn-save-scenario" class="btn ghost" type="button">save scenario</button>
+        <p class="hint">Editing an approved plan returns it to draft for another safety review.</p>
+      </details>
+
+      <div data-app="incident-command">
+      <h3>Tactical drawing</h3>
+      <div class="ops-context-grid">
+        <label class="field"><span>Object type</span><select id="ops-feature-type"></select></label>
+        <label class="field"><span>Status</span><select id="ops-feature-status">
+          <option value="observed">observed</option><option value="unconfirmed">unconfirmed</option>
+          <option value="confirmed">confirmed</option><option value="proposed">proposed</option>
+          <option value="planned">planned</option><option value="under_construction">under construction</option>
+          <option value="completed">completed</option><option value="held">held</option>
+          <option value="breached">breached</option><option value="active">active</option>
+          <option value="inactive">inactive</option><option value="abandoned">abandoned</option>
+        </select></label>
+      </div>
+      <label class="field"><span>Title / callsign</span><input id="ops-feature-title" maxlength="300" placeholder="e.g. North control line"></label>
+      <details class="ops-details ops-record-fields" id="ops-record-fields">
+        <summary>Operational record</summary>
+        <label class="field"><span>Objective</span><textarea id="ops-objective" rows="2" maxlength="10000"></textarea></label>
+        <div class="ops-context-grid">
+          <label class="field"><span>Responsible unit</span><input id="ops-responsible-unit" maxlength="300"></label>
+          <label class="field"><span>Priority</span><select id="ops-priority"><option>routine</option><option>low</option><option selected>normal</option><option>high</option><option>critical</option></select></label>
+        </div>
+        <label class="field"><span>Assigned crews / vehicles</span><input id="ops-assigned-resources" maxlength="1000"></label>
+        <label class="field"><span>Method / tactic</span><input id="ops-method" maxlength="300" placeholder="e.g. machine line, hose lay, indirect attack"></label>
+        <div class="ops-context-grid">
+          <label class="field"><span>Planned start</span><input id="ops-valid-from" type="datetime-local"></label>
+          <label class="field"><span>Planned completion</span><input id="ops-valid-to" type="datetime-local"></label>
+        </div>
+        <label class="field"><span>Required equipment</span><input id="ops-equipment" maxlength="1000"></label>
+        <label class="field"><span>Water requirement</span><input id="ops-water" maxlength="500"></label>
+        <label class="field"><span>Prerequisites</span><textarea id="ops-prerequisites" rows="2" maxlength="5000"></textarea></label>
+        <label class="field"><span>Hazards</span><textarea id="ops-hazards" rows="2" maxlength="5000"></textarea></label>
+        <div class="ops-context-grid">
+          <label class="field"><span>Escape route</span><input id="ops-escape-route" maxlength="500"></label>
+          <label class="field"><span>Safety zone</span><input id="ops-safety-zone" maxlength="500"></label>
+        </div>
+        <label class="field"><span>Communications channel</span><input id="ops-communications" maxlength="300"></label>
+        <div class="ops-context-grid">
+          <label class="field"><span>Source</span><input id="ops-source" maxlength="200"></label>
+          <label class="field"><span>Confidence</span><select id="ops-confidence"><option value="">not recorded</option><option>unconfirmed</option><option>low</option><option>medium</option><option>high</option><option>confirmed</option></select></label>
+          <label class="field"><span>Observed time</span><input id="ops-observed-at" type="datetime-local"></label>
+          <label class="field"><span>Observer</span><input id="ops-observer" maxlength="200"></label>
+          <label class="field"><span>Horizontal accuracy (m)</span><input id="ops-horizontal-accuracy" type="number" min="0" step="1"></label>
+          <label class="field"><span>Fire activity</span><select id="ops-fire-activity"><option value="">not recorded</option><option>smouldering</option><option>creeping</option><option>running</option><option>torching</option><option>crowning</option><option>spotting</option></select></label>
+          <label class="field"><span>Observed intensity</span><input id="ops-intensity" maxlength="200" placeholder="descriptive or measured"></label>
+          <label class="field"><span>Wind notes</span><input id="ops-wind" maxlength="200" placeholder="exposure, variability, instrument"></label>
+          <label class="field"><span>Wind speed (m/s)</span><input id="ops-wind-speed-ms" type="number" min="0" max="150" step="0.1"></label>
+          <label class="field"><span>Wind from (degrees)</span><input id="ops-wind-from-deg" type="number" min="0" max="360" step="1"></label>
+          <label class="field"><span>Wind gust (m/s)</span><input id="ops-wind-gust-ms" type="number" min="0" max="200" step="0.1"></label>
+          <label class="field"><span>Measurement height (m)</span><input id="ops-wind-height-m" type="number" min="0" max="500" step="0.1"></label>
+        </div>
+        <label class="field"><span>Notes / last update</span><textarea id="ops-notes" rows="3" maxlength="10000"></textarea></label>
+      </details>
+      <div class="button-row">
+        <button id="btn-start-draw" class="btn" type="button">draw on map</button>
+        <button id="btn-save-record" class="btn" type="button" hidden>save record changes</button>
+        <button id="btn-finish-draw" class="btn" type="button" hidden>finish</button>
+        <button id="btn-undo-draw" class="btn ghost" type="button" hidden>undo vertex</button>
+        <button id="btn-cancel-draw" class="btn ghost" type="button" hidden>cancel</button>
+        <button id="btn-cancel-edit" class="btn ghost" type="button" hidden>cancel edit</button>
+      </div>
+      <p class="hint" id="ops-draw-hint">Points use one click. Lines and areas: click each vertex, then Finish or press Enter.</p>
+      <div id="ops-feature-list" class="ops-feature-list"></div>
+      </div>
+
+      <details class="ops-details" data-app="incident-command">
+        <summary>Safety review</summary>
+        <p class="hint">Warnings support command review; they are not an automated declaration that a plan is safe.</p>
+        <div id="ops-safety" class="check-list"></div>
+        <button id="btn-approve-scenario" class="btn" type="button">approve reviewed plan</button>
+      </details>
+
+      <details class="ops-details" data-app="incident-command">
+        <summary>Resources</summary>
+        <div id="ops-resource-list" class="ops-resource-list"></div>
+        <input id="ops-resource-id" type="hidden">
+        <div class="ops-context-grid">
+          <label class="field"><span>Callsign</span><input id="ops-resource-callsign" maxlength="100"></label>
+          <label class="field"><span>Unit type</span><input id="ops-resource-type" maxlength="100"></label>
+          <label class="field"><span>Status</span><select id="ops-resource-status"><option>available</option><option>assigned</option><option>working</option><option>returning</option><option>unavailable</option></select></label>
+          <label class="field"><span>Crew size</span><input id="ops-resource-crew" type="number" min="0" max="1000"></label>
+          <label class="field"><span>Water capacity (L)</span><input id="ops-resource-water" type="number" min="0" step="1"></label>
+          <label class="field"><span>Radio / contact</span><input id="ops-resource-channel" maxlength="100"></label>
+        </div>
+        <label class="field"><span>Capabilities</span><input id="ops-resource-capabilities" maxlength="10000"></label>
+        <label class="field"><span>Assignment</span><input id="ops-resource-assignment" maxlength="10000"></label>
+        <div class="button-row"><button id="btn-save-resource" class="btn ghost" type="button">add resource</button><button id="btn-cancel-resource" class="btn ghost" type="button" hidden>cancel edit</button></div>
+      </details>
+
+      <details class="ops-details" id="ops-live-telemetry" data-app="ingest">
+        <summary>Live vehicle telemetry</summary>
+        <p class="hint">Automatic GPS is an unconfirmed feed. Gray positions are stale; red positions or broken tracks carry a quality warning. Estimated movement is never written as an observation.</p>
+        <div class="button-row">
+          <button id="btn-refresh-vehicles" class="btn ghost" type="button">refresh positions</button>
+          <label><input id="ops-show-vehicle-tracks" type="checkbox" checked> show last two hours of tracks</label>
+        </div>
+        <p id="ops-vehicle-status" class="hint" aria-live="polite">No telemetry loaded.</p>
+      </details>
+
+      <details class="ops-details" id="ops-wind-map" data-app="ingest">
+        <summary>Temporal wind situation</summary>
+        <p class="hint">Arrows point downwind. Rings mark retained measurements; arrows between them are labelled estimates. Attached model weather is only uniform background forcing, not terrain-resolved wind.</p>
+        <div class="ops-context-grid">
+          <label class="field"><span>Situation time</span><input id="ops-wind-time" type="datetime-local"></label>
+          <label class="field"><span>Observation look-back (hours)</span><input id="ops-wind-window" type="number" min="0.25" max="72" step="0.25" value="6"></label>
+          <label class="field"><span>Arrow grid</span><input id="ops-wind-grid" type="number" min="2" max="30" step="1" value="12"></label>
+        </div>
+        <div class="button-row">
+          <button id="btn-show-wind" class="btn ghost" type="button">show wind for current view</button>
+          <button id="btn-clear-wind" class="btn ghost" type="button">clear</button>
+        </div>
+        <p class="hint">Arrow colour: cyan &lt; 5 m/s · amber 5-10 m/s · red ≥ 10 m/s. Dashed rings are measured source points.</p>
+        <p id="ops-wind-status" class="hint" aria-live="polite">No wind field displayed.</p>
+      </details>
+
+      <details class="ops-details" id="ops-drone-desk" data-app="ingest">
+        <summary>Drone imagery desk</summary>
+        <p class="hint">Originals are retained as evidence. A local map layer is produced only for imagery explicitly affirmed as nadir or orthorectified with TL, TR, BR, BL WGS84 corners.</p>
+        <div class="ops-context-grid">
+          <label class="field"><span>New mission name</span><input id="ops-drone-mission-name" maxlength="200"></label>
+          <label class="field"><span>Aircraft</span><input id="ops-drone-aircraft" maxlength="200"></label>
+          <label class="field"><span>Operator</span><input id="ops-drone-operator" maxlength="200"></label>
+        </div>
+        <button id="btn-create-drone-mission" class="btn ghost" type="button">create mission</button>
+        <label class="field"><span>Active mission</span><select id="ops-drone-mission"><option value="">No mission</option></select></label>
+        <div class="ops-context-grid">
+          <label class="field"><span>Image</span><input id="ops-drone-file" type="file" accept="image/jpeg,image/png,image/tiff"></label>
+          <label class="field"><span>Captured time</span><input id="ops-drone-captured" type="datetime-local"></label>
+          <label class="field"><span>Georeference type</span><select id="ops-drone-georef-kind"><option value="">evidence only</option><option value="nadir">nadir</option><option value="orthorectified">orthorectified</option></select></label>
+        </div>
+        <label class="field"><span>Four corners (JSON: TL, TR, BR, BL)</span><textarea id="ops-drone-corners" rows="2" placeholder='[[11.0,48.1],[11.1,48.1],[11.1,48.0],[11.0,48.0]]'></textarea></label>
+        <button id="btn-upload-drone-image" class="btn ghost" type="button">retain image</button>
+        <div id="ops-drone-assets" class="ops-resource-list"></div>
+        <div class="ops-context-grid">
+          <label class="field"><span>Mosaic name</span><input id="ops-drone-mosaic-name" maxlength="200" value="Operational drone mosaic"></label>
+        </div>
+        <button id="btn-create-drone-mosaic" class="btn ghost" type="button">mosaic selected georeferenced frames</button>
+        <p id="ops-drone-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <details class="ops-details" id="ops-offline-pack" data-app="ingest">
+        <summary>Offline AOI coverage</summary>
+        <p class="hint">Verifies every tile at every integer zoom in the selected range. Complete manifests pin ordinary cached tiles against TTL/size pruning. Public providers are not bulk-downloaded; import an authorised MBTiles or GeoTIFF source for deliberate all-zoom offline coverage.</p>
+        <div class="ops-context-grid">
+          <label class="field"><span>Cached layer</span><select id="ops-pack-layer"></select></label>
+          <label class="field"><span>Minimum zoom</span><input id="ops-pack-min-zoom" type="number" min="0" max="22" value="10"></label>
+          <label class="field"><span>Maximum zoom</span><input id="ops-pack-max-zoom" type="number" min="0" max="22" value="14"></label>
+        </div>
+        <div class="button-row"><button id="btn-create-pack" class="btn ghost" type="button">check current view</button><button id="btn-verify-pack" class="btn ghost" type="button" hidden>verify again</button></div>
+        <p id="ops-pack-status" class="hint" aria-live="polite"></p>
+        <div id="ops-pack-zooms" class="ops-resource-list" aria-label="Per-zoom tile coverage"></div>
+      </details>
+
+      <details class="ops-details" id="ops-recovery-tools" data-app="incident-command">
+        <summary>Recovery and snapshot comparison</summary>
+        <p class="hint">Recovery creates a separate verified database for download. It never replaces the running database.</p>
+        <div class="button-row"><button id="btn-create-recovery" class="btn ghost" type="button">create recovery copy</button></div>
+        <p id="ops-recovery-status" class="hint" aria-live="polite"></p>
+        <div class="ops-context-grid">
+          <label class="field"><span>Compare from snapshot</span><select id="ops-snapshot-left"></select></label>
+          <label class="field"><span>Compare to</span><select id="ops-snapshot-right"><option value="">current workspace</option></select></label>
+        </div>
+        <button id="btn-compare-snapshots" class="btn ghost" type="button">compare snapshots</button>
+        <p id="ops-comparison-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <details class="ops-details" id="ops-mbtiles-import" data-app="ingest">
+        <summary>Import local MBTiles / geospatial raster</summary>
+        <p class="hint">Uploads a file from this device to the local command server. No external map provider is contacted.</p>
+        <label class="field"><span>MBTiles, GeoTIFF or raster GeoPackage</span><input id="ops-mbtiles-file" type="file" accept=".mbtiles,.tif,.tiff,.gpkg,application/x-sqlite3,image/tiff"></label>
+        <div class="ops-context-grid">
+          <label class="field"><span>Display name</span><input id="ops-mbtiles-name" maxlength="200"></label>
+          <label class="field"><span>Source organisation</span><input id="ops-mbtiles-source" maxlength="500"></label>
+          <label class="field"><span>Attribution</span><input id="ops-mbtiles-attribution" maxlength="2000"></label>
+          <label class="field"><span>Acquisition date</span><input id="ops-mbtiles-acquired" type="date"></label>
+        </div>
+        <label class="field"><span>Licence / permitted use</span><input id="ops-mbtiles-licence" maxlength="1000"></label>
+        <label class="field"><span>Operational limitations</span><textarea id="ops-mbtiles-limitations" rows="2" maxlength="5000"></textarea></label>
+        <button id="btn-import-mbtiles" class="btn ghost" type="button">validate and import</button>
+        <p id="ops-mbtiles-status" class="hint" aria-live="polite"></p>
+        <div class="ops-context-grid">
+          <label class="field"><span>Imported DEM raster</span><select id="ops-terrain-source"><option value="">select raster source</option></select></label>
+          <label class="field"><span>Contour interval (m)</span><input id="ops-terrain-interval" type="number" min="1" max="1000" value="20"></label>
+        </div>
+        <button id="btn-terrain-package" class="btn ghost" type="button">derive slope, aspect and contours</button>
+        <p id="ops-terrain-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <details class="ops-details" id="ops-field-import" data-app="ingest">
+        <summary>Import field observations</summary>
+        <p class="hint">GeoJSON, GPX, KML, KMZ, vector GeoPackage and CSV are previewed against the current map view before any incident records change.</p>
+        <label class="field"><span>Source file</span><input id="ops-field-import-file" type="file" accept=".geojson,.json,.gpx,.kml,.kmz,.gpkg,.csv"></label>
+        <div class="ops-context-grid">
+          <label class="field"><span>Default object type</span><select id="ops-field-import-type"><option value="">automatic by geometry</option></select></label>
+          <label class="field"><span>Source / organisation</span><input id="ops-field-import-source" maxlength="500"></label>
+        </div>
+        <label class="field"><span>Confirmation reason</span><input id="ops-field-import-confirmation" maxlength="1000" placeholder="required only for confirmed observations"></label>
+        <label class="field"><span>Optional field mapping (JSON)</span><textarea id="ops-field-import-mapping" rows="2" placeholder='{"latitude":"lat","longitude":"lon","title":"name","observed_at":"time"}'></textarea></label>
+        <div class="button-row"><button id="btn-preview-field-import" class="btn ghost" type="button">preview import</button><button id="btn-apply-field-import" class="btn" type="button" hidden>apply reviewed import</button></div>
+        <p id="ops-field-import-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <details class="ops-details" id="ops-position-report" data-app="ingest">
+        <summary>GPS / radio position report</summary>
+        <p class="hint">Creates an auditable, time-stamped observation. A selected resource's latest map position is also updated.</p>
+        <div class="ops-context-grid">
+          <label class="field"><span>Resource (optional)</span><select id="ops-position-resource"><option value="">unlisted resource</option></select></label>
+          <label class="field"><span>Callsign</span><input id="ops-position-callsign" maxlength="200"></label>
+          <label class="field"><span>Source</span><select id="ops-position-source"><option>radio</option><option>gps</option><option>manual</option></select></label>
+          <label class="field"><span>Accuracy (m)</span><input id="ops-position-accuracy" type="number" min="0" max="100000"></label>
+          <label class="field"><span>Latitude</span><input id="ops-position-lat" type="number" min="-90" max="90" step="any"></label>
+          <label class="field"><span>Longitude</span><input id="ops-position-lon" type="number" min="-180" max="180" step="any"></label>
+        </div>
+        <button id="btn-save-position" class="btn ghost" type="button">record position</button>
+        <p id="ops-position-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <details class="ops-details" id="ops-progression" data-app="ingest">
+        <summary>Observed progression comparison</summary>
+        <div class="ops-context-grid">
+          <label class="field"><span>From</span><input id="ops-progression-from" type="datetime-local"></label>
+          <label class="field"><span>To</span><input id="ops-progression-to" type="datetime-local"></label>
+        </div>
+        <div class="button-row"><button id="btn-show-progression" class="btn ghost" type="button">show progression</button><button id="btn-clear-progression" class="btn ghost" type="button">clear</button></div>
+        <p id="ops-progression-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <details class="ops-details" id="ops-tactical-tools" data-app="incident-command">
+        <summary>Tactical assessment and calculators</summary>
+        <div class="button-row"><button id="btn-assess-tactics" class="btn ghost" type="button">measure and screen plan</button></div>
+        <div class="ops-context-grid"><label class="field"><span>Copy plan to period</span><select id="ops-copy-target-period"></select></label><label class="field"><span>New draft plan name</span><input id="ops-copy-scenario-name" maxlength="300"></label></div>
+        <button id="btn-copy-scenario" class="btn ghost" type="button">copy plan without changing source</button>
+        <p id="ops-tactical-status" class="hint" aria-live="polite"></p>
+        <div id="ops-tactical-warnings" class="ops-resource-list"></div>
+        <div class="ops-context-grid">
+          <label class="field"><span>Calculator</span><select id="ops-calculator-kind"><option value="production_time">production time</option><option value="hose_lay">hose lay</option><option value="water_duration">water duration</option><option value="travel_time">travel time</option></select></label>
+          <label class="field"><span>Profile/source</span><input id="ops-calculator-profile" maxlength="200" value="operator supplied"></label>
+        </div>
+        <label class="field"><span>Inputs (JSON)</span><textarea id="ops-calculator-inputs" rows="3">{"length_m":1000,"rate_m_per_hour":100,"resource_count":2}</textarea></label>
+        <label class="field"><span>Assumptions</span><input id="ops-calculator-assumptions" maxlength="1000"></label>
+        <button id="btn-run-calculator" class="btn ghost" type="button">calculate transparently</button>
+        <p id="ops-calculator-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <details class="ops-details" id="ops-model-provenance" data-app="incident-command">
+        <summary>Scenario model provenance and freshness</summary>
+        <p class="hint">Attach a completed local analysis job to the selected plan. Stale inputs and model limitations remain visible in snapshots and products.</p>
+        <label class="field"><span>Completed analysis job ID</span><input id="ops-model-job-id" type="number" min="1" inputmode="numeric"></label>
+        <button id="btn-attach-model" class="btn ghost" type="button">attach to selected scenario</button>
+        <div id="ops-model-run-list" class="ops-resource-list"></div>
+        <p id="ops-model-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <details class="ops-details" id="ops-account-admin" data-app="incident-command" hidden>
+        <summary>Incident LAN accounts</summary>
+        <p class="hint">Create named accounts with the minimum role required. Passwords require at least 12 characters.</p>
+        <div class="ops-context-grid">
+          <label class="field"><span>Username</span><input id="ops-account-username" maxlength="100"></label>
+          <label class="field"><span>Role</span><select id="ops-account-role"><option>viewer</option><option>field_editor</option><option>plans</option><option>safety</option><option>public</option><option>administrator</option></select></label>
+        </div>
+        <label class="field"><span>Initial password</span><input id="ops-account-password" type="password" minlength="12" maxlength="1000" autocomplete="new-password"></label>
+        <button id="btn-create-account" class="btn ghost" type="button">create local account</button>
+        <div id="ops-account-list" class="ops-resource-list"></div>
+        <p id="ops-account-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <details class="ops-details" id="ops-products" data-app="incident-command">
+        <summary>Classified portable products</summary>
+        <div class="ops-context-grid">
+          <label class="field"><span>Template</span><select id="ops-product-type"><option>strategic</option><option>field</option><option>iap</option><option>briefing</option><option>transport</option><option>air_operations</option><option>evacuation</option><option>progression</option><option value="public_information">public information</option><option>handover</option></select></label>
+          <label class="field"><span>Classification</span><select id="ops-product-classification"><option>draft</option><option selected>operational</option><option>public</option></select></label>
+          <label class="field"><span>Format</span><select id="ops-product-format"><option>pdf</option><option value="geopdf">georeferenced PDF</option><option>geojson</option><option>json</option><option>csv</option><option>gpx</option><option>kml</option><option>kmz</option><option>geotiff</option><option>gpkg</option></select></label>
+          <label class="field"><span>Immutable snapshot (recommended)</span><select id="ops-product-snapshot"><option value="">current workspace</option></select></label>
+        </div>
+        <label class="field"><span>Product title</span><input id="ops-product-title" maxlength="300"></label>
+        <button id="btn-create-product" class="btn ghost" type="button">create, hash and audit product</button>
+        <div id="ops-product-list" class="ops-resource-list"></div>
+        <p id="ops-product-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <details class="ops-details" id="ops-merge-resolver" data-app="incident-command">
+        <summary>Disconnected package conflicts</summary>
+        <p class="hint">Both inputs remain preserved until a named operator selects the local or incoming record for every conflict.</p>
+        <div id="ops-merge-conflicts" class="ops-feature-list"></div>
+        <button id="btn-resolve-merge" class="btn" type="button" hidden>apply named resolution</button>
+        <p id="ops-merge-status" class="hint" aria-live="polite"></p>
+      </details>
+
+      <div class="button-row ops-outputs" data-app="incident-command">
+        <button id="btn-snapshot" class="btn ghost" type="button">create snapshot</button>
+        <button id="btn-export-incident" class="btn ghost" type="button">export handover</button>
+        <button id="btn-print-operations" class="btn ghost" type="button">print operations map</button>
+        <button id="btn-backup-now" class="btn ghost" type="button">verified backup</button>
+        <button id="btn-import-incident" class="btn ghost" type="button">import handover</button>
+        <input id="ops-import-file" type="file" accept="application/json,.json" hidden>
+      </div>
+      <p id="ops-backup-status" class="hint" data-app="incident-command"></p>
+      <!-- Shared across all three incident-linked apps, not incident-command-only:
+           setStatus() in operations.js writes every action's result here
+           (drone uploads, telemetry refresh, MBTiles import...), so hiding
+           it outside incident-command would make Ingest/EventView actions
+           silently report success/failure nowhere visible. -->
+      <p id="ops-status" class="hint" aria-live="polite" data-app="incident-command ingest eventview"></p>
+    </div>
+  </section>
+
+  <section class="stats" aria-label="Summary for the current view" data-app="firemap">
+    <div class="stat">
+      <span class="stat-label">Detections in view</span>
+      <span class="stat-value" id="stat-count">-</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Total radiative power</span>
+      <span class="stat-value" id="stat-frp">-</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Busiest day</span>
+      <span class="stat-value" id="stat-peak">-</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Cached history</span>
+      <span class="stat-value" id="stat-days">-</span>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="h-history" data-app="firemap">
+    <div class="block-head">
+      <h2 id="h-history">Detections per day</h2>
+      <button id="btn-clear-day" class="link-btn" hidden>clear day filter</button>
+    </div>
+    <div id="histogram" class="histogram" role="img" aria-label="Daily detection counts"></div>
+    <p class="hint" id="histogram-hint">Click a bar to isolate that day.</p>
+  </section>
+
+  <section class="block" aria-labelledby="h-window" data-app="firemap">
+    <h2 id="h-window">Time window</h2>
+    <div class="seg" id="days-seg" role="radiogroup" aria-label="Days of history">
+      <button role="radio" data-days="1" aria-checked="false">24h</button>
+      <button role="radio" data-days="3" aria-checked="true">3d</button>
+      <button role="radio" data-days="7" aria-checked="false">7d</button>
+      <button role="radio" data-days="14" aria-checked="false">14d</button>
+      <button role="radio" data-days="30" aria-checked="false">30d</button>
+    </div>
+    <p class="hint">Older data is served straight from the local cache.</p>
+  </section>
+
+  <section class="block" aria-labelledby="h-playback" data-app="firemap">
+    <h2 id="h-playback">Acquisition-time playback</h2>
+    <div class="playback-row">
+      <button id="btn-playback" class="icon-btn" aria-label="Play acquisition-time animation" title="Play/pause">▶</button>
+      <input type="range" id="playback-slider" min="0" max="1" step="1" value="1" aria-label="Time cursor">
+    </div>
+    <p class="hint" id="playback-readout">Showing all loaded detections.</p>
+  </section>
+
+  <section class="block" aria-labelledby="h-style" data-app="firemap">
+    <h2 id="h-style">Display</h2>
+    <label class="field">
+      <span>Colour by</span>
+      <select id="color-by">
+        <option value="age">Detection age</option>
+        <option value="frp">Fire radiative power</option>
+        <option value="instrument">Instrument</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>Render as</span>
+      <select id="render-mode">
+        <option value="points">Points</option>
+        <option value="cluster">Clusters</option>
+        <option value="heat">Heatmap</option>
+      </select>
+    </label>
+    <div id="legend" class="legend" aria-live="polite"></div>
+  </section>
+
+  <section class="block" aria-labelledby="h-coverage" data-app="firemap">
+    <div class="block-head">
+      <h2 id="h-coverage">Satellite coverage</h2>
+      <label class="switch"><input type="checkbox" id="coverage-toggle"><span>show</span></label>
+    </div>
+    <p class="hint">
+      How recently a tracked satellite's orbit passed over each area today -
+      brighter means a more recent look. A geometric approximation from
+      orbit data (not cloud/quality checked): it answers "was this area
+      even watched", not "was it seen clearly".
+    </p>
+    <p class="hint" id="coverage-status"></p>
+  </section>
+
+  <section class="block" aria-labelledby="h-industrial" data-app="firemap">
+    <div class="block-head">
+      <h2 id="h-industrial">Industrial/static sources</h2>
+      <label class="switch"><input type="checkbox" id="industrial-toggle"><span>show</span></label>
+    </div>
+    <p class="hint">
+      Recurring non-wildfire heat (flares, kilns, refineries, power plants)
+      identified from OpenStreetMap + this server's own cached detection
+      history - never deletes anything, only distinguishes. Switching this on
+      scans the current view automatically (small/medium views only); use
+      "rescan now" to force a refresh or check a large area on purpose.
+    </p>
+    <button id="btn-scan-industrial" class="btn ghost" type="button">rescan now</button>
+    <p class="hint" id="industrial-status"></p>
+  </section>
+
+  <section class="block" aria-labelledby="h-eumetsat" id="eumetsat-section" data-app="firemap" hidden>
+    <div class="block-head">
+      <h2 id="h-eumetsat">EUMETSAT confirmation</h2>
+      <label class="switch"><input type="checkbox" id="eumetsat-toggle"><span>show</span></label>
+    </div>
+    <p class="hint">
+      Independent geostationary fire detection from EUMETSAT's MTG/FCI
+      "Active Fire Monitoring" instrument (~10 minute revisit, Europe /
+      Africa / Atlantic / Middle East only) - a second, differently-sourced
+      satellite confirming (or not) what FIRMS sees, not a magnitude
+      cross-check (this product reports confidence, not radiative power).
+      Known false-positive mode: low-confidence hits over water/sun-glint.
+    </p>
+    <p class="hint" id="eumetsat-status"></p>
+  </section>
+
+  <section class="block" aria-labelledby="h-filters" data-app="firemap">
+    <h2 id="h-filters">Filters</h2>
+
+    <fieldset class="fieldset">
+      <legend>Satellites</legend>
+      <div id="source-list" class="check-list"></div>
+    </fieldset>
+
+    <fieldset class="fieldset">
+      <legend>Confidence</legend>
+      <div class="check-list">
+        <label><input type="checkbox" class="f-conf" value="low"> Low</label>
+        <label><input type="checkbox" class="f-conf" value="nominal" checked> Nominal</label>
+        <label><input type="checkbox" class="f-conf" value="high" checked> High</label>
+      </div>
+    </fieldset>
+
+    <label class="field">
+      <span>Minimum FRP <output id="frp-out">0 MW</output></span>
+      <input type="range" id="min-frp" min="0" max="200" step="5" value="0">
+    </label>
+
+    <label class="field">
+      <span>Overpass</span>
+      <select id="daynight">
+        <option value="">Day and night</option>
+        <option value="D">Daytime only</option>
+        <option value="N">Night-time only</option>
+      </select>
+    </label>
+  </section>
+
+  <section class="block" aria-labelledby="h-events" data-app="eventview">
+    <div class="block-head">
+      <h2 id="h-events">Fire events</h2>
+      <button id="btn-detect-events" class="link-btn" type="button">find in view</button>
+    </div>
+    <p class="hint">
+      Detections grouped by a space-time graph into distinct fires, not just
+      everything inside a box - pick one to estimate its likely extent.
+    </p>
+    <div id="event-list" class="event-list"></div>
+
+    <div id="event-analysis" class="event-analysis" hidden>
+      <div class="block-head">
+        <h3 id="h-analysis-event">Event</h3>
+        <button id="btn-close-analysis" class="link-btn" type="button">close</button>
+      </div>
+      <div class="seg" role="radiogroup" aria-label="Analysis layer">
+        <button role="radio" data-layer="heat" aria-checked="true" type="button">Likelihood</button>
+        <button role="radio" data-layer="arrival" aria-checked="false" type="button">Arrival time</button>
+        <button role="radio" data-layer="burn" aria-checked="false" type="button" id="btn-layer-burn" disabled>Burn scar</button>
+        <button role="radio" data-layer="spread" aria-checked="false" type="button" id="btn-layer-spread" disabled>Modelled spread</button>
+        <button role="radio" data-layer="ensemble" aria-checked="false" type="button" id="btn-layer-ensemble" disabled>Ensemble</button>
+      </div>
+      <label class="switch"><input type="checkbox" id="envelope-toggle" checked><span>uncertainty envelopes / isochrones</span></label>
+      <button id="btn-check-burn-scar" class="btn ghost" type="button">check burn severity (Sentinel-2)</button>
+      <button id="btn-run-propagation" class="btn ghost" type="button">run spread model (terrain + weather)</button>
+      <button id="btn-run-ensemble" class="btn ghost" type="button">run Monte Carlo ensemble (~40 members)</button>
+      <button id="btn-validate-event" class="btn ghost" type="button">validate model (rolling backtest)</button>
+      <button id="btn-view-3d" class="btn ghost" type="button">view in 3D terrain</button>
+      <p class="hint" id="analysis-status"></p>
+      <div id="structure-exposure" class="structure-exposure" hidden>
+        <div class="block-head">
+          <h3>Structures at risk over time</h3>
+          <label class="switch"><input type="checkbox" id="structures-toggle"><span>show</span></label>
+        </div>
+        <label class="field">
+          <span>Highlight reached within <output id="structure-horizon-out">12 h</output></span>
+          <input type="range" id="structure-horizon" min="0" max="48" step="1" value="12">
+        </label>
+        <div id="structure-summary" class="structure-summary"></div>
+        <button id="btn-structures-refresh" class="btn ghost" type="button">cache / refresh buildings for model area</button>
+        <p class="hint" id="structure-status">Modelled scenario exposure only, not confirmed damage or evacuation status.</p>
+      </div>
+      <div id="validation-results" class="validation-results" hidden></div>
+    </div>
+  </section>
+
+  <section class="block" aria-labelledby="h-cache" data-app="firemap">
+    <h2 id="h-cache">Cache</h2>
+    <button id="btn-cache-view" class="btn">Cache this view for 30 days</button>
+    <button id="btn-refresh" class="btn ghost">Refresh newest data</button>
+    <dl class="kv" id="cache-kv"></dl>
+    <p class="hint" id="cache-note"></p>
+  </section>
+
+  <footer class="panel-foot">
+    <p>
+      Fire data: <a href="https://firms.modaps.eosdis.nasa.gov/" target="_blank" rel="noopener">NASA FIRMS</a>.
+      Basemaps: &copy; OpenStreetMap contributors.
+    </p>
+  </footer>
+</aside>
+
+<div id="tooltip" class="chart-tooltip" hidden></div>
+<section id="ops-print-title" class="ops-print-title" aria-hidden="true"></section>
+
+<script src="/static/vendor/leaflet/leaflet.js"></script>
+<script src="/static/vendor/markercluster/leaflet.markercluster.js"></script>
+<script src="/static/vendor/heat/leaflet-heat.js"></script>
+<script src="/static/vendor/maplibre/maplibre-gl.js"></script>
+<script src="/static/vendor/proj4/proj4.js"></script>
+<script src="/static/vendor/mgrs/mgrs.min.js"></script>
+<script src="/static/js/coords.js"></script>
+<script src="/static/js/app.js"></script>
+<script src="/static/js/operations.js"></script>
+<script src="/static/js/structures.js"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "name": "NexFiremap Incident Command",
+  "short_name": "NexFiremap",
+  "description": "Offline-first fire situation and tactical planning map",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0d0d0d",
+  "theme_color": "#1a1a19",
+  "icons": [
+    {"src": "/static/img/nexfiremap-64.png", "sizes": "64x64", "type": "image/png"},
+    {"src": "/static/img/nexfiremap-256.png", "sizes": "256x256", "type": "image/png"}
+  ]
+}
