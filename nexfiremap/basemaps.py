@@ -10,6 +10,12 @@ from __future__ import annotations
 
 OSM_ATTRIB = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
 
+# Each entry drives both the /tiles proxy (id/url/subdomains/tile_ext) and the
+# frontend's layer switcher (name/attribution/dark). "dark" flags a basemap
+# whose imagery is dark-toned, so the UI can pick readable overlay colours
+# against it; "default" (only ever True on one entry) marks the layer shown
+# on first load. "max_native_zoom" is set only when a provider's own tiles
+# stop gaining real detail before "max_zoom" - see esri-terrain below.
 BASEMAPS: list[dict] = [
     {
         "id": "osm",

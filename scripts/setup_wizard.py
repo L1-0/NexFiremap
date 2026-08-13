@@ -76,6 +76,8 @@ def fail(msg: str) -> None:
 
 
 def ask(prompt: str, default: str = "") -> str:
+    """Prompts for a free-text answer, returning ``default`` on an empty
+    reply or non-interactive stdin (EOF)."""
     suffix = f" [{default}]" if default else ""
     try:
         raw = input(f"{prompt}{suffix}: ")
@@ -92,6 +94,9 @@ def ask(prompt: str, default: str = "") -> str:
 
 
 def ask_yes_no(prompt: str, default: bool = True) -> bool:
+    """Yes/no prompt; any reply starting with "y" counts as yes, anything
+    else (including a blank reply or non-interactive EOF) falls through to
+    ``default``."""
     hint = "Y/n" if default else "y/N"
     try:
         raw = input(f"{prompt} [{hint}]: ").strip().lower()
@@ -103,6 +108,10 @@ def ask_yes_no(prompt: str, default: bool = True) -> bool:
 
 
 def mask_key(key: str) -> str:
+    """Masks a secret for display (e.g. an existing FIRMS key being
+    re-confirmed) - short values are fully starred out rather than showing
+    first/last 4 characters, since 4+4 could reveal most or all of a very
+    short key."""
     if len(key) <= 8:
         return "*" * len(key)
     return key[:4] + "..." + key[-4:]
@@ -124,16 +133,28 @@ def check_python_version() -> bool:
 
 
 def in_virtualenv() -> bool:
+    """True when the interpreter running this script is itself already
+    inside a virtualenv - the standard ``sys.prefix != sys.base_prefix``
+    check (falls back to comparing prefix to itself, i.e. False, on the
+    rare interpreter without ``base_prefix`` at all)."""
     return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 
 
 def venv_python_path(venv_dir: Path) -> Path:
+    """Path to the interpreter inside a venv - the layout differs between
+    Windows (Scripts/python.exe) and POSIX (bin/python)."""
     if platform.system() == "Windows":
         return venv_dir / "Scripts" / "python.exe"
     return venv_dir / "bin" / "python"
 
 
 def setup_venv() -> Path:
+    """Returns a usable Python interpreter path for installing dependencies
+    into: reuses the current interpreter if already inside a venv, reuses an
+    existing ``.venv`` if one was already created by a prior run, or creates
+    a fresh one - falling back to the current interpreter (not failing
+    outright) if venv creation itself doesn't work, so setup can still limp
+    forward on a constrained environment."""
     if in_virtualenv():
         ok(f"Already running inside a virtual environment ({sys.prefix}) - using it.")
         return Path(sys.executable)
@@ -156,6 +177,8 @@ def setup_venv() -> Path:
 
 
 def _requirement_lines() -> list[str]:
+    """requirements.txt entries, stripped of comments/blank lines - used
+    only for the package-by-package fallback install path below."""
     if not REQUIREMENTS.is_file():
         return []
     lines = []
@@ -209,10 +232,16 @@ def install_requirements(python_exe: Path) -> dict[str, str]:
 
 
 def _read_lines(path: Path) -> list[str]:
+    """Reads a file as lines, or ``[]`` if it doesn't exist yet - used for
+    both .env and .env.example so a first-time setup with no .env falls
+    back to the example file's structure/comments."""
     return path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
 
 
 def _existing_env_values() -> dict[str, str]:
+    """Parses whatever's currently in .env into a flat key/value map, so
+    `configure_env` can offer existing values as defaults instead of
+    prompting from scratch on a re-run."""
     values: dict[str, str] = {}
     for raw in _read_lines(ENV_FILE):
         line = raw.strip()
@@ -247,6 +276,9 @@ def _set_env_var(lines: list[str], key: str, value: str) -> list[str]:
 
 
 def configure_env() -> dict[str, str]:
+    """Interactively collects the values `write_env` needs (FIRMS key,
+    optional tile-fetch contact email), pre-filling from any existing .env
+    so re-running the wizard doesn't force re-entering everything."""
     existing = _existing_env_values()
 
     print("A free FIRMS map key is required to download fire data:")
@@ -301,6 +333,9 @@ CONNECTIVITY_TARGETS: list[tuple[str, str]] = [
 
 
 def _fetch(url: str, timeout: float = 8.0) -> tuple[int, bytes]:
+    """Bare urllib GET with an identifying User-Agent - stdlib only, since
+    this script must run before dependencies (including httpx) are
+    installed."""
     req = urllib.request.Request(url, headers={"User-Agent": "NexFiremap-Setup/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.status, resp.read()
@@ -393,6 +428,11 @@ def check_eumetsat_credentials(key: str, secret: str) -> tuple[bool, str]:
 
 
 def run_connectivity_tests(env_values: dict[str, str]) -> dict[str, bool]:
+    """Probes every free data source this project talks to, plus the
+    FIRMS key (and EUMETSAT credentials, if configured) - all before the
+    server ever starts, so connectivity/credential problems surface here
+    with an actionable message rather than as a mysterious job failure
+    later."""
     section("Testing connectivity")
     results: dict[str, bool] = {}
     for name, url in CONNECTIVITY_TARGETS:
@@ -434,6 +474,10 @@ def chmod_launchers() -> None:
 
 
 def print_summary(dep_failures: dict[str, str], connectivity: dict[str, bool]) -> None:
+    """Final human-readable rollup of everything checked above - the
+    "can I actually use this now" answer, kept separate from the individual
+    check functions so it can present install/network/key issues in one
+    place rather than scattered across the earlier sections' own output."""
     section("Summary")
     if dep_failures:
         warn(f"{len(dep_failures)} package(s) failed to install:")
@@ -466,6 +510,9 @@ def print_summary(dep_failures: dict[str, str], connectivity: dict[str, bool]) -
 
 
 def launch_server(python_exe: Path) -> int:
+    """Hands off to run.py using the (possibly freshly created) venv
+    interpreter, treating Ctrl+C as a normal stop rather than an error exit
+    code."""
     print(f"\n{_BOLD}Starting NexFiremap ...{_RESET} (Ctrl+C to stop)\n")
     try:
         return subprocess.call([str(python_exe), str(ROOT / "run.py"), "--open"])
@@ -477,6 +524,11 @@ def launch_server(python_exe: Path) -> int:
 
 
 def main() -> int:
+    """Runs the whole wizard end to end, in the order a fresh clone needs:
+    verify the Python version, get a virtualenv, install dependencies,
+    configure .env, test connectivity, then optionally launch the server -
+    each section prints its own progress via `section`/`ok`/`warn`/`fail`
+    as it goes."""
     banner()
 
     section("Checking Python")

@@ -34,6 +34,15 @@ def _already_running(host: str, port: int) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI entry point. Parses args, then runs a series of fail-closed
+    safety gates before ever binding a socket - each one prints an
+    actionable message and returns a non-zero exit code rather than letting
+    uvicorn fail more crypticly further down, and each is a deliberate
+    default-safe choice: NexFiremap defaults to loopback-only, and every way
+    to widen that (binding to a LAN/public address, enabling TLS) requires
+    explicit, validated opt-in rather than silently doing something less
+    safe than the caller may have intended.
+    """
     parser = argparse.ArgumentParser(
         prog="nexfiremap",
         description="Local NASA FIRMS fire map server with a 30 day cache.",
@@ -50,6 +59,10 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings()
     host = args.host or settings.host
     port = args.port or settings.port
+    # Gate 1: refuse to bind anywhere but loopback unless the operator has
+    # explicitly turned on LAN mode. A CLI --host flag alone can't widen
+    # this - it takes the environment-level NEXFIREMAP_LAN_MODE opt-in too,
+    # so a bind address typo/mistake can't silently expose the app.
     if host not in {"127.0.0.1", "localhost", "::1"} and not settings.lan_mode:
         print(
             "\n  Refusing non-loopback bind without NEXFIREMAP_LAN_MODE=true.\n"
@@ -57,9 +70,17 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    # Gate 2: LAN mode itself additionally requires a real admin password -
+    # re-checked here (SecurityManager's constructor enforces the same rule
+    # again once the app actually starts) so the failure surfaces
+    # immediately as a clear CLI message instead of an exception during
+    # app startup.
     if settings.lan_mode and len(settings.admin_password) < 12:
         print("\n  LAN mode requires NEXFIREMAP_ADMIN_PASSWORD with at least 12 characters.\n", file=sys.stderr)
         return 2
+    # Gate 3/4: TLS is all-or-nothing (both cert and key, and both must
+    # actually exist) - a half-configured TLS setup should never fall back
+    # to serving plaintext on what an operator believes is an HTTPS bind.
     if bool(settings.tls_cert_file) != bool(settings.tls_key_file):
         print("\n  TLS requires both NEXFIREMAP_TLS_CERT_FILE and NEXFIREMAP_TLS_KEY_FILE.\n", file=sys.stderr)
         return 2

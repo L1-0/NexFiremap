@@ -52,6 +52,11 @@ MAX_QUERY_CHARS = 200
 
 
 class GeocodeService:
+    """Owns the single shared HTTP client, in-process cache, and the
+    lock/timestamp pair that enforces Nominatim's 1 req/s policy - one
+    instance per running server, not per request, so the rate limit and
+    cache are actually shared across concurrent search callers."""
+
     def __init__(self, settings: Settings) -> None:
         # Reuses the tile User-Agent/contact string - both are OSM-family
         # usage policies asking for the same thing (an identifiable client).
@@ -68,12 +73,19 @@ class GeocodeService:
         await self._client.aclose()
 
     def _cached(self, key: str) -> list[dict[str, Any]] | None:
+        """Returns the cached result list if present and not yet expired,
+        else None - callers treat None as "go fetch it", never as "empty
+        result", so an expired/absent entry is indistinguishable on purpose."""
         entry = self._cache.get(key)
         if entry and time.time() - entry[0] < CACHE_TTL_S:
             return entry[1]
         return None
 
     async def search(self, query: str, *, limit: int = 6) -> dict[str, Any]:
+        """Cached, rate-limited place-name search. Always returns a dict with
+        an ``error`` key (None on success) rather than raising, so callers
+        (and the frontend dropdown) can distinguish "no matches" from
+        "upstream is unreachable" without a try/except."""
         q = (query or "").strip()[:MAX_QUERY_CHARS]
         if len(q) < 2:
             return {"query": q, "results": [], "error": None}
@@ -92,6 +104,9 @@ class GeocodeService:
             if cached is not None:
                 return {"query": q, "results": cached, "error": None, "cached": True}
 
+            # Enforced here, inside the lock, rather than trusting the
+            # frontend's own debounce - that's a UX nicety, not something a
+            # shared upstream policy can rely on to actually hold the line.
             wait = MIN_REQUEST_INTERVAL_S - (time.time() - self._last_request)
             if wait > 0:
                 await asyncio.sleep(wait)
@@ -125,6 +140,10 @@ class GeocodeService:
 
     @staticmethod
     def _row(item: dict[str, Any]) -> dict[str, Any] | None:
+        """Normalizes one Nominatim result into this project's own shape.
+        Returns None (dropped by the caller) rather than raising on a
+        malformed entry - one bad row from upstream shouldn't fail the
+        whole search."""
         try:
             lat, lon = float(item["lat"]), float(item["lon"])
         except (KeyError, TypeError, ValueError):

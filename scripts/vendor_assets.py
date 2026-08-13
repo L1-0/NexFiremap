@@ -115,6 +115,12 @@ ASSETS: list[tuple[str, str]] = [
 
 
 def main() -> int:
+    """Downloads every asset in ``ASSETS``, verifying each against
+    ``KNOWN_HASHES`` before writing it to disk. With ``--update-hashes``, a
+    mismatch is treated as an accepted new baseline (printed at the end for
+    pasting back into ``KNOWN_HASHES``) instead of being rejected - meant
+    for the deliberate-version-bump workflow described in the module
+    docstring, not routine runs."""
     update_hashes = "--update-hashes" in sys.argv[1:]
     failures = 0
     mismatches: list[str] = []

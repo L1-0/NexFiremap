@@ -1,4 +1,21 @@
-"""Explainable tactical measurements, warnings and field calculators."""
+"""Explainable tactical measurements, warnings and field calculators.
+
+Three independent pieces, each deliberately simple and inspectable rather
+than "smart":
+
+* Geometry measurement (haversine length/spherical polygon area) for any
+  drawn feature.
+* A deterministic warning scan (`TacticsManager.assessment`) over a period's
+  features - broken links, double-assigned resources, escape routes that
+  cross a forecast/uncertainty boundary - each warning identified by a
+  stable content hash so it survives being re-computed (features/links
+  changing elsewhere) without losing an operator's prior acknowledgement of
+  the *same* warning.
+* Field calculators (`TacticsManager.calculate`) for common fireground math
+  (hose lays, production time, water duration, travel time), each returning
+  its own formula string alongside the numeric result so the UI can show
+  the calculation, not just the answer.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +36,9 @@ LINK_TYPES = {
 
 
 def haversine_m(a: list[float], b: list[float]) -> float:
+    """Great-circle distance in meters between two [lon, lat] points.
+    ``min(1.0, ...)`` guards ``asin`` against a value fractionally above 1.0
+    from floating-point rounding on near-antipodal/identical points."""
     lon1, lat1, lon2, lat2 = map(math.radians, (a[0], a[1], b[0], b[1]))
     dlon, dlat = lon2 - lon1, lat2 - lat1
     value = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
@@ -26,6 +46,9 @@ def haversine_m(a: list[float], b: list[float]) -> float:
 
 
 def line_length_m(coordinates: list[list[float]]) -> float:
+    """Sum of consecutive-vertex great-circle distances - adequate for the
+    short, mostly-straight incident-scale lines this measures (fire lines,
+    escape routes), not a geodesic-accurate long-haul distance."""
     return sum(haversine_m(a, b) for a, b in zip(coordinates, coordinates[1:]))
 
 
@@ -40,6 +63,9 @@ def polygon_area_m2(ring: list[list[float]]) -> float:
 
 
 def measure_geometry(geometry: dict[str, Any]) -> dict[str, float | str]:
+    """Length/area for one GeoJSON geometry, dispatched by type - a Polygon's
+    perimeter/area accounts for holes (rings after the first are subtracted,
+    per the GeoJSON right-hand-rule convention for interior rings)."""
     kind, coordinates = geometry.get("type"), geometry.get("coordinates")
     if kind == "Point": return {"geometry_type": kind, "length_m": 0.0, "area_m2": 0.0}
     if kind == "LineString": return {"geometry_type": kind, "length_m": round(line_length_m(coordinates), 2), "area_m2": 0.0}
@@ -51,19 +77,32 @@ def measure_geometry(geometry: dict[str, Any]) -> dict[str, float | str]:
 
 
 def _segments(coordinates: list[list[float]]):
+    """Consecutive (point, next_point) pairs - the edges of a line/ring."""
     yield from zip(coordinates, coordinates[1:])
 
 
 def _orientation(a, b, c) -> float:
+    """Sign of the cross product of (b-a) and (c-a): positive/negative tells
+    which side of line a->b the point c falls on, zero means collinear -
+    the standard building block for a segment-intersection test."""
     return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
 
 def _intersects(a, b, c, d) -> bool:
+    """True if segment a-b crosses segment c-d: c and d must fall on
+    opposite sides of line a-b, and vice versa - the standard orientation-
+    based segment intersection test (treats touching/collinear as
+    intersecting via the <= 0 rather than < 0)."""
     return (_orientation(a, b, c) * _orientation(a, b, d) <= 0 and
             _orientation(c, d, a) * _orientation(c, d, b) <= 0)
 
 
 def line_crosses_polygon(line: list[list[float]], polygon: list[list[list[float]]]) -> bool:
+    """True if any segment of ``line`` crosses any edge of any ring of
+    ``polygon`` - a boundary-crossing check, not a point-in-polygon test:
+    a line entirely inside or entirely outside the polygon (never crossing
+    its boundary) reports False either way, which is what "does this escape
+    route cross into/out of the forecast area" actually needs to know."""
     return any(_intersects(a, b, c, d) for a, b in _segments(line)
                for ring in polygon for c, d in _segments(ring))
 
@@ -73,6 +112,15 @@ class TacticsManager:
         self.store = store
 
     def assessment(self, incident_id: str, period_id: str, scenario_id: str | None) -> dict[str, Any]:
+        """Runs the full deterministic warning scan for one planning period/
+        scenario: measures every feature's geometry, validates declared
+        links (anchor/lookout/escape_route/safety_zone/trigger) point at a
+        feature of the expected type, flags resources assigned to more than
+        one tactical object, and flags escape routes that cross a forecast/
+        uncertainty boundary. Each warning is content-hashed (see the
+        acknowledgement loop below) and matched against any prior
+        acknowledgement so a warning an operator already signed off on
+        doesn't keep nagging just because the assessment re-ran."""
         features = self.store.list_features(incident_id, period_id, scenario_id)
         feature_map = {item["properties"]["id"]: item for item in features}
         measurements = [{"feature_id": item["properties"]["id"], **measure_geometry(item["geometry"])} for item in features]
@@ -123,6 +171,12 @@ class TacticsManager:
             (incident_id, period_id, scenario_id or ""),
         ).fetchall()}
         for warning in warnings:
+            # Hash of every field except the human-readable "message" (which
+            # can be reworded without changing what the warning actually
+            # is), sorted keys for a stable encoding - this makes the same
+            # underlying issue hash to the same warning_id across repeated
+            # assessment() calls, which is what lets an acknowledgement
+            # recorded against this id keep matching it later.
             identity = {key: value for key, value in warning.items() if key != "message"}
             warning_id = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]
             warning["warning_id"] = warning_id
@@ -136,6 +190,12 @@ class TacticsManager:
 
     def acknowledge(self, incident_id: str, period_id: str, scenario_id: str | None,
                     warning_id: str, reason: str, actor: str) -> dict[str, Any]:
+        """Records a reasoned sign-off against one warning_id. Requires a
+        non-empty reason (an acknowledgement without one isn't useful
+        after-the-fact accountability) and re-runs the full assessment
+        first to confirm the warning is still actually active - acking a
+        warning_id for an issue that's already been fixed/no longer exists
+        is rejected rather than silently recorded."""
         reason = _clean_text(reason, 1000)
         if not reason:
             raise OperationsError("a warning acknowledgement requires a reason")
@@ -162,7 +222,17 @@ class TacticsManager:
 
     @staticmethod
     def calculate(kind: str, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Runs one named field calculator and returns both the result and
+        the formula string used - explainability is the point (an operator
+        needs to trust and be able to check the math, not just the number),
+        which is why each branch below builds its own formula string rather
+        than this being a generic expression evaluator."""
+
         def number(key: str, minimum: float = 0.0) -> float:
+            # minimum defaults to 0.0 (reject negative) but callers pass a
+            # small positive epsilon for anything used as a divisor, so a
+            # caller-supplied zero rate/speed/section-length can't reach a
+            # ZeroDivisionError below - it's rejected here first instead.
             try: value = float(inputs[key])
             except (KeyError, TypeError, ValueError) as exc: raise OperationsError(f"calculator input {key} is required") from exc
             if not math.isfinite(value) or value < minimum: raise OperationsError(f"calculator input {key} is invalid")

@@ -20,6 +20,8 @@ def encode_png(rgba: np.ndarray) -> bytes:
     height, width, _ = rgba.shape
 
     def chunk(tag: bytes, data: bytes) -> bytes:
+        # PNG chunk framing: big-endian length, 4-byte type tag, the raw
+        # data, then a CRC32 over tag+data (not length) - per the PNG spec.
         return (
             struct.pack(">I", len(data))
             + tag
@@ -28,7 +30,7 @@ def encode_png(rgba: np.ndarray) -> bytes:
         )
 
     signature = b"\x89PNG\r\n\x1a\n"
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)  # 8-bit RGBA
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)  # 8-bit depth, color type 6 = RGBA
     # Filter type 0 (None) prefixed to every scanline, per the PNG spec.
     raw = b"".join(b"\x00" + row.tobytes() for row in rgba)
     idat = zlib.compress(raw, level=6)
