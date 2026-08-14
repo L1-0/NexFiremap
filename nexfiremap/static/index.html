@@ -14,6 +14,9 @@
 </head>
 <body>
 
+<!-- ============================ Sign-in dialog ============================
+     Incident LAN auth (api.py / security.py). Native <dialog>, opened by
+     app.js when a request needs a session the browser doesn't have yet. -->
 <dialog id="auth-dialog" class="auth-dialog" aria-labelledby="auth-title">
   <form id="auth-form" method="dialog">
     <h2 id="auth-title">Incident LAN sign in</h2>
@@ -27,6 +30,9 @@
 
 <div id="map" role="application" aria-label="Fire detection map"></div>
 
+<!-- =========================== Basemap picker ============================
+     Bottom-left thumbnail toggle + flyout grid (see alignBasemapPicker() in
+     app.js, which lines it up with Leaflet's own zoom control). -->
 <div id="basemap-picker" class="basemap-picker">
   <button id="basemap-toggle" class="basemap-toggle" type="button" aria-expanded="false"
     aria-controls="basemap-flyout" title="Change basemap">
@@ -39,6 +45,9 @@
   </div>
 </div>
 
+<!-- ============================ 3D terrain view ===========================
+     Full-screen MapLibre GL overlay, toggled from an event's analysis panel
+     (btn-view-3d below); stays hidden and inert otherwise. -->
 <div id="map3d-wrap" class="map3d-wrap" hidden>
   <div id="map3d" role="application" aria-label="3D terrain view of the fire"></div>
   <button id="btn-close-3d" class="btn ghost map3d-close" type="button">← back to 2D map</button>
@@ -47,6 +56,9 @@
   </p>
 </div>
 
+<!-- ================================ Topbar =================================
+     Brand + app switcher, place/coordinate search, and the status pills
+     (auth identity, fetch spinner, print/panel toggles) on the right. -->
 <header class="topbar">
   <div class="brand">
     <img class="brand-mark" src="/static/img/nexfiremap-256.png" alt="" aria-hidden="true">
@@ -81,16 +93,17 @@
   <div class="topbar-status">
     <span id="auth-identity" class="pill muted" hidden></span>
     <button id="btn-auth-logout" class="link-btn" type="button" hidden>sign out</button>
-    <span id="ops-connectivity" class="pill muted" title="Connection to the local command server">local server -</span>
     <span id="fetch-indicator" class="pill" hidden>
       <span class="spinner" aria-hidden="true"></span><span id="fetch-text">Fetching…</span>
     </span>
-    <span id="cache-pill" class="pill muted" title="Rows held in the local cache">cache -</span>
     <button id="btn-print-view" class="icon-btn" type="button" title="Print this view">🖨</button>
     <button id="btn-panel" class="icon-btn" aria-expanded="true" aria-controls="panel" title="Toggle panel">☰</button>
   </div>
 </header>
 
+<!-- ========================= First-run setup dialog ========================
+     Shown instead of the map until a FIRMS_MAP_KEY is configured server-side
+     (see config.py); not a native <dialog>, just a hidden/unhidden div. -->
 <div id="setup" class="setup" hidden>
   <h2>Add your NASA FIRMS map key</h2>
   <p>
@@ -103,6 +116,12 @@
   </ol>
 </div>
 
+<!-- ============================= Control panel =============================
+     Right-hand sidebar. Most <section>s below carry a data-app attribute
+     ("firemap", "incident-command", "ingest", "eventview", or a
+     space-separated combination); applyAppMode() in app.js shows/hides them
+     to make this one panel act like separate per-app tabs driven by the
+     app-switcher menu in the topbar, rather than four independent panels. -->
 <aside id="panel" class="panel" aria-label="Map controls">
 
   <section id="public-products-view" class="block" hidden aria-labelledby="h-public-products">
@@ -111,6 +130,14 @@
     <div id="public-product-list" class="ops-resource-list"></div>
   </section>
 
+  <!-- ========================= Incident operations forms =====================
+       The bulk of the incident-command/ingest/eventview panel content:
+       incident/period/scenario context, tactical drawing on the map, safety
+       review, resources, then a run of collapsible <details> tools (vehicle
+       telemetry, wind, drone imagery, offline packs, recovery/snapshots,
+       MBTiles import, field-data import, position reports, progression,
+       tactics/calculators, model provenance, accounts, products, merge
+       conflicts) - each gated to its owning app(s) via data-app. -->
   <section class="block operations-block" aria-labelledby="h-operations" data-app="incident-command ingest eventview">
     <div class="block-head">
       <h2 id="h-operations">Incident command</h2>
@@ -454,6 +481,7 @@
         <p id="ops-merge-status" class="hint" aria-live="polite"></p>
       </details>
 
+      <!-- Snapshot / handover / print / backup actions for the whole incident. -->
       <div class="button-row ops-outputs" data-app="incident-command">
         <button id="btn-snapshot" class="btn ghost" type="button">create snapshot</button>
         <button id="btn-export-incident" class="btn ghost" type="button">export handover</button>
@@ -521,6 +549,10 @@
     <p class="hint" id="playback-readout">Showing all loaded detections.</p>
   </section>
 
+  <!-- ================================ Legend ================================
+       Colour-by / render-mode selects plus the #legend div, whose contents
+       (ramp swatches or gradient) are built at runtime by app.js to match
+       whichever encoding is currently selected. -->
   <section class="block" aria-labelledby="h-style" data-app="firemap">
     <h2 id="h-style">Display</h2>
     <label class="field">
@@ -534,6 +566,7 @@
     <label class="field">
       <span>Render as</span>
       <select id="render-mode">
+        <option value="topology">Spread over Time</option>
         <option value="points">Points</option>
         <option value="cluster">Clusters</option>
         <option value="heat">Heatmap</option>
@@ -620,6 +653,10 @@
     </label>
   </section>
 
+  <!-- ============================= Fire events tab ==========================
+       eventview app: detected-event list plus, once one is selected, its
+       per-event analysis layers (likelihood/arrival/burn-scar/spread/
+       ensemble) and structure-exposure summary further down. -->
   <section class="block" aria-labelledby="h-events" data-app="eventview">
     <div class="block-head">
       <h2 id="h-events">Fire events</h2>
@@ -636,6 +673,11 @@
         <h3 id="h-analysis-event">Event</h3>
         <button id="btn-close-analysis" class="link-btn" type="button">close</button>
       </div>
+      <p class="hint event-wide-span-warning" id="event-wide-span-warning" hidden>
+        ⚠ This candidate spans an unusually large area for one fire - likely several unrelated
+        sources chained together by the clustering (e.g. widespread agricultural burning), not
+        a single event. Review the raw detections before trusting any layer below.
+      </p>
       <div class="seg" role="radiogroup" aria-label="Analysis layer">
         <button role="radio" data-layer="heat" aria-checked="true" type="button">Likelihood</button>
         <button role="radio" data-layer="arrival" aria-checked="false" type="button">Arrival time</button>
@@ -676,6 +718,10 @@
   </section>
 
   <footer class="panel-foot">
+    <div class="panel-status-row">
+      <span id="ops-connectivity" class="pill muted" title="Connection to the local command server">local server -</span>
+      <span id="cache-pill" class="pill muted" title="Rows held in the local cache">cache -</span>
+    </div>
     <p>
       Fire data: <a href="https://firms.modaps.eosdis.nasa.gov/" target="_blank" rel="noopener">NASA FIRMS</a>.
       Basemaps: &copy; OpenStreetMap contributors.

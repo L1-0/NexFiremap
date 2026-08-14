@@ -51,11 +51,12 @@
     days: 3,
     focusDay: null,          // ISO date when a histogram bar is selected
     colorBy: "age",
-    renderMode: "points",
+    renderMode: "topology",
     minFrp: 0,
     daynight: "",
     rows: [],
     summary: [],
+    lastSpreadTopologyRange: null, // {earliest, latest} band cutoff ts of the last-rendered topology - set by drawSpreadTopology, read by renderLegend
     basemapTone: "dark",
     pollTimer: null,
     loadTimer: null,
@@ -80,16 +81,65 @@
     currentEnsemble: null, // { jobId, result } - from run_ensemble_assimilation, separate job
   };
 
+  /**
+   * Reads a CSS custom property's current value off `<body>` so palette
+   * decisions live in app.css (and can be re-themed there) instead of
+   * being hardcoded in JS.
+   * @param {string} name - a `--custom-property` name, e.g. "--fire-3".
+   * @returns {string} the trimmed computed value (typically a hex color).
+   */
   const css = (name) =>
     getComputedStyle(document.body).getPropertyValue(name).trim();
 
+  /** The 5-step age/FRP color ramp (index 0 = recessive, 4 = prominent). @returns {string[]} */
   const fireRamp = () => [1, 2, 3, 4, 5].map((n) => css(`--fire-${n}`));
+  /** The 5-step purple->grey time-spread ramp used by "Spread over Time". @returns {string[]} */
+  const timeRamp = () => [1, 2, 3, 4, 5].map((n) => css(`--time-${n}`));
+  /** The 3 categorical swatches used when colorBy === "instrument". @returns {string[]} */
   const catColors = () => [css("--cat-1"), css("--cat-2"), css("--cat-3")];
+
+  // Continuous purple->red->orange->yellow->grey interpolation across
+  // timeRamp()'s 5 stops (see app.css's --time-* comment for how/why this
+  // exact palette was chosen) - a plain per-channel sRGB lerp between the
+  // two stops `fraction` falls between, matching how the CSS
+  // `linear-gradient` legend bar interpolates so the two never visually
+  // disagree. `fraction` 0 = earliest (purple), 1 = latest (grey).
+  /**
+   * @param {number} fraction - 0 (earliest/purple) .. 1 (latest/grey), clamped.
+   * @param {string[]} ramp - 5-stop hex ramp, as returned by timeRamp().
+   * @returns {string} an `rgb(r, g, b)` string lerped between the two stops `fraction` falls between.
+   */
+  function timeSpreadColor(fraction, ramp) {
+    const f = Math.max(0, Math.min(1, fraction));
+    const segments = ramp.length - 1; // 4
+    const pos = f * segments;
+    const i = Math.min(segments - 1, Math.floor(pos));
+    const t = pos - i;
+    const a = hexToRgb(ramp[i]);
+    const b = hexToRgb(ramp[i + 1]);
+    const r = Math.round(a[0] + (b[0] - a[0]) * t);
+    const g = Math.round(a[1] + (b[1] - a[1]) * t);
+    const bl = Math.round(a[2] + (b[2] - a[2]) * t);
+    return `rgb(${r}, ${g}, ${bl})`;
+  }
+
+  /** @param {string} hex - a `#rrggbb` (or `rrggbb`) color. @returns {[number, number, number]} r,g,b in 0-255. */
+  function hexToRgb(hex) {
+    const h = hex.trim().replace(/^#/, "");
+    return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+  }
 
   // ----------------------------------------------------------- formatting
 
   const nf = new Intl.NumberFormat();
 
+  /**
+   * Locale-formatted count, abbreviated above 10K/1M (e.g. "12.3K") so stat
+   * tiles and popups stay a fixed, glanceable width instead of growing
+   * arbitrarily wide with cache size.
+   * @param {number|null|undefined} value
+   * @returns {string}
+   */
   function compact(value) {
     if (value === null || value === undefined) return "-";
     if (value >= 1e6) return (value / 1e6).toFixed(1).replace(/\.0$/, "") + "M";
@@ -97,6 +147,7 @@
     return nf.format(Math.round(value));
   }
 
+  /** @param {string} iso - a "YYYY-MM-DD" date. @returns {string} locale short date (e.g. "3 Aug"), read as UTC. */
   function shortDate(iso) {
     const d = new Date(iso + "T00:00:00Z");
     return d.toLocaleDateString(undefined, {
@@ -106,12 +157,14 @@
     });
   }
 
+  /** @param {number} seconds - elapsed time, e.g. `now - detectionTimestamp`. @returns {string} a coarse relative-age label ("14 min ago", "3 h ago", "2 d ago"). */
   function ageLabel(seconds) {
     if (seconds < HOUR) return `${Math.max(1, Math.round(seconds / 60))} min ago`;
     if (seconds < DAY) return `${Math.round(seconds / HOUR)} h ago`;
     return `${Math.round(seconds / DAY)} d ago`;
   }
 
+  /** Escapes `&<>"'` for safe interpolation into innerHTML strings built throughout this file. @param {*} value @returns {string} */
   function escapeHtml(value) {
     return String(value)
       .replace(/&/g, "&amp;")
@@ -128,6 +181,18 @@
   // fetch and `isCurrent(token)` after it turns "am I still the latest
   // call" into a one-line check instead of four hand-rolled copies of the
   // same guard.
+  /**
+   * Factory for the request-staleness token pattern used by every
+   * viewport-driven panel loader (coverage/industrial/events/eumetsat/map
+   * search, one guard instance each - see e.g. `coverageGuard`,
+   * `industrialGuard`, `eventsGuard`, `eumetsatGuard`, `searchGuard` below).
+   *
+   * Usage: call `next()` right before firing a fetch, capture the returned
+   * token, then call `isCurrent(token)` after the response lands (and
+   * again after any subsequent await) - if it returns false, a newer call
+   * has since started and this response's data must not be applied.
+   * @returns {{ next: () => number, isCurrent: (t: number) => boolean }}
+   */
   function makeStaleGuard() {
     let token = 0;
     return { next: () => ++token, isCurrent: (t) => t === token };
@@ -135,6 +200,13 @@
 
   // --------------------------------------------------------------- colours
 
+  /**
+   * Finds which bin a value falls in for a bins array shaped like
+   * AGE_BINS/FRP_BINS (each `{ max }`, ascending, last entry `max: Infinity`).
+   * @param {{max: number}[]} bins
+   * @param {number} value
+   * @returns {number} index of the first bin whose `max` exceeds `value`.
+   */
   function binIndex(bins, value) {
     for (let i = 0; i < bins.length; i++) if (value < bins[i].max) return i;
     return bins.length - 1;
@@ -149,6 +221,13 @@
   // freshest-first, so age needs the index mirrored - otherwise the
   // freshest (most operationally important) detections would land on the
   // ramp's most-recessive step, the least visible choice on the map.
+  /**
+   * @param {Array} row - a detection row, positional fields per api.py's /api/detections (lat, lon, ts, frp, confidence, source_id, ...).
+   * @param {number} now - epoch seconds, passed in rather than read fresh so a whole batch of rows is colored against one consistent "now".
+   * @param {string[]} ramp - fireRamp(), 5 steps.
+   * @param {string[]} cats - catColors(), 3 steps.
+   * @returns {string} the hex/rgb fill color for this row under the current state.colorBy mode.
+   */
   function colorForRow(row, now, ramp, cats) {
     if (state.colorBy === "instrument") {
       const meta = state.sources.get(row[5]);
@@ -170,6 +249,7 @@
   // pushState) so panning around never pollutes browser back-button history
   // or fires a hashchange loop - it just keeps the current URL in sync.
 
+  /** @returns {{zoom: number, lat: number, lon: number}|null} the parsed `#zoom/lat/lon` hash, or null if absent/malformed. */
   function readViewFromHash() {
     const m = /^#(\d+(?:\.\d+)?)\/(-?\d+(?:\.\d+)?)\/(-?\d+(?:\.\d+)?)$/.exec(
       window.location.hash
@@ -180,6 +260,7 @@
     return { zoom, lat, lon };
   }
 
+  /** Syncs the URL hash to the map's current view; see the section comment above for why replaceState. */
   function writeViewToHash() {
     const c = map.getCenter();
     const hash = `#${map.getZoom()}/${c.lat.toFixed(5)}/${c.lng.toFixed(5)}`;
@@ -198,6 +279,9 @@
   let pointLayer = null;
   let clusterLayer = null;
   let heatLayer = null;
+  let spreadTopologyLayer = null;
+  let spreadTopologyGeneration = 0; // bumped per submitSpreadTopologyJob() call - lets a slow/superseded job response detect it's stale and skip rendering
+  let spreadTopologyDebounceTimer = null;
   let coverageLayer = null;
   let coverageRetryTimer = null;
   let industrialLayer = null;
@@ -217,6 +301,12 @@
   // (started once in init()) re-renders just that text node periodically.
   let calloutReferenceTs = null;
 
+  /**
+   * Builds the Leaflet map, its custom panes (z-ordering for
+   * coverage/analysis/industrial layers relative to fire markers) and the
+   * moveend/zoomend -> URL-hash + scheduleLoad wiring. Called once from init().
+   * @param {object} config - the /api/config payload (used only for startup_bbox here).
+   */
   function initMap(config) {
     // Restore the last-viewed spot rather than always opening on the whole
     // world: the URL's own #zoom/lat/lon wins first (works across restarts
@@ -279,6 +369,12 @@
     });
   }
 
+  /**
+   * Populates the basemap picker grid and the overlay checkbox list from
+   * server config, and restores whichever basemap was last selected
+   * (localStorage) or falls back to the configured default.
+   * @param {object} config - the /api/config payload (basemaps[], overlays[]).
+   */
   function buildBasemaps(config) {
     const grid = $("#basemap-grid");
     grid.innerHTML = "";
@@ -338,6 +434,13 @@
     });
   }
 
+  /**
+   * Swaps the active basemap layer, persists the choice, and - only when
+   * the new basemap's light/dark tone actually differs from the current
+   * one - re-renders everything whose styling depends on basemapTone
+   * (legend, detections, coverage mesh).
+   * @param {string} id - a basemap id from config.basemaps.
+   */
   function selectBasemap(id) {
     const entry = basemapLayers[id];
     if (!entry) return;
@@ -373,6 +476,7 @@
   // looking - not a generic icon - fetched through the same /tiles proxy
   // and cache the main map itself uses, so this costs nothing extra beyond
   // normal tile caching and still works fully offline once cached.
+  /** @param {number} zoom - target preview zoom (see thumbnailUrl's own comment on how it's chosen). @returns {{x: number, y: number, z: number}} the slippy-map tile covering the map's current center at `zoom`. */
   function previewTileXYZ(zoom) {
     const center = map.getCenter();
     const n = 2 ** zoom;
@@ -384,6 +488,7 @@
     return { x: ((x % n) + n) % n, y: Math.min(Math.max(y, 0), n - 1), z: zoom };
   }
 
+  /** @param {object} bm - a basemap meta entry (from config.basemaps). @returns {string} a real /tiles-proxied tile URL suitable as a CSS background-image preview. */
   function thumbnailUrl(bm) {
     // A regional-overview zoom, not the map's own current zoom - a useful
     // small preview should show recognisable terrain/coastline/roads, not
@@ -395,6 +500,7 @@
     return bm.url.replace("{z}", z).replace("{x}", x).replace("{y}", y).replace("{r}", "");
   }
 
+  /** Refreshes every basemap-grid tile's preview image against the map's current center. */
   function refreshBasemapThumbnails() {
     if (!map) return;
     $$("#basemap-grid .basemap-tile").forEach((tile) => {
@@ -404,22 +510,26 @@
     });
   }
 
+  /** Refreshes just the collapsed toggle button's own preview swatch (the active basemap only). */
   function refreshBasemapToggleThumb() {
     if (!map || !activeBasemap) return;
     $("#basemap-toggle-thumb").style.backgroundImage = `url("${thumbnailUrl(activeBasemap.meta)}")`;
   }
 
+  /** Opens the basemap flyout, refreshing its thumbnails first (see wireBasemapPicker's lazy-refresh comment). */
   function openBasemapFlyout() {
     refreshBasemapThumbnails();
     $("#basemap-flyout").hidden = false;
     $("#basemap-toggle").setAttribute("aria-expanded", "true");
   }
 
+  /** Closes the basemap flyout. */
   function closeBasemapFlyout() {
     $("#basemap-flyout").hidden = true;
     $("#basemap-toggle").setAttribute("aria-expanded", "false");
   }
 
+  /** Wires the basemap-toggle button, its flyout's open/close/outside-click/Escape handling, and thumbnail refresh-on-pan. */
   function wireBasemapPicker() {
     const toggle = $("#basemap-toggle");
     toggle.addEventListener("click", () => {
@@ -455,6 +565,7 @@
   // than a hardcoded guess at Leaflet's own margins (a first attempt at a
   // fixed CSS offset landed a few pixels off; Leaflet's actual per-corner
   // spacing isn't just the documented 10px control margin).
+  /** Repositions #basemap-picker against the real rendered zoom control (see the comment above for why this can't just be a fixed CSS offset). Called on init, on window resize, and whenever the layout it depends on changes (e.g. applyAppMode). */
   function alignBasemapPicker() {
     const zoomEl = document.querySelector(".leaflet-control-zoom");
     const mapEl = document.getElementById("map");
@@ -493,6 +604,11 @@
     eventview: "NexEventView",
   };
 
+  /**
+   * Switches the visible app (see the section comment above for the
+   * class-toggle-not-`hidden` rationale) and persists the choice.
+   * @param {string} id - one of APP_MODES; falls back to "firemap" if unrecognised.
+   */
   function applyAppMode(id) {
     if (!APP_MODES.includes(id)) id = "firemap";
     $$("[data-app]").forEach((el) => {
@@ -522,11 +638,13 @@
     alignBasemapPicker();
   }
 
+  /** Closes the app-switcher dropdown menu. */
   function closeAppSwitcher() {
     $("#app-switcher-menu").hidden = true;
     $("#app-switcher-toggle").setAttribute("aria-expanded", "false");
   }
 
+  /** Wires the app-switcher toggle/menu (open/close/outside-click/Escape) and restores the last-selected app from localStorage. */
   function wireAppSwitcher() {
     const toggle = $("#app-switcher-toggle");
     const menu = $("#app-switcher-menu");
@@ -564,13 +682,15 @@
 
   // -------------------------------------------------------------- drawing
 
+  /** Removes whichever detection render-mode layer is currently on the map (at most one of these is ever non-null) and nulls out all four handles. */
   function clearLayers() {
-    [pointLayer, clusterLayer, heatLayer].forEach((layer) => {
+    [pointLayer, clusterLayer, heatLayer, spreadTopologyLayer].forEach((layer) => {
       if (layer && map.hasLayer(layer)) map.removeLayer(layer);
     });
-    pointLayer = clusterLayer = heatLayer = null;
+    pointLayer = clusterLayer = heatLayer = spreadTopologyLayer = null;
   }
 
+  /** @returns {number} the circleMarker radius (px) for the map's current zoom - coarser zoom, smaller dots, so dense clusters stay legible. */
   function radiusForZoom() {
     const z = map.getZoom();
     if (z <= 3) return 2.5;
@@ -587,6 +707,16 @@
   // honest than a fixed-radius dot at every zoom level.
   const KM_PER_DEG_LAT = 110.574;
 
+  /**
+   * Builds an axis-aligned ellipse polygon approximating a FIRMS pixel
+   * footprint (see the comment above for why axis-aligned, not
+   * heading-oriented).
+   * @param {number} lat @param {number} lon - footprint center.
+   * @param {number} scanKm - along-scan (east-west-ish) footprint size, km.
+   * @param {number} trackKm - along-track (north-south-ish) footprint size, km.
+   * @param {number} [segments=24] - polygon vertex count.
+   * @returns {[number, number][]} lat/lon vertex ring for L.polygon.
+   */
   function ellipseLatLngs(lat, lon, scanKm, trackKm, segments = 24) {
     const latRad = (lat * Math.PI) / 180;
     const kmPerDegLon = 111.320 * Math.cos(latRad) || 0.0001;
@@ -600,6 +730,7 @@
     return points;
   }
 
+  /** @param {Array} row - a detection row. @returns {string} the HTML for a detection marker's popup (lazily invoked via `marker.bindPopup(() => popupHtml(row))`, not built eagerly for every row). */
   function popupHtml(row) {
     const meta = state.sources.get(row[5]) || {};
     const when = new Date(row[2] * 1000);
@@ -624,6 +755,7 @@
 
   // Rows currently on screen, honouring a scrubbed/playing time cursor -
   // playback never re-fetches, it just narrows what's already loaded.
+  /** @returns {Array[]} state.rows, filtered to state.playback.cursor when playback is scrubbed/active; all rows otherwise. */
   function visibleRows() {
     const cursor = state.playback.cursor;
     if (cursor === null) return state.rows;
@@ -632,6 +764,7 @@
 
   // ------------------------------------------------------------- playback
 
+  /** Recomputes playback min/max from state.rows (called after every reload) and repositions the cursor - see the inline "wasAtEnd" comment for the stay-pinned-to-now behaviour. */
   function updatePlaybackRange() {
     const pb = state.playback;
     if (!state.rows.length) {
@@ -652,6 +785,7 @@
     syncPlaybackUI();
   }
 
+  /** Syncs the playback slider's min/max/value and enabled state, and disables playback entirely when there's not enough time spread in view to animate. */
   function syncPlaybackUI() {
     const pb = state.playback;
     const slider = $("#playback-slider");
@@ -670,6 +804,7 @@
     updatePlaybackReadout();
   }
 
+  /** Updates the playback readout's text to match the current cursor position. */
   function updatePlaybackReadout() {
     const pb = state.playback;
     const out = $("#playback-readout");
@@ -682,6 +817,7 @@
     out.textContent = `Showing detections up to ${when} UTC`;
   }
 
+  /** Starts the acquisition-time animation: a 150ms-tick interval that advances the cursor and redraws, stopping itself automatically at pb.max. */
   function startPlayback() {
     const pb = state.playback;
     if (pb.min === null || pb.max === null || pb.min === pb.max) return;
@@ -702,6 +838,7 @@
     }, 150);
   }
 
+  /** Stops the playback animation timer and resets the play/pause button. */
   function stopPlayback() {
     const pb = state.playback;
     pb.active = false;
@@ -712,8 +849,32 @@
     btn.setAttribute("aria-label", "Play acquisition-time animation");
   }
 
+  /**
+   * Renders state.rows (via visibleRows()) onto the map in whichever
+   * state.renderMode is active:
+   *  - "topology" delegates entirely to drawSpreadTopology() - a
+   *    server-computed contour, not a per-point style, so it returns early
+   *    before any of the client-side per-row styling below runs.
+   *  - "heat" builds a single L.heatLayer weighted by normalised FRP.
+   *  - "cluster" groups per-row circleMarkers into a marker-cluster layer.
+   *  - "points" (default) draws one marker per row directly on the map,
+   *    switching each marker from a fixed-radius circleMarker to a
+   *    sensor-accurate footprint ellipse (ellipseLatLngs) once the zoom is
+   *    past FOOTPRINT_MIN_ZOOM and scan/track data is present - below that
+   *    zoom an ellipse would be visually indistinguishable from a dot, so
+   *    the cheaper circleMarker is used instead.
+   * The entry point for every redraw trigger: pan/zoom settling, source
+   * toggles, color-by/render-mode changes, basemap-tone flips, and each
+   * playback tick.
+   */
   function drawDetections() {
     clearLayers();
+
+    if (state.renderMode === "topology") {
+      drawSpreadTopology();
+      return;
+    }
+
     const rows = visibleRows();
     if (!rows.length) return;
 
@@ -773,10 +934,180 @@
     }
   }
 
+  // "Spread over Time" can't be drawn from state.rows client-side like every
+  // other render mode - the nested bands are a server-computed contour of
+  // the *cumulative* detection footprint at up to 5 cutoffs, one per
+  // distinct satellite overpass (see events.py's spread_topology), not a
+  // per-point style function.
+  //
+  // drawDetections() (and everything that calls it: pan/zoom settling,
+  // render-mode/basemap-tone switches, ...) can fire several times within
+  // milliseconds of each other during one user action - each one used to
+  // submit its own background job immediately, so a single settling pan
+  // could queue half a dozen redundant jobs, and worse, created a real
+  // race: whichever job happened to *finish* last won, even if an earlier
+  // one (for the exact same final, now-settled view) had already
+  // rendered a perfectly good result - an unrelated late failure could
+  // blank out a result that was already correct on screen. Debouncing the
+  // actual submission (this function) the same way loadDetections' own
+  // pan/zoom trigger already is (scheduleLoad, app.js:1120) fixes both:
+  // only the final, truly-settled view ever submits a job.
+  /** Shows a "computing…" placeholder in the legend and (re)arms the 400ms debounce that eventually calls submitSpreadTopologyJob(). */
+  function drawSpreadTopology() {
+    clearTimeout(spreadTopologyDebounceTimer);
+    const legend = $("#legend");
+    legend.innerHTML = `<div class="legend-title">Spread over Time</div><p class="hint">Computing spread over time…</p>`;
+    spreadTopologyDebounceTimer = setTimeout(submitSpreadTopologyJob, 400);
+  }
+
+  // Submits the job and polls it, the same submit/waitForJob idiom
+  // detectEvents() uses (app.js:1521) - errors surface in the legend area
+  // rather than leaving the map silently blank, since this is the one
+  // render mode where "nothing drew", "still computing", and "the job
+  // failed" would otherwise look identical.
+  /**
+   * Submits a spread_topology job for the current view/days/sources, waits
+   * for it, then hands the resulting GeoJSON to renderSpreadTopologyLayer().
+   * Guards every await point with `stillCurrent()` against
+   * spreadTopologyGeneration so a superseded call (newer pan/zoom/render-
+   * mode switch) never overwrites a more recent result - see makeStaleGuard's
+   * comment for the same pattern in object form.
+   */
+  async function submitSpreadTopologyJob() {
+    const myGeneration = ++spreadTopologyGeneration;
+    const stillCurrent = () => spreadTopologyGeneration === myGeneration;
+    const legend = $("#legend");
+    const showLegendMessage = (msg) => {
+      legend.innerHTML = `<div class="legend-title">Spread over Time</div><p class="hint">${escapeHtml(msg)}</p>`;
+    };
+
+    if (!state.enabledSources.size) {
+      showLegendMessage("No sources enabled.");
+      return;
+    }
+
+    try {
+      const res = await fetch("/api/detections/spread_topology", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          bbox: bboxParam(),
+          days: state.days,
+          sources: Array.from(state.enabledSources),
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const { job_id } = await res.json();
+      const job = await waitForJob(job_id, { timeoutMs: 60000, intervalMs: 1000 });
+      if (!stillCurrent()) return; // superseded by a newer pan/zoom/render-mode switch
+
+      const result = job.result;
+      if (!result.files.topology) {
+        state.lastSpreadTopologyRange = null;
+        showLegendMessage("No detections in this view.");
+        return;
+      }
+      const geoRes = await fetch(`/api/jobs/${job_id}/files/${result.files.topology}`);
+      if (!geoRes.ok) throw new Error(`HTTP ${geoRes.status} fetching contour result`);
+      const geo = await geoRes.json();
+      if (!stillCurrent()) return;
+
+      renderSpreadTopologyLayer(geo);
+    } catch (err) {
+      if (!stillCurrent()) return;
+      console.error(err);
+      showLegendMessage(`Couldn't compute: ${err.message || String(err)}`);
+    }
+  }
+
+  /** @param {object} geo - the spread_topology GeoJSON FeatureCollection (each feature carrying cutoff_ts/band_index/detection_count). Draws the layer, refreshes state.lastSpreadTopologyRange, and re-renders the legend. */
+  function renderSpreadTopologyLayer(geo) {
+    if (spreadTopologyLayer && map.hasLayer(spreadTopologyLayer)) map.removeLayer(spreadTopologyLayer);
+
+    if (!geo.features.length) {
+      state.lastSpreadTopologyRange = null;
+      renderLegend();
+      return;
+    }
+
+    const cutoffs = geo.features.map((f) => f.properties.cutoff_ts);
+    state.lastSpreadTopologyRange = { earliest: Math.min(...cutoffs), latest: Math.max(...cutoffs) };
+
+    const ramp = timeRamp();
+    // Largest/latest band first, smallest/earliest last - mirrors
+    // drawProbabilityEnvelopes' concentric-ring comment (app.js:1627), but
+    // the size/color relationship here is the opposite of that function's:
+    // there, a smaller mass is more *confident*; here, a smaller band is
+    // *earlier* (cumulative construction - see spread_topology's docstring).
+    // Near-opaque fill (not drawProbabilityEnvelopes' ~0.18), deliberately:
+    // these bands are cumulative supersets of each other, so the innermost
+    // area sits under every single band at once - a translucent fill (first
+    // tried at 0.55) compounds across all of them there (alpha stacking:
+    // 1-(1-0.55)^5 ~= 0.98), washing the center out to a muddy near-solid
+    // blend regardless of which color is nominally "on top", which is
+    // exactly backwards from what this encoding needs (each pixel should
+    // show *one* band's actual color, the most recent one covering it).
+    // Opaque fill sidesteps the compounding entirely: each later, smaller
+    // band drawn on top cleanly overwrites the larger one beneath it in
+    // its footprint, rather than blending into it - the correct read for
+    // "this area's own most-recent color", not confidence density.
+    const sorted = {
+      ...geo,
+      features: [...geo.features].sort((a, b) => b.properties.band_index - a.properties.band_index),
+    };
+    const ring = state.basemapTone === "dark" ? "#fcfcfb" : "#0d0d0d";
+    spreadTopologyLayer = L.geoJSON(sorted, {
+      style: (feature) => ({
+        fillColor: ramp[feature.properties.band_index],
+        color: ring,
+        weight: 1,
+        opacity: 0.5,
+        fillOpacity: 0.94,
+      }),
+      onEachFeature: (feature, layer) => {
+        const when = new Date(feature.properties.cutoff_ts * 1000).toISOString().slice(0, 16).replace("T", " ");
+        layer.bindTooltip(`as of ${when} UTC · ${feature.properties.detection_count} detection(s)`);
+      },
+    }).addTo(map);
+
+    renderLegend();
+  }
+
   // --------------------------------------------------------------- legend
 
+  /**
+   * Rebuilds the #legend panel to match the current renderMode/colorBy:
+   * a gradient bar with real UTC timestamps for "topology" mode, a
+   * categorical swatch list for colorBy "instrument", or an age/FRP ramp
+   * otherwise. Called after every mode/tone change so the legend never
+   * shows stale bins for what's actually drawn.
+   */
   function renderLegend() {
     const el = $("#legend");
+
+    if (state.renderMode === "topology") {
+      const range = state.lastSpreadTopologyRange;
+      // Real timestamps, not bare "Earlier"/"Later" labels - this project's
+      // established convention (see popupHtml's own "Detected" field) of
+      // showing the actual value rather than a vague relative one. Falls
+      // back to the plain labels only when nothing has rendered yet (job
+      // still running, or none of the bands returned any contour).
+      const fmt = (ts) => new Date(ts * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC";
+      const labels = range
+        ? [fmt(range.earliest), fmt(range.latest)]
+        : ["Earlier", "Later"];
+      // No inline gradient here - .legend-gradient's own CSS already builds
+      // it from the same --time-* vars timeRamp() reads, so the legend bar
+      // and the marks it describes can never drift out of sync.
+      el.innerHTML = `
+        <div class="legend-title">Spread over Time</div>
+        <div class="legend-gradient"></div>
+        <div class="legend-gradient-labels">
+          ${labels.map((l) => `<span>${escapeHtml(l)}</span>`).join("")}
+        </div>`;
+      return;
+    }
+
     const ramp = fireRamp();
 
     if (state.colorBy === "instrument") {
@@ -818,6 +1149,12 @@
 
   // ------------------------------------------------------------ histogram
 
+  /**
+   * Renders the per-day detection-count bar chart from state.summary as
+   * hand-built SVG (no charting library) - bars inside the active `days`
+   * window (or the selected focusDay) are highlighted; clicking a bar
+   * toggles it as the focus day and reloads detections for just that day.
+   */
   function renderHistogram() {
     const host = $("#histogram");
     const data = state.summary;
@@ -903,6 +1240,7 @@
     host.appendChild(svg);
   }
 
+  /** Positions and fills the shared #tooltip element for a hovered histogram bar. @param {MouseEvent} event @param {{day: string, count: number, frp_total: number}} d */
   function showTooltip(event, d) {
     const tip = $("#tooltip");
     tip.innerHTML = `<b>${compact(d.count)}</b> <span>detections</span><br><span>${shortDate(
@@ -913,12 +1251,14 @@
     tip.style.top = `${event.clientY - 46}px`;
   }
 
+  /** Hides the shared histogram tooltip. */
   function hideTooltip() {
     $("#tooltip").hidden = true;
   }
 
   // ----------------------------------------------------------- stat tiles
 
+  /** Fills the count/FRP-total/peak-day/days-cached stat tiles from state.rows and state.summary. @param {object|null} meta - the detections response's own meta (used only for the "truncated" `+` suffix). */
   function renderStats(meta) {
     $("#stat-count").textContent = compact(state.rows.length) +
       (meta && meta.truncated ? "+" : "");
@@ -939,6 +1279,7 @@
 
   // ------------------------------------------------------------ data load
 
+  /** @returns {string} the map's current viewport as a "west,south,east,north" query param, longitude clamped to ±180 (worldCopyJump can otherwise report bounds outside that range). */
   function bboxParam() {
     const b = map.getBounds();
     const west = Math.max(-180, b.getWest());
@@ -948,6 +1289,7 @@
       .join(",");
   }
 
+  /** @returns {URLSearchParams} bbox + enabled sources + confidence/min-FRP/day-night filters for /api/detections (days/start/end are added separately by loadDetections, since focusDay changes which of those apply). */
   function filterParams() {
     const params = new URLSearchParams();
     params.set("bbox", bboxParam());
@@ -959,6 +1301,17 @@
     return params;
   }
 
+  /**
+   * Debounce entry point for loadDetections(): every filter/pan/zoom
+   * trigger calls this (not loadDetections directly), so a burst of rapid
+   * changes - a fast pan, several filter checkboxes toggled in succession -
+   * collapses into one fetch fired `delay` ms after the last one, instead
+   * of one fetch per intermediate step.
+   * @param {number} [delay=250] - debounce window in ms; callers close to
+   *   the user's own action (checkbox/slider changes) tend to pass a
+   *   shorter one (120ms) than the map's own moveend/zoomend (450ms),
+   *   since a still-settling pan gesture benefits from the longer wait.
+   */
   function scheduleLoad(delay = 250) {
     clearTimeout(state.loadTimer);
     state.loadTimer = setTimeout(loadDetections, delay);
@@ -969,6 +1322,7 @@
   // (zoomed out, no sources enabled) used to just skip that, leaving
   // whatever those layers last showed for a *different*, zoomed-in
   // viewport still on the map instead of clearing or refreshing it.
+  /** Clears every viewport-piggybacked layer (coverage/industrial/eumetsat/events) and their retry timers - see the comment above for why this exists as its own function rather than being inlined at each early-return. */
   function clearAutofetchLayers() {
     const zoomHint = "Zoom in (or pick a source) to load this layer for the current view.";
 
@@ -1003,6 +1357,23 @@
     renderEventMarkers();
   }
 
+  /**
+   * The core viewport-driven fetch engine: pulls /api/detections +
+   * /api/summary for the current bbox/filters, redraws the map, and
+   * kicks off every layer that piggybacks on the same viewport (coverage,
+   * events, industrial sources, EUMETSAT). Never called directly from UI
+   * handlers - always through scheduleLoad()'s debounce.
+   *
+   * Cancellation: any in-flight call is aborted (via state.inflight's
+   * AbortController) the moment a new call starts, so a slow response for
+   * an old viewport can never land after - and overwrite - a newer one.
+   * This is the same "only the latest request wins" goal as
+   * makeStaleGuard()'s token pattern used elsewhere, but implemented with
+   * AbortController instead because this fetch is expensive enough
+   * (largest payload, drives the most downstream work) to be worth
+   * actually cancelling over the network rather than just ignoring the
+   * response once it arrives.
+   */
   async function loadDetections() {
     // Below MIN_ACTIVE_ZOOM the viewport is "most of a continent or more" -
     // skip the fetch (and everything piggybacking on it: coverage/events/
@@ -1081,6 +1452,13 @@
 
   const coverageGuard = makeStaleGuard();
 
+  /**
+   * Fetches and draws the satellite-coverage mesh for the current
+   * viewport/focusDay, guarded by coverageGuard against a stale response
+   * overwriting a newer one. Retries once after 5s if the response came
+   * back with a job still queued (see the trailing comment on why one
+   * retry, not a poll loop).
+   */
   async function loadCoverage() {
     clearTimeout(coverageRetryTimer);
     coverageRetryTimer = null;
@@ -1154,6 +1532,12 @@
 
   const industrialGuard = makeStaleGuard();
 
+  /**
+   * Fetches and draws known industrial-source candidates for the current
+   * viewport, guarded by industrialGuard, styled per INDUSTRIAL_STYLE by
+   * classification. Retries once after 6s if a scan job was just queued
+   * for a not-yet-seen viewport.
+   */
   async function loadIndustrialSources() {
     clearTimeout(industrialRetryTimer);
     industrialRetryTimer = null;
@@ -1223,6 +1607,7 @@
     }
   }
 
+  /** Manually triggers (and waits for) an industrial-source scan for the current viewport via the "rescan now" button, then reloads the layer. */
   async function scanIndustrial() {
     const btn = $("#btn-scan-industrial");
     const status = $("#industrial-status");
@@ -1269,6 +1654,13 @@
 
   const eumetsatGuard = makeStaleGuard();
 
+  /**
+   * Fetches and draws recent EUMETSAT MTG/FCI fire detections for the
+   * current viewport, guarded by eumetsatGuard. A no-op (early return,
+   * still clearing the layer) when the feature isn't enabled or its
+   * consumer key isn't configured server-side. Retries once after 8s if a
+   * fetch job was just queued.
+   */
   async function loadEumetsatFires() {
     clearTimeout(eumetsatRetryTimer);
     eumetsatRetryTimer = null;
@@ -1341,6 +1733,12 @@
 
   const eventsGuard = makeStaleGuard();
 
+  /**
+   * Fetches and renders clustered fire events for the current viewport
+   * (list + map bbox rectangles), guarded by eventsGuard. Retries once
+   * after 4s if a clustering job was just queued for a not-yet-seen
+   * viewport.
+   */
   async function loadEvents() {
     clearTimeout(eventsRetryTimer);
     eventsRetryTimer = null;
@@ -1371,6 +1769,16 @@
     }
   }
 
+  /**
+   * Draws each event's clustering bbox as a dashed rectangle on the map.
+   * `ev.params.wide_span` (server-computed - events.py flags a cluster
+   * whose bbox exceeds the plausible single-fire span) is surfaced right
+   * in the tooltip text, the same warning the list row's badge shows
+   * (renderEventList below) and the persistent banner shows once the
+   * event is opened (analyzeEvent) - three independent surfaces for the
+   * one flag, since a marker can be reached without ever passing through
+   * the other two.
+   */
   function renderEventMarkers() {
     if (eventMarkersLayer) map.removeLayer(eventMarkersLayer);
     const boxes = state.events.map((ev) =>
@@ -1380,11 +1788,21 @@
         weight: 1,
         dashArray: "4 3",
         fillOpacity: 0.03,
-      }).bindTooltip(`Event #${ev.id} · ${ev.detection_count} detections`)
+      }).bindTooltip(
+        `Event #${ev.id} · ${ev.detection_count} detections` +
+          (ev.params?.wide_span ? ` · ⚠ ${ev.params.span_km} km span, likely chained sources` : "")
+      )
     );
     eventMarkersLayer = L.layerGroup(boxes).addTo(map);
   }
 
+  /**
+   * Renders the event list panel; each row carries a `⚠ wide span` badge
+   * when the event's own `params.wide_span` flag is set (see
+   * renderEventMarkers' comment above for the flag's origin and its other
+   * two surfaces).
+   * @param {{job_id?: string}} [meta] - the /api/events response's own meta, used only for the "still clustering" empty-state message.
+   */
   function renderEventList(meta) {
     const host = $("#event-list");
     if (!state.events.length) {
@@ -1402,7 +1820,11 @@
       row.title = noLikelihood
         ? "Unavailable: the 'likelihood' module didn't load - see /api/config."
         : "Click to view and analyze this event";
-      row.innerHTML = `<span>Event #${ev.id} <span class="meta">· ${ev.detection_count} pts · ${when}</span></span>`;
+      const wideSpan = ev.params?.wide_span;
+      row.innerHTML = `<span>Event #${ev.id} <span class="meta">· ${ev.detection_count} pts · ${when}</span></span>` +
+        (wideSpan
+          ? `<span class="event-wide-span-badge" title="Spans ${ev.params.span_km} km - past the plausible single-fire bound. Likely several unrelated sources chained together (e.g. widespread agricultural burning), not one fire.">⚠ wide span</span>`
+          : "");
       // One click does everything: pan to it and analyze it - no separate
       // "analyze" button to discover first.
       row.addEventListener("click", () => {
@@ -1416,6 +1838,7 @@
     });
   }
 
+  /** Manually triggers (and waits for) event clustering for the current viewport via the "find in view" button, then reloads the event list/markers. */
   async function detectEvents() {
     const btn = $("#btn-detect-events");
     btn.disabled = true;
@@ -1444,6 +1867,25 @@
     }
   }
 
+  /**
+   * Polls `/api/jobs/{jobId}` on a fixed interval until the background job
+   * reaches a terminal state, resolving with the job record on "done" and
+   * throwing on "error", a 404 (permanently gone - not retried, see the
+   * comment below), too many consecutive transient failures, or the
+   * overall timeout. Shared by every one-shot background-job caller in
+   * this file (detectEvents, submitSpreadTopologyJob, analyzeEvent,
+   * checkBurnScar, runPropagation, runEnsemble, runValidation, ...) - the
+   * one retry/backoff implementation all of them lean on rather than each
+   * hand-rolling its own poll loop.
+   * @param {string} jobId
+   * @param {{timeoutMs?: number, intervalMs?: number}} [options] - callers
+   *   tune both per job kind: a cheap job keeps the defaults, a slower one
+   *   (ensemble, propagation, validation) passes a longer timeout and a
+   *   longer poll interval so it doesn't hammer the server for a job it
+   *   knows typically takes tens of seconds.
+   * @returns {Promise<object>} the job record once `status === "done"`.
+   * @throws {Error} on job failure, a 404, too many transient failures, or timeout.
+   */
   async function waitForJob(jobId, { timeoutMs = 30000, intervalMs = 700 } = {}) {
     const deadline = Date.now() + timeoutMs;
     // A 404 (the job row was purged, or the id is simply wrong) is a
@@ -1485,6 +1927,7 @@
     throw new Error("timed out waiting for the analysis job");
   }
 
+  /** Removes the analysis overlay image, envelope/isochrone layer, and fire callout marker, resetting calloutReferenceTs too. */
   function clearAnalysisLayers() {
     if (analysisOverlay) {
       map.removeLayer(analysisOverlay);
@@ -1510,6 +1953,15 @@
   const ENVELOPE_FILL = { 0.5: "#fd4f24", 0.8: "#fd7924", 0.9: "#fda65a" };
   const ENVELOPE_FILL_OPACITY = { 0.5: 0.4, 0.8: 0.24, 0.9: 0.13 };
 
+  /**
+   * Per-feature Leaflet style for one probability-mass band. The 50% (core)
+   * band gets a solid outline and slightly heavier weight - it's the
+   * headline "most likely" region (see showFireCallout) - while the
+   * looser 80%/90% bands get a dashed outline and progressively fainter
+   * fill, reading as "less certain, just bounding" rather than a firm edge.
+   * @param {object} feature - a GeoJSON feature with `properties.probability_mass` (0.5, 0.8, or 0.9).
+   * @returns {object} a Leaflet path style object.
+   */
   function styleProbabilityEnvelope(feature) {
     const mass = feature.properties.probability_mass;
     return {
@@ -1522,9 +1974,20 @@
     };
   }
 
+  /**
+   * Builds the probability-envelope GeoJSON layer (concentric confidence
+   * bands around a fire's likely/estimated extent).
+   * @param {object} geo - envelope FeatureCollection (from analyze_event/run_ensemble's `envelopes` file).
+   * @returns {L.GeoJSON} an un-added layer (callers `.addTo(map)` it themselves, storing the handle in envelopeLayer).
+   */
   function drawProbabilityEnvelopes(geo) {
     // Largest/least-confident mass first so smaller, more confident bands
     // layer visibly on top of it, producing the concentric-ring look.
+    // That's the z-ordering trick the whole function turns on: Leaflet/SVG
+    // draws features in array order, later ones on top, so pre-sorting by
+    // descending mass here is what actually produces the "confident core
+    // punched through a looser halo" read - styleProbabilityEnvelope alone
+    // (color/opacity per band) wouldn't get there without this ordering.
     const sorted = {
       ...geo,
       features: [...geo.features].sort((a, b) => b.properties.probability_mass - a.properties.probability_mass),
@@ -1537,6 +2000,14 @@
   // read "spreads this way, this fast" without hovering each line.
   const ISOCHRONE_RAMP = ["#fd4f24", "#fd7924", "#fda65a", "#fdc98c", "#fde4c4"];
 
+  /**
+   * Builds the isochrone GeoJSON layer (modelled spread-arrival contours,
+   * one line per elapsed-hours cutoff), styled from ISOCHRONE_RAMP by sort
+   * order of `properties.hours` (soonest first = brightest/thickest/most
+   * opaque), plus a permanent "+Nh" label per contour.
+   * @param {object} geo - isochrone FeatureCollection (from run_propagation's `isochrones` file).
+   * @returns {L.GeoJSON} an un-added layer (callers `.addTo(map)` it themselves, storing the handle in envelopeLayer).
+   */
   function drawIsochrones(geo) {
     const sortedHours = [...new Set(geo.features.map((f) => f.properties.hours))].sort((a, b) => a - b);
     const style = (feature) => {
@@ -1559,6 +2030,7 @@
     });
   }
 
+  /** @param {number|null} km2 @returns {string|null} "N km² (M mi²)" with precision scaled to magnitude, or null when km2 is unknown. */
   function fmtArea(km2) {
     if (km2 == null) return null;
     const mi2 = km2 * 0.386102;
@@ -1566,6 +2038,7 @@
     return `${fmt(km2)} km² (${fmt(mi2)} mi²)`;
   }
 
+  /** @param {number} ts - epoch seconds. @returns {string} coarse "Xm/Xh/Xd ago" relative-time label, used by the fire callout's live-updating freshness text. */
   function relativeTime(ts) {
     const mins = Math.max(0, Math.round((Date.now() / 1000 - ts) / 60));
     if (mins < 1) return "just now";
@@ -1575,6 +2048,13 @@
     return `${Math.round(hours / 24)}d ago`;
   }
 
+  /**
+   * Places the "🔥 Estimated fire extent"-style divIcon callout at the
+   * centroid of the 50% (core, highest-confidence) probability band.
+   * @param {object} geo - the envelope FeatureCollection this callout summarises.
+   * @param {string} headline - e.g. "Estimated fire extent" or "Modelled impact area".
+   * @param {number|null} referenceTs - epoch seconds the result is "as of"; feeds the live-updating "Updated Xm ago" text (see calloutReferenceTs/refreshFireCalloutFreshness).
+   */
   function showFireCallout(geo, headline, referenceTs) {
     // The 50% (core) band is the headline area, matching the doc's
     // Observed/Estimated framing - it's the smallest region that still
@@ -1604,6 +2084,7 @@
   // Re-render the callout's own "Updated Xm ago" text against the wall
   // clock instead of letting it freeze at whatever it said when the layer
   // was drawn - see calloutReferenceTs above.
+  /** Ticked periodically (setInterval in init()) to re-render just the callout's "Updated Xm ago" text node against the current wall clock; a no-op when no callout is showing. */
   function refreshFireCalloutFreshness() {
     if (!calloutMarker || !calloutReferenceTs) return;
     const el = calloutMarker.getElement();
@@ -1611,6 +2092,16 @@
     if (span) span.textContent = `Updated ${relativeTime(calloutReferenceTs)}`;
   }
 
+  /**
+   * Selects an event and kicks off every analysis it supports as
+   * independent background jobs (see the comment further down for why
+   * they're all fired up front rather than lazily per-click). Also resets
+   * the analysis panel's UI to a clean "heat" state and shows the
+   * persistent wide_span warning banner when this event's own
+   * `params.wide_span` flag is set (see renderEventMarkers' comment for
+   * the flag's origin).
+   * @param {number} eventId
+   */
   async function analyzeEvent(eventId) {
     state.selectedEventId = eventId;
     // A fresh event selection invalidates any burn-scar/propagation/ensemble
@@ -1648,6 +2139,12 @@
     $("#event-analysis").hidden = false;
     $("#h-analysis-event").textContent = `Event #${eventId}`;
     $("#analysis-status").textContent = "Analyzing…";
+    // Same wide_span flag the list badge already showed - repeated here as
+    // a persistent banner since an operator can open an event straight from
+    // a map click (renderEventMarkers()'s bbox rectangles) without ever
+    // seeing the list row it came from.
+    const selected = state.events.find((ev) => ev.id === eventId);
+    $("#event-wide-span-warning").hidden = !selected?.params?.wide_span;
 
     // Every analysis this event supports gets queued now, not on a later
     // click - each is an independent background job (idle OS priority, see
@@ -1683,6 +2180,20 @@
     }
   }
 
+  /**
+   * Submits and waits for a burn-scar job (Sentinel-2/Landsat pre/post
+   * comparison) for `eventId`. Shared shape with runPropagation/
+   * runEnsemble/runValidation below: submit -> waitForJob -> guard against
+   * `state.selectedEventId !== eventId` (the user may have selected a
+   * different event while this was in flight) -> store the result and
+   * enable its layer button.
+   * @param {number} eventId
+   * @param {{autoTriggered?: boolean}} [options] - true when queued
+   *   automatically from analyzeEvent() rather than a direct button click;
+   *   suppresses the error status text and skips auto-switching the
+   *   visible layer, since an unrequested background job shouldn't yank
+   *   the view away from whatever the operator is already looking at.
+   */
   async function checkBurnScar(eventId, { autoTriggered = false } = {}) {
     const btn = $("#btn-check-burn-scar");
     btn.disabled = true;
@@ -1728,6 +2239,7 @@
     }
   }
 
+  /** Submits and waits for a spread-propagation (terrain + weather) job for `eventId`. Same submit/wait/stale-selection-guard shape as checkBurnScar above. @param {number} eventId @param {{autoTriggered?: boolean}} [options] */
   async function runPropagation(eventId, { autoTriggered = false } = {}) {
     const btn = $("#btn-run-propagation");
     btn.disabled = true;
@@ -1762,6 +2274,7 @@
     }
   }
 
+  /** Submits and waits for a Monte Carlo ensemble (~40 members) job for `eventId`. Same submit/wait/stale-selection-guard shape as checkBurnScar above. @param {number} eventId @param {{autoTriggered?: boolean}} [options] */
   async function runEnsemble(eventId, { autoTriggered = false } = {}) {
     const btn = $("#btn-run-ensemble");
     btn.disabled = true;
@@ -1799,6 +2312,7 @@
     }
   }
 
+  /** Submits and waits for a rolling-holdout validation backtest for `eventId`. Same submit/wait/stale-selection-guard shape as checkBurnScar above; a failure here (e.g. too few detections) is expected and quiet when auto-triggered. @param {number} eventId @param {{autoTriggered?: boolean}} [options] */
   async function runValidation(eventId, { autoTriggered = false } = {}) {
     const btn = $("#btn-validate-event");
     const out = $("#validation-results");
@@ -1838,6 +2352,7 @@
     }
   }
 
+  /** Renders the validation backtest's per-model metrics table (kernel_density vs. classical baselines) into #validation-results. @param {object} result - the validate job's result payload. */
   function renderValidationResults(result) {
     const out = $("#validation-results");
     const metricCols = [
@@ -1881,11 +2396,29 @@
   // rendering choice.
   let analysisRenderGeneration = 0;
 
+  /**
+   * Publishes the currently-rendered spread/ensemble analysis (or `null`
+   * when cleared) as both a global and a CustomEvent, so other
+   * modules/apps sharing this map (e.g. operations.js's NexIncidentCommand
+   * tools) can react to it without this file importing them back.
+   * @param {object|null} detail
+   */
   function publishSpreadAnalysis(detail) {
     window.NexFiremapSpreadAnalysis = detail;
     window.dispatchEvent(new CustomEvent("nexfiremap:spread-analysis", { detail }));
   }
 
+  /**
+   * Draws whichever analysis layer matches state.analysisMode (heat/
+   * arrival/burn/spread/ensemble) from the already-fetched
+   * state.currentAnalysis/currentBurnScar/currentPropagation/
+   * currentEnsemble, plus (when the envelope toggle is on) fetches and
+   * draws the matching envelope/isochrone contour and fire callout.
+   * Guards every async envelope fetch with `stillCurrent()` against
+   * analysisRenderGeneration - see the comment above for the same-event,
+   * different-mode race this closes that the selectedEventId checks
+   * elsewhere in this section don't cover.
+   */
   function renderAnalysisLayers() {
     clearAnalysisLayers();
     publishSpreadAnalysis(null);
@@ -2028,6 +2561,7 @@
 
   let map3d = null;
 
+  /** @returns {{url: string, bounds: number[][], label: string}|null} the image URL/bounds/label for whichever analysis result matches state.analysisMode, or null if that mode has no result yet - the single source both the 2D image overlay and the 3D drape read from. */
   function currentOverlayInfo() {
     const mode = state.analysisMode;
     if (mode === "ensemble" && state.currentEnsemble) {
@@ -2050,6 +2584,19 @@
     return null;
   }
 
+  /**
+   * Lazily creates (once) and returns the singleton MapLibre GL 3D map,
+   * built from a terrain-DEM raster-dem source (terrarium encoding, ~1.8x
+   * exaggerated) plus an OpenTopoMap raster base - the bridge between the
+   * 2D Leaflet engine used everywhere else in this file and MapLibre GL,
+   * the only one of the two with real 3D/terrain rendering. Subsequent
+   * calls are free no-ops that just return the existing instance, so
+   * callers (open3DView) can call this unconditionally on every open.
+   * @param {string} demUrl - server-relative URL to the terrain-DEM tile source (config.terrain_dem.url).
+   * @param {string} topoUrl - server-relative URL to the topo basemap tile source.
+   * @param {string} topoAttribution
+   * @returns {maplibregl.Map}
+   */
   function ensureMap3D(demUrl, topoUrl, topoAttribution) {
     if (map3d) return map3d;
     map3d = new maplibregl.Map({
@@ -2070,6 +2617,15 @@
     return map3d;
   }
 
+  /**
+   * Opens the 3D overlay panel and drapes the current 2D analysis image
+   * (currentOverlayInfo()) over MapLibre terrain: creates the map on first
+   * use (ensureMap3D), then either updates the existing "nfm-fire" image
+   * source in place or adds it for the first time, since MapLibre sources
+   * can't be swapped wholesale the way a Leaflet imageOverlay is replaced.
+   * A no-op if there's nothing to show yet (no analysis result for the
+   * current mode).
+   */
   function open3DView() {
     const overlay = currentOverlayInfo();
     if (!overlay) return;
@@ -2104,10 +2660,12 @@
       `drag to orbit, scroll to zoom, right-drag/ctrl-drag to tilt.`;
   }
 
+  /** Hides the 3D overlay panel (the MapLibre instance itself is left alive - see ensureMap3D - so reopening is instant). */
   function close3DView() {
     $("#map3d-wrap").hidden = true;
   }
 
+  /** Tears down the whole event-analysis panel: clears map layers, the 3D view, and every state.current* result, then deselects the event. */
   function closeAnalysis() {
     clearAnalysisLayers();
     close3DView();
@@ -2122,6 +2680,7 @@
 
   // ---------------------------------------------------------- server status
 
+  /** Shows/hides the "Downloading N chunks" topbar pill from the /api/status fetcher block. @param {{pending: number}} fetcher */
   function setFetchIndicator(fetcher) {
     const pill = $("#fetch-indicator");
     const busy = fetcher.pending > 0;
@@ -2133,6 +2692,18 @@
     }
   }
 
+  /**
+   * Fetches `/api/status` and refreshes the fetch indicator, cache stat
+   * panel, and API-budget readout. When the background chunk fetcher just
+   * finished (`pending` dropped to 0), stops the poll loop and - unless
+   * told not to - reloads detections so the newly-completed chunks appear
+   * without the operator having to pan/zoom to trigger a refresh.
+   * @param {boolean} [reloadWhenIdle=true] - false for the periodic
+   *   "just check in" callers (init()'s own setInterval) that don't want
+   *   an unsolicited reload competing with whatever the operator's doing;
+   *   true for the polling loop actually watching a fetch to completion
+   *   (startPolling), where reloading on idle is the whole point.
+   */
   async function pollStatus(reloadWhenIdle = true) {
     try {
       const res = await fetch("/api/status");
@@ -2175,11 +2746,19 @@
     }
   }
 
+  /**
+   * Starts the 3s background-chunk-download status poll loop (idempotent -
+   * a second call while one's already running is a no-op). Triggered
+   * whenever the server reports pending chunks: after loadDetections sees
+   * `meta.pending > 0`, and after the manual "cache view"/"refresh" actions
+   * queue new fetches.
+   */
   function startPolling() {
     if (state.pollTimer) return;
     state.pollTimer = setInterval(() => pollStatus(true), 3000);
   }
 
+  /** Stops the status poll loop started by startPolling() and clears state.pollTimer. Called by pollStatus itself once the fetcher goes idle. */
   function stopPolling() {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
@@ -2187,6 +2766,13 @@
 
   // ------------------------------------------------------------------ init
 
+  /**
+   * Populates the source checkbox list from server config, seeds
+   * state.sources/enabledSources/instruments, and wires each checkbox to
+   * scheduleLoad(). Instruments are collected in first-seen order so
+   * colorBy "instrument" assigns categorical colors consistently.
+   * @param {object} config - the /api/config payload (sources[]).
+   */
   function buildSourceList(config) {
     const host = $("#source-list");
     host.innerHTML = "";
@@ -2217,6 +2803,14 @@
     state.instruments = instruments;
   }
 
+  /**
+   * Wires up essentially every control in the panel (days segment,
+   * color-by/render-mode selects, playback, coverage/industrial/eumetsat
+   * toggles, event-detection and per-layer analysis buttons, filters,
+   * panel/print/cache buttons, ...) - the single init-time pass that
+   * connects static DOM to the functions defined throughout this file.
+   * Called once from init().
+   */
   function wireControls() {
     $$("#days-seg button").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -2238,6 +2832,13 @@
 
     $("#render-mode").addEventListener("change", (e) => {
       state.renderMode = e.target.value;
+      // Unlike colorBy, renderMode now changes which legend renders too
+      // (topology has its own gradient legend, keyed on renderMode not
+      // colorBy) - renderLegend() first for an instant fallback ("Earlier"/
+      // "Later" until the async contour job resolves), same "show something
+      // now, refine when the real data lands" pattern loadCoverage/loadEvents
+      // already use elsewhere.
+      renderLegend();
       drawDetections();
     });
 
@@ -2330,6 +2931,19 @@
       $("#btn-panel").setAttribute("aria-expanded", String(!panel.hidden));
     });
 
+    // Lives in the topbar (never data-app-tagged), so it's reachable from
+    // every app, not just NexIncidentCommand's own print button. Delegates
+    // to operations.js's richer incident-aware print when that module has
+    // loaded (window.NexPrintView, set in its own init()) and always falls
+    // back to a bare window.print() otherwise - a click here must never
+    // silently do nothing, the exact failure mode this button's own
+    // generalisation was written to avoid (see printOperationsMap()'s
+    // comment in operations.js).
+    $("#btn-print-view").addEventListener("click", () => {
+      if (typeof window.NexPrintView === "function") window.NexPrintView();
+      else window.print();
+    });
+
     $("#btn-cache-view").addEventListener("click", async (e) => {
       const btn = e.currentTarget;
       btn.disabled = true;
@@ -2379,6 +2993,7 @@
   let searchResults = [];
   let searchActiveIndex = -1;
 
+  /** @param {string} raw - the raw search-box text. @returns {{label: string, lat: number, lon: number, bounds: null, type: "coordinates"}|null} a synthetic local search result if `raw` parses as coordinates (any system coords.js recognises), else null - falls through to the network geocoder. */
   function parseCoordinateQuery(raw) {
     // Delegates to coords.js: decimal degrees, DMS, DDM, MGRS and UTM are
     // all self-describing enough to auto-detect; a bare "number number"
@@ -2392,6 +3007,7 @@
     return { label: label || `${point.lat.toFixed(5)}, ${point.lon.toFixed(5)}`, lat: point.lat, lon: point.lon, bounds: null, type: "coordinates" };
   }
 
+  /** Populates the coordinate-system dropdown from coords.js's registry, restores the last-selected system (and any saved custom proj4 string), and wires changes to persist. A no-op if coords.js hasn't loaded. */
   function wireCoordSystemSelect() {
     if (typeof window.NexCoords === "undefined") return;
     const select = $("#coord-system-select");
@@ -2420,6 +3036,7 @@
     });
   }
 
+  /** Closes and clears the search results dropdown. */
   function closeSearchResults() {
     const list = $("#map-search-results");
     list.hidden = true;
@@ -2429,6 +3046,13 @@
     $("#map-search-input").setAttribute("aria-expanded", "false");
   }
 
+  /**
+   * Renders the search results dropdown (list + optional status/error row)
+   * and resets keyboard-selection state to the first item.
+   * @param {object[]} items - result objects (each with at least label/lat/lon).
+   * @param {string|null} statusText - an inline status/error line ("Searching…", "No matches.", ...), or null for none.
+   * @param {boolean} isError - styles statusText as an error when true.
+   */
   function renderSearchResults(items, statusText, isError) {
     const list = $("#map-search-results");
     searchResults = items;
@@ -2453,6 +3077,7 @@
     $("#map-search-input").setAttribute("aria-expanded", String(!list.hidden));
   }
 
+  /** Commits a chosen search result: fills the input, drops a pin, and pans/zooms the map to it (fitBounds if the result carries bounds, else a plain setView). @param {object|null} item */
   function selectSearchResult(item) {
     if (!item) return;
     $("#map-search-input").value = item.label;
@@ -2477,6 +3102,13 @@
     }
   }
 
+  /**
+   * Resolves a search query: a coordinate pair short-circuits locally
+   * (parseCoordinateQuery), otherwise queries the server's geocode proxy,
+   * guarded by searchGuard against a slower older query's response
+   * landing after a newer one.
+   * @param {string} query
+   */
   async function runSearch(query) {
     // A raw "lat, lon" pair resolves instantly and locally, no network
     // needed, and still works with the command server's WAN link down.
@@ -2515,6 +3147,7 @@
     }
   }
 
+  /** Moves keyboard focus among search results by `delta` (wrapping), for ArrowUp/ArrowDown handling. @param {number} delta - +1 or -1. */
   function moveSearchSelection(delta) {
     if (!searchResults.length) return;
     searchActiveIndex = (searchActiveIndex + delta + searchResults.length) % searchResults.length;
@@ -2525,6 +3158,7 @@
     if (active) active.scrollIntoView({ block: "nearest" });
   }
 
+  /** Wires the map-search input's debounced typing, keyboard navigation (Escape/Arrow/Enter), result clicks, and clear button. */
   function wireSearchControl() {
     const input = $("#map-search-input");
     const clearBtn = $("#map-search-clear");
@@ -2590,6 +3224,7 @@
   // A feature whose backend module failed to import (missing optional
   // dependency) gets its button disabled with an explanatory tooltip,
   // rather than letting the user hit a 503 with no context.
+  /** Disables (and adds an explanatory tooltip to) each control whose backend module failed to load, per state.features - called once from init() after config is fetched. */
   function applyFeatureAvailability() {
     const f = state.features;
 
@@ -2627,6 +3262,14 @@
     }
   }
 
+  /**
+   * App entry point: fetches server config, builds the map and every
+   * panel/picker, does the first detection load, and starts the periodic
+   * status/callout-freshness background timers. Its promise rejection is
+   * handled by the top-level `init().catch(...)` below, which renders a
+   * visible "failed to start" banner instead of leaving a blank page on
+   * any startup error.
+   */
   async function init() {
     const res = await fetch("/api/config");
     if (!res.ok) throw new Error(`/api/config returned HTTP ${res.status}`);

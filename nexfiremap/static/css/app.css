@@ -34,6 +34,35 @@
   --fire-4: #fb9a66;
   --fire-5: #ffc6a4;
 
+  /* "Time over Spread" ramp - continuous purple->red->orange->yellow->grey,
+     earliest->latest, colorForRow()/timeSpreadColor() in app.js interpolate
+     between these 5 stops rather than snapping to a bin. Deliberately
+     multi-hue (not the single-hue "sequential" default the dataviz skill
+     recommends) per an explicit design request with a reference image -
+     validated with validate_palette.py rather than eyeballed, and the
+     validator's categorical checks do report two FAILs on this palette,
+     both intentional, not oversights:
+       - "Lightness band": these steps vary L monotonically purple(dark)->
+         yellow(bright) instead of holding one flat L, the same technique
+         perceptually-uniform multi-hue colormaps (inferno/plasma) use -
+         confirmed empirically necessary here: an exhaustive search at a
+         *fixed* L for red/orange/yellow bottomed out around CVD dE 5-6
+         (purple/red/orange/yellow all crowded into one narrow lightness
+         slice is what makes them hard to tell apart), while letting L vary
+         found stops clearing dE >= 15 (normal/deutan/protan/tritan) here.
+       - "Chroma floor": the grey step is intentionally desaturated - that
+         IS "faded to grey", the whole point of it being the "latest, most
+         stale" endpoint.
+     Residual: one light-mode pair (grey<->yellow) sits at dE 14.3, just
+     under the 15 floor - not a hard fail, and every detection's exact
+     timestamp is always available in its popup regardless of color, the
+     secondary encoding the skill asks for when CVD separation is tight. */
+  --time-1: #6754d5; /* purple - earliest */
+  --time-2: #d13861; /* red */
+  --time-3: #ff8b00; /* orange */
+  --time-4: #f2e309; /* yellow */
+  --time-5: #aeaeae; /* grey - latest */
+
   /* Categorical slots 1-3, dark steps - instrument identity. */
   --cat-1: #3987e5;
   --cat-2: #d95926;
@@ -58,6 +87,14 @@ body[data-basemap-tone="light"] {
   --fire-3: #952e00;
   --fire-4: #6c1500;
   --fire-5: #440000;
+
+  /* Same 5-stop family, re-validated against surface #fcfcfb (see the
+     --time-* comment above for the method). */
+  --time-1: #210460;
+  --time-2: #62000c;
+  --time-3: #a14206;
+  --time-4: #b68700;
+  --time-5: #808080;
 }
 
 * { box-sizing: border-box; }
@@ -807,6 +844,29 @@ input[type="range"] { accent-color: var(--accent); }
 .event-row.selected { border-color: var(--accent); }
 .event-row .meta { color: var(--text-muted); }
 
+/* Flagged by events.py when a candidate's bounding-box diagonal exceeds
+   MAX_PLAUSIBLE_EVENT_SPAN_KM - a probable chained scatter of unrelated
+   detections (widespread agricultural burning is the common real case),
+   not a confident single fire. Visible before the click-through (this
+   badge) and again if the operator opens it anyway (the banner below). */
+.event-wide-span-badge {
+  color: var(--warning);
+  font-weight: 700;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.event-wide-span-warning {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 7px;
+  border: 1px solid rgba(250, 178, 25, 0.4);
+  background: rgba(250, 178, 25, 0.08);
+  color: var(--warning);
+  font-weight: 600;
+}
+.event-wide-span-warning[hidden] { display: none; }
+
 .event-analysis {
   margin-top: 4px;
   padding-top: 10px;
@@ -841,6 +901,27 @@ input[type="range"] { accent-color: var(--accent); }
 .legend-ramp .step { flex: 1; height: 9px; border-radius: 2px; }
 
 .legend-scale {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Continuous encoding (Time over Spread) - a smooth bar, not discrete
+   .legend-ramp .step swatches, since the underlying value is interpolated,
+   not binned. Built from the same --time-* stops app.js's timeSpreadColor()
+   interpolates between, so the legend and the actual marks never disagree. */
+.legend-gradient {
+  height: 9px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to right,
+    var(--time-1), var(--time-2), var(--time-3), var(--time-4), var(--time-5)
+  );
+}
+
+.legend-gradient-labels {
   display: flex;
   justify-content: space-between;
   font-size: 10px;
@@ -956,6 +1037,15 @@ body[data-basemap-tone="light"] .fire-callout-text span { color: #55534c; }
 .panel-foot { border-top: 1px solid var(--border); padding-top: 10px; }
 .panel-foot p { margin: 0; font-size: 10px; color: var(--text-muted); line-height: 1.5; }
 .panel-foot a, .setup a { color: var(--text-secondary); }
+
+/* Moved out of the topbar (no longer floating "buttons on the map") and
+   into this untagged, always-rendered panel-foot instead - since every
+   data-app section above it is hidden except the active app's own,
+   .panel-foot lands right after whichever content is currently showing,
+   reading as "the bottom of this menu" in every one of the four apps
+   without needing four separate copies of it. */
+.panel-status-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.panel-status-row .pill { backdrop-filter: none; }
 
 /* ------------------------------------------------------------------- setup */
 
@@ -1098,7 +1188,11 @@ code {
 @media print {
   @page { size: landscape; margin: 8mm; }
   html, body { width: 100%; height: 100%; overflow: visible; background: #fff; }
-  .topbar, .panel, .setup, .map3d-wrap, .leaflet-control-container { display: none !important; }
+  /* The new print button lives inside .topbar, so hiding that already
+     covers it. .basemap-picker sits outside .topbar (a sibling of #map,
+     not the Leaflet control container) and was the one piece of floating
+     map chrome this rule didn't already reach. */
+  .topbar, .panel, .setup, .map3d-wrap, .leaflet-control-container, .basemap-picker { display: none !important; }
   #map { position: fixed; inset: 25mm 0 0; border: 1px solid #444; }
   .ops-print-title[aria-hidden="false"] {
     position: fixed; display: grid; grid-template-columns: 2fr 1fr 1fr;
@@ -1118,8 +1212,12 @@ code {
      directly on top of panel fields (a tactical-drawing dropdown, a
      records section) once the panel becomes this full-width bottom sheet. */
   .panel { left: 12px; width: auto; top: auto; height: 52vh; bottom: 90px; }
-  #ops-connectivity { display: none; }
 }
+/* -------------------------------------------------------------- wind vector */
+/* L.divIcon markers built in operations.js (renderWindLayer()) - the arrow
+   glyph's rotation and colour come from the --wind-angle/--wind-colour custom
+   properties set inline per-marker, not from a class variant, since both vary
+   continuously per observation rather than falling into a few fixed states. */
 .wind-vector-icon {
   background: transparent;
   border: 0;
