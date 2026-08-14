@@ -1,14 +1,14 @@
 # NexFiremap
 
 Implementation status and remaining release gates are tracked in
-[`END_TO_END_TODO.md`](END_TO_END_TODO.md). Incident-LAN deployment and emergency
-recovery procedures are in [`INCIDENT_LAN_RUNBOOK.md`](INCIDENT_LAN_RUNBOOK.md).
+[`END_TO_END_TODO.md`](docs/END_TO_END_TODO.md). Incident-LAN deployment and emergency
+recovery procedures are in [`INCIDENT_LAN_RUNBOOK.md`](docs/INCIDENT_LAN_RUNBOOK.md).
 
 A local server that overlays [NASA FIRMS](https://firms.modaps.eosdis.nasa.gov/) active-fire
 detections on a choice of OpenStreetMap-based basemaps, with a 30-day local cache so
 history stays available without re-downloading it and without hammering NASA's API.
 
-Beyond the map, NexFiremap does something further_plan.md (this repo's own design notes)
+Beyond the map, NexFiremap does something docs/further_plan.md (this repo's own design notes)
 asks for explicitly: it keeps **Observed** detections, **Estimated** likelihood,
 **Modelled** propagation, and **Uncertainty** as separate, honestly-labelled layers,
 using classical statistics/geostatistics and physics - no machine learning - all computed
@@ -185,7 +185,7 @@ works on the command laptop's local server without public internet access.
 17. Generate immutable classified products as PDF, GeoJSON/JSON, CSV, GPX, KML/KMZ,
  GeoTIFF or raster GeoPackage. Only the public-information template can create public
  products, and public accounts can access only that filtered product catalogue.
-18. For shared incident-LAN use, follow [`INCIDENT_LAN_RUNBOOK.md`](INCIDENT_LAN_RUNBOOK.md):
+18. For shared incident-LAN use, follow [`INCIDENT_LAN_RUNBOOK.md`](docs/INCIDENT_LAN_RUNBOOK.md):
  enable LAN mode explicitly, configure TLS, create least-privilege named accounts,
  complete a WAN-off drill, and retain backups on separate encrypted media.
 19. **Live vehicle telemetry** shows source-token GPS feeds independently of manual
@@ -207,7 +207,7 @@ incident sketch as explicitly unsaved. Successful save or deliberate cancel remo
 LAN clients show whether the local command server is connected. The PWA shell and last
 successful reads are cached, but writes are never fabricated or silently queued while
 the command server is unavailable. The field-hardening roadmap is in
-[`OPERATIONAL_IMPLEMENTATION_PLAN.md`](OPERATIONAL_IMPLEMENTATION_PLAN.md).
+[`OPERATIONAL_IMPLEMENTATION_PLAN.md`](docs/OPERATIONAL_IMPLEMENTATION_PLAN.md).
 
 ## How the cache works
 
@@ -313,7 +313,7 @@ download.
 - No crown-fire behaviour, spotting, or the full Nelson dead-fuel-moisture PDE - see
  `rothermel.py`'s and `moisture.py`'s module docstrings for exactly what's approximated
  and why (the full FlamMap-compatible stack these come from is documented in this repo's
- own `firemodel.md`).
+ own `docs/firemodel.md`).
 - The ensemble's "sequential assimilation" is a batch weighted-calibration (each member
  solves once, scored against every later detection) rather than a fully recursive
  particle filter that re-propagates from a resampled state at each observation - the
@@ -328,7 +328,7 @@ download.
 ## Validation programme
 
 "Do not proceed to the visually polished model unless it reliably beats these
-baselines" - further_plan.md §11. Click **validate model** on an analyzed event to run a
+baselines" - docs/further_plan.md §11. Click **validate model** on an analyzed event to run a
 rolling-holdout backtest (`nexfiremap/validation.py`): reveal an event's earliest
 detections, hide the rest, ask several candidate models to predict the next observation,
 score them against what was actually seen (and, via the tri-state model, confirmed clear
@@ -353,7 +353,7 @@ estimate) arrival-time error.
 ## Persistent thermal-source classifier
 
 Not every hot pixel is a wildfire. `nexfiremap/industrial.py` implements
-further_plan.md §13's rule: **"OSM creates a candidate. Recurrence confirms it.
+docs/further_plan.md §13's rule: **"OSM creates a candidate. Recurrence confirms it.
 stationarity strengthens it. Propagation or burn evidence overrides it."**
 
 Click **scan this view** in the *Industrial/static sources* panel to:
@@ -544,7 +544,7 @@ tests/
  test_events.py Space-time clustering
  test_likelihood.py Likelihood raster, arrival-time IDW, envelopes, tri-state suppression
  test_imagery.py NBR/dNBR math, severity classification (offline)
- test_rothermel.py Rothermel kernel regression table (firemodel.md sec.54), directional ellipse
+ test_rothermel.py Rothermel kernel regression table (docs/firemodel.md sec.54), directional ellipse
  test_moisture.py Equilibrium moisture, time-lag conditioning, rain response
  test_terrain.py Slope/aspect, fuel crosswalk, anisotropic graph fast-marching, ensemble sampling
  test_validation.py Rolling-holdout splits, every baseline model, scoring metrics
@@ -591,7 +591,7 @@ python tests\test_industrial.py
 
 ### EUMETSAT corroboration (optional, needs a free account)
 
-further_plan.md §13 suggests EUMETSAT LSA SAF FRP as a European corroboration source.
+docs/further_plan.md §13 suggests EUMETSAT LSA SAF FRP as a European corroboration source.
 Its classic MSG/SEVIRI FRP-PIXEL product needs its own separate LSA SAF registration on
 top of a EUMETSAT account - real added friction every other source in this project avoids,
 which originally kept it out. Once a EUMETSAT account exists, though, the **EUMETSAT Data
