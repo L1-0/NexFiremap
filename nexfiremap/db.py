@@ -7,6 +7,15 @@ Two tables carry the cache:
 ``coverage``    bookkeeping: which (source, grid cell, day) combinations have
                 already been pulled, and when. This is what lets the server
                 fetch only the gaps instead of re-downloading everything.
+
+Schema changes are versioned. `SCHEMA` (idempotent CREATE ... IF NOT EXISTS)
+covers additive changes; anything that has to alter or rewrite an existing
+table is an entry in the `MIGRATIONS` ladder, applied one version at a time
+from whatever `PRAGMA user_version` the file reports up to `SCHEMA_VERSION`.
+Opening a database older than the code migrates it forward (after taking a
+pre-migration backup of the whole file); opening one *newer* than the code
+refuses outright rather than writing a schema it doesn't understand. See the
+"migrations" section below for the contract each step honours.
 """
 
 from __future__ import annotations
@@ -16,9 +25,10 @@ import math
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from .geo import lon_range_sql
 
@@ -605,18 +615,238 @@ DETECTION_COLUMNS = (
     "raw_json",
 )
 
-# Columns added to `detections` after its original CREATE TABLE - `CREATE
-# TABLE IF NOT EXISTS` doesn't retrofit them onto a database file created
-# before the column existed, so _init_schema adds any that are missing.
-_DETECTION_MIGRATIONS: tuple[tuple[str, str], ...] = (
-    ("raw_json", "TEXT"),
+# --------------------------------------------------------------- migrations
+#
+# The SCHEMA script above is idempotent, so it covers purely *additive*
+# changes on its own: a brand-new table or index simply appears the next
+# time the process starts. What it cannot do is touch a table that already
+# exists - `CREATE TABLE IF NOT EXISTS` is a no-op the moment the name is
+# taken - so a column added to `detections` later, a renamed column, or a
+# backfill of existing rows all need a real, ordered migration step.
+#
+# Hence this ladder: an ordered list of `MigrationStep`s, each carrying the
+# `PRAGMA user_version` the database is at *once that step has succeeded*.
+# `apply_migrations` walks it from the version the file on disk reports up
+# to `SCHEMA_VERSION`, so a database at any prior version catches up by
+# replaying exactly the steps it missed, in order.
+#
+# The contract a step has to honour:
+#
+#   * `apply` is either raw SQL (one or more statements) or a Python
+#     callable taking the connection - real migrations eventually have to
+#     rename/transform/backfill data, which SQL alone can't always express.
+#   * The runner wraps each step in its own transaction and bumps
+#     `user_version` *inside that same transaction*, so a step either lands
+#     completely (body plus version bump) or not at all: `user_version`
+#     lives in the database header and rolls back with everything else.
+#     A crash or a raising step therefore leaves the file at the last
+#     version whose body fully succeeded, never half-migrated-but-stamped.
+#   * Because the runner owns the transaction, a step must not COMMIT or
+#     ROLLBACK itself, and must avoid statements SQLite refuses inside a
+#     transaction (`VACUUM`, `PRAGMA journal_mode`, `PRAGMA foreign_keys`).
+#     A rebuild that needs foreign keys out of the way can use
+#     `PRAGMA defer_foreign_keys=ON`, which *does* work inside one.
+#   * A step must be safe to run against a table that is already in its
+#     final shape. SCHEMA runs first and always creates tables as the
+#     current code defines them, so on a fresh database a step that adds a
+#     column would find the column already present. Check before changing -
+#     `_add_missing_columns` below is the pattern.
+
+
+@dataclass(frozen=True)
+class MigrationStep:
+    """One rung of the schema ladder.
+
+    ``version``      the ``PRAGMA user_version`` the database reaches when
+                     this step succeeds (unique across the ladder; steps run
+                     in ascending version order).
+    ``description``  human-readable, quoted in errors and worth keeping
+                     accurate since it is the only record of intent once the
+                     step is years old.
+    ``apply``        raw SQL, or a callable receiving the open connection.
+    """
+
+    version: int
+    description: str
+    apply: str | Callable[[sqlite3.Connection], None]
+
+
+def _add_missing_columns(
+    table: str, columns: Sequence[tuple[str, str]]
+) -> Callable[[sqlite3.Connection], None]:
+    """Build a migration body that ALTERs in only the columns ``table`` is
+    actually missing.
+
+    The existence check is what makes such a step safe on a database whose
+    table SCHEMA just created in its current (already-complete) shape, where
+    a bare ``ADD COLUMN`` would fail with "duplicate column name"."""
+
+    def step(conn: sqlite3.Connection) -> None:
+        # PRAGMA table_info's second column is the column name; indexing by
+        # position (rather than by name) works whether or not the caller's
+        # connection has a row factory set.
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for column, column_type in columns:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")
+
+    return step
+
+
+# Ordered oldest-first. Versions 1-3 predate this ladder; everything they
+# introduced was additive and is therefore already covered by the SCHEMA
+# script, which is why the first rung here is 4 - the version at which
+# `detections` gained `raw_json`. (That column-add was previously a bare
+# "(name, type)" tuple applied on every startup; it is a genuine, shipped
+# migration, so it becomes the ladder's first real step rather than being
+# rewritten as a synthetic example.)
+MIGRATIONS: tuple[MigrationStep, ...] = (
+    MigrationStep(
+        version=4,
+        description="detections.raw_json - retrofit onto pre-v4 databases",
+        apply=_add_missing_columns("detections", (("raw_json", "TEXT"),)),
+    ),
 )
 
-# Bumped whenever SCHEMA/`_DETECTION_MIGRATIONS` gain something an existing
-# database file won't already have. `_init_schema` compares this against the
-# file's own `PRAGMA user_version` to decide whether a pre-migration backup
-# is warranted before applying the (idempotent) SCHEMA script.
+# Bumped whenever SCHEMA or MIGRATIONS gain something an existing database
+# file won't already have. `_init_schema` compares this against the file's
+# own `PRAGMA user_version` to decide whether a pre-migration backup is
+# warranted and which steps are still pending. A version that needs no step
+# of its own (a purely additive SCHEMA change) simply has no entry in
+# MIGRATIONS above - the runner stamps the gap once the ladder is done.
 SCHEMA_VERSION = 4
+
+
+def _refuse_downgrade(current: int, target: int) -> None:
+    """Raise if the file on disk is *newer* than this code understands.
+
+    Silently proceeding would mean older code writing a schema it doesn't
+    know the shape of - and the idempotent SCHEMA script would happily
+    "migrate" the file backwards - so refusing to open is the only safe
+    answer."""
+    if current > target:
+        raise RuntimeError(
+            f"database schema {current} is newer than supported schema {target}"
+        )
+
+
+def _ordered_steps(steps: Iterable[MigrationStep]) -> tuple[MigrationStep, ...]:
+    """The ladder sorted by version, rejecting duplicate/invalid versions.
+
+    Sorting here rather than trusting declaration order means a step
+    appended in the wrong place can't silently apply out of sequence; a
+    repeated version is a genuine authoring bug (two different bodies
+    claiming the same rung) and is refused outright."""
+    ordered = tuple(sorted(steps, key=lambda step: step.version))
+    seen: set[int] = set()
+    for step in ordered:
+        if step.version < 1:
+            raise RuntimeError(
+                f"migration version must be >= 1, got {step.version} ({step.description})"
+            )
+        if step.version in seen:
+            raise RuntimeError(f"duplicate migration version {step.version}")
+        seen.add(step.version)
+    return ordered
+
+
+def _execute_step_sql(conn: sqlite3.Connection, script: str) -> None:
+    """Run a step's raw-SQL body, statement by statement.
+
+    Deliberately not `executescript`: that helper commits whatever
+    transaction is already in progress before it starts, which would tear
+    the step out of the transaction the runner wrapped around it (and with
+    it the atomicity of body-plus-version-bump). `sqlite3.complete_statement`
+    lets us find the statement boundaries ourselves and feed them to
+    `execute` one at a time, leaving the surrounding transaction intact."""
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            conn.execute(buffer)
+            buffer = ""
+    # A trailing statement without its closing semicolon still counts; a
+    # trailing comment (or nothing at all) does not.
+    tail = buffer.strip()
+    if tail and any(
+        line.strip() and not line.strip().startswith("--") for line in tail.splitlines()
+    ):
+        conn.execute(tail)
+
+
+def apply_migrations(
+    conn: sqlite3.Connection,
+    steps: Iterable[MigrationStep] | None = None,
+    target: int | None = None,
+) -> int:
+    """Walk ``conn`` from its current `user_version` up to ``target``,
+    applying each pending step in ascending version order, and return the
+    version reached.
+
+    Each step gets its own transaction, committed before the next one
+    starts, rather than the whole ladder sharing one. That is a deliberate
+    trade: a failure part-way through leaves the earlier steps durably
+    applied and the file honestly stamped at the last version that fully
+    succeeded, so re-running resumes from there instead of replaying
+    migrations that may have taken minutes over a large table. (The
+    all-or-nothing option is still available to the operator, and is
+    strictly better than one giant transaction for a *bad* migration rather
+    than a failed one: `Database` takes a pre-migration backup of the whole
+    file first, so the entire ladder can be abandoned by restoring it.)
+
+    Callers must not have a transaction in progress: the runner switches the
+    connection to manual transaction control for the duration and restores
+    the previous setting afterwards."""
+    ladder = _ordered_steps(MIGRATIONS if steps is None else steps)
+    goal = SCHEMA_VERSION if target is None else int(target)
+    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    _refuse_downgrade(current, goal)
+    if ladder and ladder[-1].version > goal:
+        # An authoring slip: a step exists for a version the code doesn't
+        # claim to be at yet. Applying it would stamp the file beyond
+        # SCHEMA_VERSION and every later open would then refuse the file.
+        raise RuntimeError(
+            f"migration version {ladder[-1].version} exceeds schema version {goal}"
+        )
+
+    previous_isolation = conn.isolation_level
+    conn.isolation_level = None  # manual BEGIN/COMMIT, see below
+    try:
+        for step in ladder:
+            if step.version <= current:
+                continue  # already on this database
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                body = step.apply
+                if isinstance(body, str):
+                    _execute_step_sql(conn, body)
+                else:
+                    body(conn)
+                # Inside the same transaction as the body above: the two
+                # commit together or not at all.
+                conn.execute(f"PRAGMA user_version={int(step.version)}")
+                conn.execute("COMMIT")
+            except BaseException as exc:
+                try:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                except sqlite3.Error:  # pragma: no cover - rollback is best effort
+                    pass
+                raise RuntimeError(
+                    f"migration to version {step.version} failed "
+                    f"({step.description}): {exc}"
+                ) from exc
+            current = step.version
+        if current < goal:
+            # Versions with no step of their own - additive SCHEMA changes
+            # that the CREATE ... IF NOT EXISTS script already applied.
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(f"PRAGMA user_version={goal}")
+            conn.execute("COMMIT")
+            current = goal
+    finally:
+        conn.isolation_level = previous_isolation
+    return current
 
 
 class Database:
@@ -680,46 +910,50 @@ class Database:
             self._connections.append(conn)
         return conn
 
+    def _backup_before_migration(self, current: int) -> Path:
+        """Copy the database as it stands *right now*, before a single
+        migration touches it, to ``<name>.pre-migration-v<current>``.
+
+        A byte-consistent online backup (rather than a file copy) makes the
+        pre-migration state recoverable even with WAL mode active and other
+        connections open. This is the escape hatch for a migration that
+        succeeds mechanically but turns out to be *wrong*: the per-step
+        commits in `apply_migrations` can't undo those, restoring this file
+        can."""
+        backup_path = self.path.with_name(
+            f"{self.path.stem}.pre-migration-v{current}{self.path.suffix}"
+        )
+        target = sqlite3.connect(backup_path)
+        try:
+            self.conn.backup(target)
+            target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            target.commit()
+        finally:
+            target.close()
+        return backup_path
+
     def _init_schema(self) -> None:
-        """Create any missing tables/indexes and apply column-level
-        migrations, backing up the file first if it's an older, pre-existing
-        database. Safe to run on every startup: `CREATE TABLE IF NOT EXISTS`
-        and the `_DETECTION_MIGRATIONS` existence check both make this
-        idempotent, so a database already on the current schema just gets a
-        cheap no-op pass."""
+        """Create any missing tables/indexes, then run every migration step
+        this database file has not seen yet, backing the file up first if
+        it's an older, pre-existing database. Safe to run on every startup:
+        `CREATE TABLE IF NOT EXISTS` is idempotent and the ladder skips
+        steps at or below the file's own version, so a database already on
+        the current schema just gets a cheap no-op pass."""
         with self._write_lock:
-            current = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
-            if current > SCHEMA_VERSION:
-                # A newer file opened by older code would otherwise be
-                # silently "migrated" backwards by the executescript below -
-                # refuse instead of risking data loss from a downgrade.
-                raise RuntimeError(
-                    f"database schema {current} is newer than supported schema {SCHEMA_VERSION}"
-                )
+            conn = self.conn
+            current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            # Checked before anything is written: a newer file opened by
+            # older code would otherwise be silently "migrated" backwards by
+            # the executescript below.
+            _refuse_downgrade(current, SCHEMA_VERSION)
             if self._database_existed and current < SCHEMA_VERSION:
-                # A byte-consistent online backup makes the pre-migration
-                # state recoverable even when WAL mode is active.
-                backup_path = self.path.with_name(
-                    f"{self.path.stem}.pre-migration-v{current}{self.path.suffix}"
-                )
-                target = sqlite3.connect(backup_path)
-                try:
-                    self.conn.backup(target)
-                    target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    target.commit()
-                finally:
-                    target.close()
-            self.conn.executescript(SCHEMA)
-            existing = {
-                row["name"] for row in self.conn.execute("PRAGMA table_info(detections)")
-            }
-            for column, column_type in _DETECTION_MIGRATIONS:
-                if column not in existing:
-                    self.conn.execute(
-                        f"ALTER TABLE detections ADD COLUMN {column} {column_type}"
-                    )
-            self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            self.conn.commit()
+                self._backup_before_migration(current)
+            # Additive part first, so a migration step can assume every
+            # table and index the current code knows about exists.
+            conn.executescript(SCHEMA)
+            conn.commit()
+            if current < SCHEMA_VERSION:
+                apply_migrations(conn, MIGRATIONS, SCHEMA_VERSION)
 
     def close(self) -> None:
         """Close every connection this Database has ever handed out (across
