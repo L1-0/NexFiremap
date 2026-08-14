@@ -207,6 +207,13 @@ class EventDetectRequest(BaseModel):
     v_max_kmh: float = Field(8.0, gt=0, le=200)
     max_dt_hours: float = Field(168.0, gt=0, le=24 * 60)
     min_detections: int = Field(2, ge=1, le=1000)
+    max_span_km: float = Field(100.0, ge=10, le=2000)
+
+
+class SpreadTopologyRequest(BaseModel):
+    bbox: str = Field(..., description="west,south,east,north")
+    days: int = Field(3, ge=1, le=60)
+    sources: list[str] | None = None
 
 
 class EventAnalyzeRequest(BaseModel):
@@ -1887,6 +1894,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ]
         return _json({"columns": COMPACT_COLUMNS, "rows": compact, "meta": meta})
 
+    @app.post("/api/detections/spread_topology")
+    async def api_detections_spread_topology(request: Request, body: SpreadTopologyRequest) -> Response:
+        jobs: JobManager = request.app.state.jobs
+        box = _parse_bbox(body.bbox)
+        if box is None:
+            raise HTTPException(400, "bbox is required")
+
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=body.days)
+        sources = [s.upper() for s in body.sources] if body.sources else None
+
+        job_id = await _submit_job(
+            jobs,
+            "spread_topology",
+            {
+                "bbox": list(box),
+                "start_ts": int(start_dt.timestamp()),
+                "end_ts": int(end_dt.timestamp()),
+                "sources": sources,
+            },
+        )
+        return _json({"job_id": job_id}, status_code=202)
+
     @app.get("/api/summary")
     async def api_summary(
         request: Request,
@@ -2054,6 +2084,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "v_max_kmh": body.v_max_kmh,
                 "max_dt_hours": body.max_dt_hours,
                 "min_detections": body.min_detections,
+                "max_span_km": body.max_span_km,
             },
         )
         return _json({"job_id": job_id}, status_code=202)

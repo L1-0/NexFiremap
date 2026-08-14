@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NexFiremap Manual</title>
+<style>
+  body {
+    max-width: 54em;
+    margin: 2em auto;
+    padding: 0 1.5em 4em 1.5em;
+    background: #ffffff;
+    color: #111111;
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 16px;
+    line-height: 1.5;
+  }
+  h1, h2, h3, h4 { font-family: Arial, Helvetica, sans-serif; font-weight: bold; color: #000000; }
+  h1 { font-size: 1.6em; border-bottom: 2px solid #000000; padding-bottom: 0.2em; margin-top: 2.2em; }
+  h2 { font-size: 1.25em; border-bottom: 1px solid #999999; padding-bottom: 0.15em; margin-top: 1.8em; }
+  h3 { font-size: 1.05em; margin-top: 1.4em; }
+  h4 { font-size: 1em; margin-top: 1.2em; }
+  a { color: #0000EE; }
+  a:visited { color: #551A8B; }
+  p { margin: 0.7em 0; }
+  ul, ol { margin: 0.5em 0; padding-left: 1.6em; }
+  li { margin: 0.25em 0; }
+  code {
+    font-family: "Courier New", Courier, monospace;
+    background: #f0f0f0;
+    border: 1px solid #cccccc;
+    padding: 0.05em 0.3em;
+    font-size: 0.92em;
+  }
+  pre {
+    font-family: "Courier New", Courier, monospace;
+    background: #f0f0f0;
+    border: 1px solid #999999;
+    padding: 0.7em 1em;
+    overflow-x: auto;
+    font-size: 0.88em;
+    line-height: 1.4;
+  }
+  pre code { background: none; border: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0.8em 0 1.2em 0;
+    font-size: 0.95em;
+  }
+  th, td {
+    border: 1px solid #999999;
+    padding: 0.35em 0.6em;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: #e8e8e8; }
+  .note {
+    border: 1px solid #999999;
+    background: #f7f7f2;
+    padding: 0.6em 1em;
+    margin: 1em 0;
+  }
+  .note p:first-child { margin-top: 0; }
+  .note p:last-child { margin-bottom: 0; }
+  hr { border: none; border-top: 1px solid #999999; margin: 2em 0; }
+  .toc { border: 1px solid #999999; padding: 0.8em 1.2em 0.8em 2.4em; background: #fafafa; }
+  .toc h2 { border: none; margin-top: 0; }
+  .toc ol { padding-left: 1.4em; }
+  .toc a { text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .backlink { font-size: 0.85em; }
+  .backlink a { text-decoration: none; }
+  .fieldtable td:first-child, .fieldtable th:first-child { white-space: nowrap; font-family: "Courier New", Courier, monospace; font-size: 0.92em; }
+  footer { margin-top: 3em; padding-top: 1em; border-top: 1px solid #999999; font-size: 0.85em; color: #444444; }
+</style>
+</head>
+<body>
+
+<h1 style="border-bottom:none; margin-top:0;">NexFiremap Manual</h1>
+<p><strong>Covers all four Nex modules: NexFiremap, NexEventView, NexIncidentCommand and NexIngest.</strong></p>
+<p>This manual documents the NexFiremap application as implemented in this repository. It is written for two
+audiences in one document: operational staff who use the map and incident-command tools, and developers
+or administrators who install the server, call its API, or deploy it on an incident LAN. Chapters 1 to 9
+describe what the application does and how to use it from the browser. Chapter 10 is a configuration
+reference. Chapter 11 is the developer guide: API endpoints, data formats, and how to set up network
+routing for shared use. Chapter 12 is a glossary and appendix.</p>
+
+<div class="note">
+<p><strong>Accuracy note.</strong> Every endpoint path, field name, default value and status label in this
+manual was read directly from the source code in this repository at the time of writing, not inferred from
+marketing text. Where the software itself states a limitation or a simplification, this manual repeats it
+rather than smoothing it over. If code and manual ever disagree, the code is correct; report the mismatch
+so this manual can be corrected.</p>
+</div>
+
+<div class="note">
+<p><strong>Status.</strong> NexFiremap is a locally run research and planning tool, not a certified
+dispatch or life-safety system. The project's own completion ledger (<code>END_TO_END_TODO.md</code>)
+marks a number of items as complete in code while leaving external gates open: hardware drills, brigade
+exercises, dependency security scans and formal certification. Treat every model output, warning and
+calculator result as decision support that a qualified human must review, not as an automated
+determination.</p>
+</div>
+
+<div class="toc">
+<h2>Contents</h2>
+<ol>
+<li><a href="#c1">Introduction</a></li>
+<li><a href="#c2">Installation and first start</a></li>
+<li><a href="#c3">Signing in, accounts and roles</a></li>
+<li><a href="#c4">The four modules and shared map controls</a></li>
+<li><a href="#c5">NexFiremap: satellite fire detections</a></li>
+<li><a href="#c6">NexEventView: fire event detection and behaviour analysis</a></li>
+<li><a href="#c7">NexIncidentCommand: plans, tactics, safety, resources, products</a></li>
+<li><a href="#c8">NexIngest: telemetry, drone imagery, field data, imports</a></li>
+<li><a href="#c9">Data retention, backup and recovery</a></li>
+<li><a href="#c10">Configuration reference</a></li>
+<li><a href="#c11">Developer guide</a></li>
+<li><a href="#c12">Glossary and appendix</a></li>
+</ol>
+</div>
+
+<h1 id="c1">1. Introduction</h1>
+
+<p>NexFiremap is a locally run server that overlays NASA FIRMS active-fire satellite detections on a
+choice of OpenStreetMap-based basemaps, with a rolling local cache so that history stays available
+without re-downloading it. Beyond the base map, the same server hosts three further tools: fire event
+detection and behaviour modelling, an offline incident-command workspace, and a set of ingest tools for
+telemetry, drone imagery and field data. All four are described in this manual as the four Nex modules
+(chapter 4).</p>
+
+<h2 id="c1-1">1.1 Design principles</h2>
+<p>These principles are implemented in the code, not just stated as intent:</p>
+<ul>
+<li><strong>Observed, Estimated, Modelled and Uncertainty are kept separate.</strong> A raw satellite
+detection, a statistical likelihood estimate, a physics-based spread model and its uncertainty band are
+never merged into one number. Each layer says what kind of information it is.</li>
+<li><strong>No machine learning.</strong> Every analysis layer uses classical statistics, geostatistics
+or physics (kernel density, inverse-distance weighting, the Rothermel fire-spread equation, rule-based
+scoring). This is a deliberate project choice, stated in the source, not a limitation of the current
+version.</li>
+<li><strong>Computation happens locally.</strong> All analysis runs on the machine running the server.
+Nothing is uploaded to a third party for processing.</li>
+<li><strong>Expensive work runs in the background at low priority.</strong> Clustering, rasters, imagery
+and physics models run as separate operating-system processes dropped to idle priority, so they do not
+compete with anything else running on the same machine (chapter 11.3).</li>
+<li><strong>Every data source except FIRMS is free and keyless.</strong> Celestrak, Microsoft Planetary
+Computer, Open-Meteo, OpenStreetMap Overpass, AWS Open Data terrain tiles and Nominatim require no
+account. Only NASA FIRMS requires a free registration (chapter 2.3). EUMETSAT is an optional additional
+source that does require its own free account (chapter 5.7).</li>
+<li><strong>Nothing is silently deleted.</strong> Classifying a detection as industrial, superseding a
+plan, or importing an update never removes the original record. Superseded or flagged data stays
+available, just labelled.</li>
+</ul>
+
+<h2 id="c1-2">1.2 What is and is not included</h2>
+<p>NexFiremap displays satellite-derived fire detections and research-grade estimates of extent and
+spread. It is not an authoritative fire-behaviour product, not a certified dispatch system, and not an
+automated safety determination. Every screen that produces a warning, a calculated value or a model
+output says so in its own text, and this manual repeats those statements rather than removing them.</p>
+
+<h2 id="c1-3">1.3 Data sources used</h2>
+<table>
+<tr><th>Source</th><th>Used for</th><th>Account needed</th></tr>
+<tr><td>NASA FIRMS</td><td>VIIRS and MODIS active-fire detections</td><td>Yes, free map key</td></tr>
+<tr><td>OpenStreetMap / Humanitarian OSM / OpenTopoMap / CyclOSM / Carto / Esri</td><td>Basemap tiles</td><td>No</td></tr>
+<tr><td>Celestrak</td><td>Satellite orbital elements (TLEs) for coverage swaths</td><td>No</td></tr>
+<tr><td>Microsoft Planetary Computer</td><td>Sentinel-2, Landsat, Copernicus DEM, ESA WorldCover</td><td>No (anonymous signed access)</td></tr>
+<tr><td>Open-Meteo</td><td>Weather history for fuel moisture and wind, cloud-cover history</td><td>No</td></tr>
+<tr><td>OpenStreetMap Overpass API</td><td>Industrial thermal-source candidates, building footprints</td><td>No</td></tr>
+<tr><td>AWS Open Data Terrarium tiles</td><td>3D terrain elevation</td><td>No</td></tr>
+<tr><td>Nominatim</td><td>Place-name search</td><td>No (server-proxied, rate-limited)</td></tr>
+<tr><td>EUMETSAT Data Store</td><td>Independent MTG/FCI active-fire confirmation (optional)</td><td>Yes, free account</td></tr>
+</table>
+
+<!-- SECTION:1:INTRO -->
+<h1 id="c2">2. Installation and first start</h1>
+
+<h2 id="c2-1">2.1 Requirements</h2>
+<p>NexFiremap runs on Windows, macOS or Linux. It needs Python and an internet connection for
+installation and for fetching live data (the map itself keeps working offline once data is cached; see
+chapter 8.4 for offline area preparation). No database server, no external services beyond the free
+sources listed in chapter 1.3, and no CDN calls: fonts, mapping libraries and icons are bundled in the
+repository.</p>
+
+<h2 id="c2-2">2.2 Installing</h2>
+<p>The setup wizard is the recommended install path. It creates a Python virtual environment, installs
+dependencies, asks for the FIRMS map key, and tests reachability of every data source before the server
+is ever started.</p>
+<table>
+<tr><th>Platform</th><th>Install (once)</th><th>Start</th></tr>
+<tr><td>Windows</td><td>double-click <code>install.bat</code></td><td>double-click <code>start.bat</code></td></tr>
+<tr><td>macOS</td><td>double-click <code>install.command</code></td><td>double-click <code>start.command</code></td></tr>
+<tr><td>Linux</td><td><code>./install.sh</code></td><td><code>./start.sh</code></td></tr>
+</table>
+<p>On macOS or Linux, if double-clicking does not work the first time, run
+<code>chmod +x install.sh install.command start.sh start.command</code> once, or run
+<code>bash install.sh</code> directly. The wizard sets the executable bit on the other launchers
+afterward. The wizard is also runnable directly as <code>python scripts/setup_wizard.py</code>, and is
+safe to re-run at any time, for example to add a key later or re-check connectivity. It reuses the
+existing virtual environment and never overwrites a setting that has already been changed.</p>
+
+<p>To install without the wizard:</p>
+<pre>python -m pip install -r requirements.txt
+copy .env.example .env
+notepad .env    # paste your FIRMS_MAP_KEY
+python run.py --open</pre>
+<p>(On macOS or Linux, use <code>cp</code> and a text editor of choice instead of <code>copy</code> and
+<code>notepad</code>.)</p>
+
+<h2 id="c2-3">2.3 Getting a FIRMS map key</h2>
+<p>NASA FIRMS requires a free key to use its web services. Request one at
+<a href="https://firms.modaps.eosdis.nasa.gov/api/map_key/" target="_blank" rel="noopener">firms.modaps.eosdis.nasa.gov/api/map_key</a>.
+Without a key the map still loads, basemaps and the interface work, but no fire detections can be
+downloaded. A banner in the interface explains this until <code>FIRMS_MAP_KEY</code> is set in
+<code>.env</code> and the server is restarted. The event-analysis, incident-command and ingest tools do
+not need this key; only the raw satellite-detection layer does.</p>
+
+<h2 id="c2-4">2.4 Starting the server</h2>
+<p>Either the wizard or the manual steps end the same way: open
+<code>http://127.0.0.1:8000</code> once the server is running (the <code>--open</code> flag, or the
+wizard, does this automatically). The default port is 8000 and can be changed with
+<code>NEXFIREMAP_PORT</code> (chapter 10).</p>
+<p>By default the server binds to the local loopback address only, so it is reachable from the same
+machine and not from other devices on a network. Sharing it with other devices on an incident LAN is a
+deliberate, separate step covered in chapter 11.6, because it changes the security model: an explicit
+LAN mode, TLS and named accounts are all required before the server will accept non-loopback
+connections.</p>
+
+<h2 id="c2-5">2.5 Graceful degradation</h2>
+<p>The event-analysis modules (orbits, events, likelihood, imagery, terrain and their dependents) pull in
+optional packages, and <code>rasterio</code> in particular has platform-specific install friction. If one
+of these fails to install, the server still starts and the core fire map still works: the affected
+feature reports itself unavailable through <code>GET /api/config</code>'s <code>features</code> field,
+and its buttons disable themselves in the interface with an explanation instead of the application
+crashing. The setup wizard's package-by-package fallback and connectivity tests exist to catch this
+before the map is ever opened.</p>
+
+<!-- SECTION:2:INSTALL -->
+<!-- SECTION:3:AUTH -->
+<!-- SECTION:4:MODULES -->
+<!-- SECTION:5:FIREMAP -->
+<!-- SECTION:6:EVENTVIEW -->
+<!-- SECTION:7:INCIDENTCOMMAND -->
+<!-- SECTION:8:INGEST -->
+<!-- SECTION:9:RETENTION -->
+<!-- SECTION:10:CONFIG -->
+<!-- SECTION:11:DEVGUIDE -->
+<!-- SECTION:12:APPENDIX -->
+
+<footer>
+<p>NexFiremap is licensed under MIT. Fire detection data: NASA FIRMS. Basemaps: OpenStreetMap
+contributors and the listed tile providers. This manual is generated documentation, not a data source
+in itself.</p>
+</footer>
+
+</body>
+</html>

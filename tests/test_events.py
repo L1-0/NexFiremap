@@ -11,8 +11,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import json
+
 from nexfiremap.db import Database
-from nexfiremap.events import cluster_detections, detect_events
+from nexfiremap.events import MAX_PLAUSIBLE_EVENT_SPAN_KM, cluster_detections, detect_events, spread_topology
+from nexfiremap.geo import haversine_km
 from nexfiremap.jobs import JobContext
 
 failures: list[str] = []
@@ -89,6 +92,116 @@ def test_missing_footprint_uses_default_radius() -> None:
     ]
     clusters = cluster_detections(rows, v_max_kmh=8.0, max_dt_hours=168.0)
     check("still links two very close points", len(clusters) == 1, str(clusters))
+
+
+def test_chaining_is_span_bounded() -> None:
+    print("\ncluster_detections() itself refuses to chain past max_span_km")
+    # Consecutive points ~17.9km apart, 3 hours apart (allowed budget
+    # ~2 + 8*3 = 26km, comfortably covering each individual step - and, at
+    # this spacing/timing, even covering many non-adjacent pairs directly,
+    # not merely by chaining through intermediates). Sixteen of them span
+    # roughly 268km end to end - the exact live pattern found in this
+    # project's own dev database (a real 14,000-point, 1,005km event).
+    rows = [row(50.0, 4.0 + step * 0.25, step * 3 * HOUR) for step in range(16)]
+    clusters = cluster_detections(
+        rows, v_max_kmh=8.0, max_dt_hours=168.0, max_span_km=MAX_PLAUSIBLE_EVENT_SPAN_KM
+    )
+    check("split into more than one cluster", len(clusters) > 1, str(clusters))
+    check(
+        "every detection still accounted for exactly once",
+        sorted(idx for cluster in clusters for idx in cluster) == list(range(16)),
+        str(clusters),
+    )
+    check(
+        # A weaker "len(clusters) > 1" check alone would also pass on a
+        # degenerate all-16-singletons result - not what a sane split looks
+        # like. The geometric grid splitter groups neighbouring points
+        # together (each cell some contiguous run of the chain), so a
+        # sensible split leaves no cluster stranded alone.
+        "the split is sensible, not degenerate - no cluster is left a singleton",
+        all(len(cluster) > 1 for cluster in clusters),
+        str(clusters),
+    )
+
+    def span_km(cluster: list[int]) -> float:
+        lats = [rows[i]["lat"] for i in cluster]
+        lons = [rows[i]["lon"] for i in cluster]
+        return haversine_km(min(lats), min(lons), max(lats), max(lons))
+
+    spans = [span_km(cluster) for cluster in clusters]
+    check(
+        "no resulting cluster exceeds the span bound",
+        all(span <= MAX_PLAUSIBLE_EVENT_SPAN_KM for span in spans),
+        str(list(zip((len(c) for c in clusters), spans))),
+    )
+
+
+def test_chained_scatter_splits_instead_of_one_wide_event() -> None:
+    print("\nA chained scatter spanning hundreds of km splits into smaller events end to end, none flagged wide_span")
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "cache.sqlite3"
+        db = Database(db_path)
+
+        def det(lat, lon, ts_offset):
+            from datetime import datetime, timezone
+
+            ts = BASE_TS + ts_offset
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return {
+                "source": "VIIRS_NOAA20_NRT", "satellite": "N", "instrument": "VIIRS",
+                "latitude": lat, "longitude": lon,
+                "acq_date": dt.strftime("%Y-%m-%d"), "acq_time": dt.strftime("%H%M"), "acq_ts": ts,
+                "brightness": 330.0, "brightness2": 295.0, "scan": 0.4, "track": 0.4,
+                "confidence_raw": "n", "confidence_pct": None, "confidence_level": "nominal",
+                "frp": 10.0, "daynight": "D", "version": "2.0NRT",
+            }
+
+        # Each step is individually well within the default link rule
+        # (~18km apart, 3 hours apart - allowed budget is r_i+r_j + 8*3 ~=
+        # 26km, and at this spacing/timing even several non-adjacent steps
+        # link directly) so the pairwise rule alone would happily chain all
+        # 16 into one connected component spanning ~268km end to end -
+        # exactly like the real 14,000-point, 1,005km event found live in
+        # this project's own dev database. cluster_detections' span-bounded
+        # merge step is what's actually under test here: it should refuse
+        # to let that chain grow past MAX_PLAUSIBLE_EVENT_SPAN_KM, splitting
+        # it into several smaller, individually-plausible candidates instead.
+        rows = [det(50.0, 4.0 + step * 0.25, step * 3 * HOUR) for step in range(16)]
+        db.upsert_detections(rows)
+        job_id = db.create_job("detect_events", {})
+        result_dir = tmp / "job1"
+        result_dir.mkdir()
+        db.close()
+
+        ctx = JobContext(job_id=job_id, db_path=str(db_path), result_dir=str(result_dir))
+        result = detect_events(
+            {"bbox": [-10.0, 40.0, 20.0, 60.0], "start_ts": BASE_TS - DAY,
+             "end_ts": BASE_TS + 3 * DAY, "min_detections": 2},
+            ctx,
+        )
+        check("split into more than one candidate instead of one giant one", result["event_count"] > 1, str(result))
+        check("detection_count sums back to all 16 - none lost in the split", result["detection_count"] == 16, str(result))
+        check("no event needed the wide_span defence-in-depth flag", result["wide_span_events"] == 0, str(result))
+
+        db2 = Database(db_path)
+        events = db2.list_events()
+        check(
+            "every stored event's own span_km is within the plausible bound",
+            all(json.loads(e["params_json"])["span_km"] <= MAX_PLAUSIBLE_EVENT_SPAN_KM for e in events),
+            str([json.loads(e["params_json"]) for e in events]),
+        )
+        check(
+            "every stored event's own wide_span flag is false",
+            all(json.loads(e["params_json"])["wide_span"] is False for e in events),
+            str([json.loads(e["params_json"]) for e in events]),
+        )
+        check(
+            "detections split across events sum back to 16",
+            sum(e["detection_count"] for e in events) == 16,
+            str([dict(e) for e in events]),
+        )
+        db2.close()
 
 
 def test_detect_events_job() -> None:
@@ -176,13 +289,94 @@ def test_detect_events_job() -> None:
         db2.close()
 
 
+def test_spread_topology_job() -> None:
+    print("\nspread_topology job body: distinct-pass cutoffs, cumulative nesting, full-ramp spread")
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        db_path = tmp / "cache.sqlite3"
+        db = Database(db_path)
+
+        def det(lat, lon, ts_offset):
+            from datetime import datetime, timezone
+
+            ts = BASE_TS + ts_offset
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            return {
+                "source": "VIIRS_NOAA20_NRT", "satellite": "N", "instrument": "VIIRS",
+                "latitude": lat, "longitude": lon,
+                "acq_date": dt.strftime("%Y-%m-%d"), "acq_time": dt.strftime("%H%M"), "acq_ts": ts,
+                "brightness": 330.0, "brightness2": 295.0, "scan": 0.4, "track": 0.4,
+                "confidence_raw": "n", "confidence_pct": None, "confidence_level": "nominal",
+                "frp": 10.0, "daynight": "D", "version": "2.0NRT",
+            }
+
+        # Two distinct satellite passes roughly a day apart, each a tight
+        # clump of minute-apart detections - the exact real-world pattern
+        # (confirmed live against a 97-detection dev-DB case) that a naive
+        # linear-quantile cutoff mishandles: it would land two of its five
+        # cutoffs within the same clump (minutes apart, near-duplicate
+        # bands) while the genuine day-long gap between passes goes
+        # unrepresented. Pass-grouping should instead recognise exactly two
+        # distinct passes here and use both fully, not pad out to five.
+        bbox = [8.9, 44.9, 9.3, 45.3]
+        rows = [det(45.0 + i * 0.001, 9.0 + i * 0.001, i * 60) for i in range(10)]
+        rows += [det(45.05 + i * 0.001, 9.05 + i * 0.001, DAY + i * 60) for i in range(10)]
+        db.upsert_detections(rows)
+        job_id = db.create_job("spread_topology", {})
+        result_dir = tmp / "job1"
+        result_dir.mkdir()
+        db.close()
+
+        ctx = JobContext(job_id=job_id, db_path=str(db_path), result_dir=str(result_dir))
+        result = spread_topology(
+            {"bbox": bbox, "start_ts": BASE_TS - HOUR, "end_ts": BASE_TS + DAY + 2 * HOUR}, ctx
+        )
+
+        check("exactly two distinct passes recognised", result["pass_count"] == 2, str(result))
+        check("band count matches pass count, not padded to 5", result["band_count"] == 2, str(result))
+        check("all 20 detections examined", result["detection_count"] == 20, str(result))
+        check("cutoffs roughly a day apart", abs((result["cutoffs"][1] - result["cutoffs"][0]) - DAY) < 60, str(result))
+
+        geo = json.loads((result_dir / "spread_topology.geojson").read_text())
+        check("at least one contour ring produced", len(geo["features"]) > 0, str(geo))
+
+        band_indices = sorted({f["properties"]["band_index"] for f in geo["features"]})
+        check(
+            "two-band case spreads across the full 0-4 ramp, not bunched at one end",
+            band_indices == [0, 4],
+            str(band_indices),
+        )
+
+        west, south, east, north = bbox
+        out_of_bbox = [
+            [lon, lat]
+            for f in geo["features"]
+            for lon, lat in f["geometry"]["coordinates"][0]
+            if not (west <= lon <= east and south <= lat <= north)
+        ]
+        check("every contour coordinate stays within the requested bbox", not out_of_bbox, str(out_of_bbox[:5]))
+
+        # Cumulative construction: the later band's detection_count must be
+        # >= the earlier one's (every detection in band 0 is also in band 1
+        # by construction - see spread_topology's docstring).
+        counts_by_band = {f["properties"]["band_index"]: f["properties"]["detection_count"] for f in geo["features"]}
+        check(
+            "later band's cumulative detection_count is >= earlier band's",
+            counts_by_band[4] >= counts_by_band[0],
+            str(counts_by_band),
+        )
+
+
 def main() -> int:
     test_two_tight_groups_far_apart()
     test_chain_over_time_stays_one_event()
     test_max_dt_hours_cuts_the_link()
     test_singletons_and_empty()
     test_missing_footprint_uses_default_radius()
+    test_chaining_is_span_bounded()
+    test_chained_scatter_splits_instead_of_one_wide_event()
     test_detect_events_job()
+    test_spread_topology_job()
 
     print()
     if failures:
