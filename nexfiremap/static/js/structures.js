@@ -1,6 +1,11 @@
-/* Temporal building exposure for completed spread/ensemble analyses. */
-(() => {
-  "use strict";
+/* Temporal building exposure for completed spread/ensemble analyses.
+
+   An ES module: the map and the current analysis both arrive through
+   context.js instead of the old window.NexFiremapMap /
+   window.NexFiremapSpreadAnalysis globals and their paired CustomEvents. */
+
+import { whenMap, onSpreadAnalysis, getSpreadAnalysis, fetchJson } from "./context.js";
+
   const $ = (s) => document.querySelector(s);
   const state = { map: null, analysis: null, exposure: null, layer: null, token: 0 };
 
@@ -28,17 +33,6 @@
    * @returns {string} Escaped text. */
   function escapeHtml(value) {
     return String(value ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-  }
-
-  /** Fetches JSON and throws with the server's error detail (falling back
-   * to the HTTP status) on a non-OK response.
-   * @param {string} url - Request URL.
-   * @returns {Promise<object>} Parsed JSON payload. */
-  async function fetchJson(url) {
-    const response = await fetch(url);
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
-    return payload;
   }
 
   /** Polls a background job until it completes, tolerating transient
@@ -191,10 +185,11 @@
       render();
     });
     $("#btn-structures-refresh").addEventListener("click", () => loadExposure({ scan: true }));
-    if (window.NexFiremapSpreadAnalysis) setAnalysis(window.NexFiremapSpreadAnalysis);
+    // onSpreadAnalysis below only delivers *changes*, so catch up on an
+    // analysis app.js already published before this ran.
+    const published = getSpreadAnalysis();
+    if (published) setAnalysis(published);
   }
 
-  window.addEventListener("nexfiremap:spread-analysis", (event) => setAnalysis(event.detail));
-  if (window.NexFiremapMap) init(window.NexFiremapMap);
-  else window.addEventListener("nexfiremap:ready", (event) => init(event.detail.map), { once: true });
-})();
+  onSpreadAnalysis(setAnalysis);
+  whenMap(init);

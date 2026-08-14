@@ -37,7 +37,7 @@
 
 <!-- Reusable right-click context menu, for both the map itself (point/area
      actions) and individual markers/features (edit/remove) - filled and
-     positioned by NexShowContextMenu() in app.js, same reused-container
+     positioned by showContextMenu() in app.js, same reused-container
      idea as #legend. role="menu" + menuitem children for the same reason
      every other dropdown in this app is one (app-switcher, basemap picker). -->
 <div id="map-context-menu" class="map-context-menu" role="menu" hidden></div>
@@ -750,9 +750,19 @@
 <script src="/static/vendor/maplibre/maplibre-gl.js"></script>
 <script src="/static/vendor/proj4/proj4.js"></script>
 <script src="/static/vendor/mgrs/mgrs.min.js"></script>
-<script src="/static/js/coords.js"></script>
-<script src="/static/js/app.js"></script>
-<script src="/static/js/operations.js"></script>
-<script src="/static/js/structures.js"></script>
+<!-- Vendored libraries above stay classic global scripts (L, maplibregl,
+     proj4, mgrs); being undeferred, they finish executing while the parser is
+     still here, so those globals exist before any module body below runs.
+
+     This app's own code is ES modules. Only the three entry points need a tag:
+     coords.js and context.js are pulled in by `import`, and the browser
+     resolves the graph itself, so nothing here is load-order-sensitive any
+     more (operations.js and structures.js used to require app.js's tag first).
+     Module scripts are deferred by default, which just means they run after
+     parsing instead of at this point in it - the DOM they touch is the whole
+     document either way, and no module waits on DOMContentLoaded. -->
+<script type="module" src="/static/js/app.js"></script>
+<script type="module" src="/static/js/operations.js"></script>
+<script type="module" src="/static/js/structures.js"></script>
 </body>
 </html>

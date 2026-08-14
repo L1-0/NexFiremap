@@ -1,10 +1,15 @@
 /* NexFiremap frontend.
    Talks to the local server only: the server owns the FIRMS cache, so the map
    never waits on NASA directly - it asks for what it needs, draws whatever is
-   cached already, and redraws when the background fetch lands. */
+   cached already, and redraws when the background fetch lands.
 
-(() => {
-  "use strict";
+   An ES module (see context.js for the cross-module contracts). Leaflet,
+   MapLibre, proj4 and mgrs are still the classic globals their vendored
+   <script> tags define - those load before any module body runs, since module
+   scripts are deferred and the vendor tags are not. */
+
+import * as Coords from "./coords.js";
+import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./context.js";
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -590,14 +595,10 @@
   // actions for the dragged area on release.
   //
   // Both menus render through the same generic showContextMenu(items,
-  // screenPoint), exposed on window (matching the existing
-  // NexFiremapMap/NexPrintView convention) so operations.js can reuse it
-  // for its own feature-specific edit/remove menus and contribute
-  // "Add tactical marker here" without app.js needing any
-  // Incident-Command-specific knowledge - the same
-  // dispatchEvent(CustomEvent(...)) extensibility idiom
-  // publishSpreadAnalysis() already uses below for cross-module
-  // communication.
+  // screenPoint), exported from this module so operations.js can reuse it
+  // for its own feature-specific edit/remove menus, and contribute
+  // "Add tactical marker here" via context.js's onMapContextMenu registry
+  // without app.js needing any Incident-Command-specific knowledge.
 
   const MAP_RECT_DRAG_THRESHOLD_PX = 6; // below this, a right-click is a click, not a drag
   // "Nice" round real-world distances for the drag-select grid's cell size -
@@ -614,9 +615,9 @@
    * clamped so it never runs off the right/bottom edge. `keepOpenMs`
    * (used by the copy-to-clipboard items) runs `action` without closing
    * the menu first, then closes it after that many ms - long enough for
-   * the button's own "Copied" feedback to actually be seen. Exposed on
-   * window so operations.js's feature-specific menus (edit/remove) reuse
-   * this instead of duplicating menu-rendering. */
+   * the button's own "Copied" feedback to actually be seen. Exported so
+   * operations.js's feature-specific menus (edit/remove) reuse this
+   * instead of duplicating menu-rendering. */
   function showContextMenu(items, screenPoint) {
     const el = $("#map-context-menu");
     el.innerHTML = "";
@@ -660,8 +661,7 @@
     contextMenuOpen = false;
   }
 
-  window.NexShowContextMenu = showContextMenu;
-  window.NexCloseContextMenu = closeContextMenu;
+  export { showContextMenu, closeContextMenu };
 
   /** Copies `text` to the clipboard, falling back to a hidden textarea +
    * execCommand("copy") when the Clipboard API is unavailable -
@@ -850,7 +850,7 @@
       {
         label: "Copy coordinates",
         keepOpenMs: 900,
-        action: (btn) => copyText(window.NexCoords.format(latlng.lat, latlng.lng, window.NexCoords.currentSystem()), btn),
+        action: (btn) => copyText(Coords.format(latlng.lat, latlng.lng, Coords.currentSystem()), btn),
       },
       {
         label: "What's here",
@@ -863,11 +863,9 @@
     ];
     // Lets operations.js (or any future module) contribute more items -
     // e.g. "Add tactical marker here" - without this file needing any
-    // domain-specific knowledge. addItem pushes in place; listeners run
+    // domain-specific knowledge. addItem pushes in place; contributors run
     // synchronously before the menu is actually shown below.
-    window.dispatchEvent(new CustomEvent("nexfiremap:map-contextmenu", {
-      detail: { kind: "point", latlng, addItem: (item) => items.push(item) },
-    }));
+    emitMapContextMenu({ kind: "point", latlng, addItem: (item) => items.push(item) });
     showContextMenu(items, screenPoint);
   }
 
@@ -924,12 +922,10 @@
       },
       {
         label: "Print this area",
-        action: () => { map.fitBounds(bounds, { padding: [20, 20] }); window.NexPrintView?.() ?? window.print(); },
+        action: () => { map.fitBounds(bounds, { padding: [20, 20] }); getPrintView()?.() ?? window.print(); },
       },
     ];
-    window.dispatchEvent(new CustomEvent("nexfiremap:map-contextmenu", {
-      detail: { kind: "area", bounds, addItem: (item) => items.push(item) },
-    }));
+    emitMapContextMenu({ kind: "area", bounds, addItem: (item) => items.push(item) });
     showContextMenu(items, screenPoint);
   }
 
@@ -2754,14 +2750,13 @@
 
   /**
    * Publishes the currently-rendered spread/ensemble analysis (or `null`
-   * when cleared) as both a global and a CustomEvent, so other
-   * modules/apps sharing this map (e.g. operations.js's NexIncidentCommand
-   * tools) can react to it without this file importing them back.
+   * when cleared) through context.js, so other modules/apps sharing this
+   * map (e.g. structures.js's exposure layer) can react to it without this
+   * file importing them back.
    * @param {object|null} detail
    */
   function publishSpreadAnalysis(detail) {
-    window.NexFiremapSpreadAnalysis = detail;
-    window.dispatchEvent(new CustomEvent("nexfiremap:spread-analysis", { detail }));
+    setSpreadAnalysis(detail);
   }
 
   /**
@@ -3290,13 +3285,18 @@
     // Lives in the topbar (never data-app-tagged), so it's reachable from
     // every app, not just NexIncidentCommand's own print button. Delegates
     // to operations.js's richer incident-aware print when that module has
-    // loaded (window.NexPrintView, set in its own init()) and always falls
-    // back to a bare window.print() otherwise - a click here must never
-    // silently do nothing, the exact failure mode this button's own
-    // generalisation was written to avoid (see printOperationsMap()'s
-    // comment in operations.js).
+    // registered one (context.js's setPrintView, called from its init())
+    // and always falls back to a bare window.print() otherwise - a click
+    // here must never silently do nothing, the exact failure mode this
+    // button's own generalisation was written to avoid (see
+    // printOperationsMap()'s comment in operations.js). Still a runtime
+    // lookup rather than a static import of printOperationsMap: operations.js
+    // registers it partway through an async init() that a public-role
+    // session returns early from, so "is it available yet" is a real
+    // question an import couldn't answer.
     $("#btn-print-view").addEventListener("click", () => {
-      if (typeof window.NexPrintView === "function") window.NexPrintView();
+      const printView = getPrintView();
+      if (typeof printView === "function") printView();
       else window.print();
     });
 
@@ -3356,23 +3356,21 @@
     // pair with none of those markers falls back to whatever coordinate
     // system is currently selected (see wireCoordSystemSelect() below),
     // WGS84 decimal degrees by default.
-    if (typeof window.NexCoords === "undefined") return null;
-    const point = window.NexCoords.parse(raw, window.NexCoords.currentSystem());
+    const point = Coords.parse(raw, Coords.currentSystem());
     if (!point) return null;
-    const label = window.NexCoords.format(point.lat, point.lon, window.NexCoords.currentSystem());
+    const label = Coords.format(point.lat, point.lon, Coords.currentSystem());
     return { label: label || `${point.lat.toFixed(5)}, ${point.lon.toFixed(5)}`, lat: point.lat, lon: point.lon, bounds: null, type: "coordinates" };
   }
 
-  /** Populates the coordinate-system dropdown from coords.js's registry, restores the last-selected system (and any saved custom proj4 string), and wires changes to persist. A no-op if coords.js hasn't loaded. */
+  /** Populates the coordinate-system dropdown from coords.js's registry, restores the last-selected system (and any saved custom proj4 string), and wires changes to persist. */
   function wireCoordSystemSelect() {
-    if (typeof window.NexCoords === "undefined") return;
     const select = $("#coord-system-select");
     const customInput = $("#coord-custom-proj4");
-    select.innerHTML = window.NexCoords.SYSTEMS.map(
+    select.innerHTML = Coords.SYSTEMS.map(
       (system) => `<option value="${system.id}">${escapeHtml(system.label)}</option>`
     ).join("");
-    const stored = window.NexCoords.currentSystem();
-    select.value = window.NexCoords.SYSTEMS.some((system) => system.id === stored) ? stored : "wgs84";
+    const stored = Coords.currentSystem();
+    select.value = Coords.SYSTEMS.some((system) => system.id === stored) ? stored : "wgs84";
     customInput.hidden = select.value !== "custom";
     try {
       customInput.value = localStorage.getItem("nexfiremap.coords.customProj4") || "";
@@ -3380,7 +3378,7 @@
       /* private mode/storage pressure - custom definition just starts blank */
     }
     select.addEventListener("change", () => {
-      window.NexCoords.setSystem(select.value);
+      Coords.setSystem(select.value);
       customInput.hidden = select.value !== "custom";
     });
     customInput.addEventListener("change", () => {
@@ -3637,8 +3635,13 @@
     state.features = config.features || {};
 
     initMap(config);
+    // Deliberate global, and the only one left: the CDP-driven browser test
+    // suite (tests/test_browser_workflows.py) drives the map through
+    // Runtime.evaluate, which has no way to reach an ES module binding. No
+    // application module reads it - they all take the map from context.js's
+    // whenMap() below, so nothing here depends on <script> order any more.
     window.NexFiremapMap = map;
-    window.dispatchEvent(new CustomEvent("nexfiremap:ready", { detail: { map } }));
+    setMap(map);
     writeViewToHash(); // seed the URL immediately, even before any pan/zoom
     buildBasemaps(config);
     buildSourceList(config);
@@ -3673,4 +3676,3 @@
       `<div class="setup" style="display:block"><h2>NexFiremap failed to start</h2><p>${escapeHtml(err)}</p></div>`
     );
   });
-})();

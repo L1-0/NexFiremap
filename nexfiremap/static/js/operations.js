@@ -1,7 +1,13 @@
 /* Offline incident-command workspace layered onto the existing Leaflet map.
-   It only talks to NexFiremap's local server; no third-party service is used. */
-(() => {
-  "use strict";
+   It only talks to NexFiremap's local server; no third-party service is used.
+
+   An ES module: the map arrives through context.js's whenMap() instead of the
+   old window.NexFiremapMap / "nexfiremap:ready" handshake, and app.js's
+   context-menu renderer is a direct import rather than a global that only
+   existed because app.js's <script> tag came first. */
+
+import { showContextMenu } from "./app.js";
+import { whenMap, setPrintView, onMapContextMenu } from "./context.js";
 
   const $ = (s) => document.querySelector(s);
   // Almost every innerHTML template below interpolates operator-supplied
@@ -551,8 +557,8 @@
     });
   }
 
-  /** Right-click-on-a-feature menu: Edit/Zoom to/Remove, via
-   * window.NexShowContextMenu (app.js) - reuses the exact same
+  /** Right-click-on-a-feature menu: Edit/Zoom to/Remove, via app.js's
+   * exported showContextMenu() - reuses the exact same
    * editFeature()/removeFeature() this file's popup buttons already call,
    * just surfaced as a direct, discoverable right-click action instead of
    * "open the popup, notice the small text button". */
@@ -569,7 +575,7 @@
       },
       { label: "Remove", danger: true, action: () => removeFeature(p.id).catch(showError) },
     ];
-    window.NexShowContextMenu(items, { x: e.originalEvent.clientX, y: e.originalEvent.clientY });
+    showContextMenu(items, { x: e.originalEvent.clientX, y: e.originalEvent.clientY });
   }
 
   function geometryType(featureType) {
@@ -1274,7 +1280,7 @@
   // ----------------------------------------------------------- print view
 
   // "Print this view" now has a trigger in every app (see app.js's topbar
-  // button, wired to window.NexPrintView below), not just the
+  // button, wired via context.js's setPrintView below), not just the
   // incident-command output row this originally lived in - so a missing
   // incident builds a simpler header instead of refusing to print. The old
   // behaviour (silently do nothing beyond a status-bar message) would be
@@ -1841,8 +1847,7 @@
     // (draw and edit are mutually exclusive elsewhere in this file -
     // overwriting state.drawing here would silently discard an in-progress
     // multi-vertex sketch instead of respecting that invariant).
-    window.addEventListener("nexfiremap:map-contextmenu", (event) => {
-      const { kind, latlng, addItem } = event.detail;
+    onMapContextMenu(({ kind, latlng, addItem }) => {
       if (kind !== "point" || !state.incidentId || !state.periodId || state.drawing || state.editingFeatureId) return;
       const featureType = $("#ops-feature-type").value;
       const label = TYPE_LABELS[featureType] || featureType;
@@ -1877,12 +1882,12 @@
 
   async function init(map) {
     state.map = map;
-    // Exposed next to the existing window.NexFiremapMap global so app.js's
-    // always-visible topbar print button can call it without reaching into
-    // this file's own IIFE-scoped state - set synchronously here (before
-    // any await below) so it's guaranteed ready by the time any button
-    // wired later in this same synchronous pass could possibly be clicked.
-    window.NexPrintView = printOperationsMap;
+    // Registered with context.js so app.js's always-visible topbar print
+    // button can call it without reaching into this module's own scope -
+    // set synchronously here (before any await below) so it's guaranteed
+    // ready by the time any button wired later in this same synchronous
+    // pass could possibly be clicked.
+    setPrintView(printOperationsMap);
     state.featureLayer = L.featureGroup().addTo(map);
     state.resourceLayer = L.featureGroup().addTo(map);
     state.vehicleTrackLayer = L.featureGroup().addTo(map);
@@ -1947,6 +1952,4 @@
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js").catch(console.warn);
   }
 
-  if (window.NexFiremapMap) init(window.NexFiremapMap).catch(showError);
-  else window.addEventListener("nexfiremap:ready", (event) => init(event.detail.map).catch(showError), { once: true });
-})();
+  whenMap((map) => init(map).catch(showError));

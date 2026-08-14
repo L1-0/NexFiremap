@@ -1,10 +1,10 @@
 /* Offline app-shell and last-read fallback for clients on the incident LAN.
    Writes are never queued or fabricated; the command server is authoritative. */
-const SHELL_CACHE = "nexfiremap-shell-v12";
-const READ_CACHE = "nexfiremap-reads-v12";
+const SHELL_CACHE = "nexfiremap-shell-v13";
+const READ_CACHE = "nexfiremap-reads-v13";
 const SHELL = [
   "/", "/static/css/app.css", "/static/js/app.js", "/static/js/operations.js",
-  "/static/js/structures.js", "/static/js/coords.js",
+  "/static/js/structures.js", "/static/js/coords.js", "/static/js/context.js",
   "/static/vendor/leaflet/leaflet.css", "/static/vendor/leaflet/leaflet.js",
   "/static/vendor/markercluster/MarkerCluster.css",
   "/static/vendor/markercluster/MarkerCluster.Default.css",

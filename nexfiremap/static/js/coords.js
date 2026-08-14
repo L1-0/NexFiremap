@@ -16,9 +16,12 @@
 
    Runs entirely client-side against vendored proj4js + mgrs (both MIT, same
    maintainers) - no network call, works with the WAN down.
+
+   An ES module: proj4/mgrs are still read as the classic globals the vendored
+   <script> tags define, but this file's own API is a real export consumed by
+   `import * as Coords from "./coords.js"` in app.js, not a window.NexCoords
+   global that app.js had to be loaded after.
 */
-(() => {
-  "use strict";
 
   // Verified 2026-08-13 against https://epsg.io/<code>.proj4 (the standard
   // reference most GIS tools cite for exactly this purpose). British
@@ -342,5 +345,4 @@
     }
   }
 
-  window.NexCoords = { SYSTEMS, parse, format, currentSystem, setSystem, NATIONAL_GRIDS };
-})();
+  export { SYSTEMS, parse, format, currentSystem, setSystem, NATIONAL_GRIDS };
