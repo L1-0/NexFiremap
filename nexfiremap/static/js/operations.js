@@ -521,6 +521,21 @@
           fillColor: color, fillOpacity: stale ? 0.07 : 0.16 },
       });
       layer.bindPopup(popupHtml(feature));
+      // Right-click directly on a placed feature: Edit/Remove as a first-
+      // class, discoverable action - the "couldn't remove a set point"
+      // report turned out to be this (removeFeature() below already
+      // worked, just tucked inside a popup's small text button, easy to
+      // miss - see this file's other contextmenu wiring in wireEvents()
+      // for the full story). stopPropagation so the map's own generic
+      // point-menu (app.js) doesn't *also* fire underneath this one -
+      // L.FeatureGroup (what L.geoJSON returns) forwards a child layer's
+      // contextmenu to a listener on the group itself, same as any other
+      // Leaflet event.
+      layer.on("contextmenu", (e) => {
+        L.DomEvent.stopPropagation(e);
+        L.DomEvent.preventDefault(e);
+        showFeatureContextMenu(feature, e);
+      });
       state.featureLayer.addLayer(layer);
     });
     const list = $("#ops-feature-list");
@@ -534,6 +549,27 @@
       });
       list.append(row);
     });
+  }
+
+  /** Right-click-on-a-feature menu: Edit/Zoom to/Remove, via
+   * window.NexShowContextMenu (app.js) - reuses the exact same
+   * editFeature()/removeFeature() this file's popup buttons already call,
+   * just surfaced as a direct, discoverable right-click action instead of
+   * "open the popup, notice the small text button". */
+  function showFeatureContextMenu(feature, e) {
+    const p = feature.properties;
+    const items = [
+      { label: "Edit", action: () => editFeature(p.id) },
+      {
+        label: "Zoom to",
+        action: () => {
+          const layer = L.geoJSON(feature);
+          state.map.fitBounds(layer.getBounds().pad(0.5), { maxZoom: 16 });
+        },
+      },
+      { label: "Remove", danger: true, action: () => removeFeature(p.id).catch(showError) },
+    ];
+    window.NexShowContextMenu(items, { x: e.originalEvent.clientX, y: e.originalEvent.clientY });
   }
 
   function geometryType(featureType) {
@@ -1793,6 +1829,30 @@
     window.addEventListener("afterprint", () => {
       $("#ops-print-title").setAttribute("aria-hidden", "true");
       setTimeout(() => state.map.invalidateSize(), 50);
+    });
+
+    // Contributes "Add <type> here" to the map's generic right-click point
+    // menu (app.js's showPointContextMenu/wireMapContextMenu) - skips the
+    // sketch tool's own "click to place" step entirely by handing
+    // saveGeometry() the right-clicked point directly, the exact path
+    // drawClick() already uses for a Point geometry. Only offered with an
+    // incident+period actually selected (nothing sensible to attach a
+    // tactical marker to otherwise) and no sketch/edit already in progress
+    // (draw and edit are mutually exclusive elsewhere in this file -
+    // overwriting state.drawing here would silently discard an in-progress
+    // multi-vertex sketch instead of respecting that invariant).
+    window.addEventListener("nexfiremap:map-contextmenu", (event) => {
+      const { kind, latlng, addItem } = event.detail;
+      if (kind !== "point" || !state.incidentId || !state.periodId || state.drawing || state.editingFeatureId) return;
+      const featureType = $("#ops-feature-type").value;
+      const label = TYPE_LABELS[featureType] || featureType;
+      addItem({
+        label: `Add ${label} here`,
+        action: () => {
+          state.drawing = { featureType, geometry: "Point", points: [[latlng.lng, latlng.lat]] };
+          saveGeometry({ type: "Point", coordinates: [latlng.lng, latlng.lat] }).catch(showError);
+        },
+      });
     });
   }
 

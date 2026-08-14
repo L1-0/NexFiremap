@@ -527,6 +527,84 @@ html, body {
 .basemap-overlays label:hover { color: var(--text-primary); }
 .basemap-overlays input { accent-color: var(--accent); margin: 0; }
 
+/* ------------------------------------------------------- map context menu
+   Same translucent-card language as .app-switcher-menu/.basemap-flyout,
+   but position: fixed and placed at the cursor by JS (wireMapContextMenu()
+   in app.js) rather than anchored under a toggle button - a right-click
+   can land anywhere on the map, not just under one fixed control. */
+.map-context-menu {
+  position: fixed;
+  z-index: 1200; /* above everything else map-related, including the corner controls */
+  width: max-content;
+  min-width: 200px;
+  max-width: min(280px, calc(100vw - 24px));
+  padding: 6px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(26, 26, 25, 0.98);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.map-context-menu[hidden] { display: none; }
+
+.map-context-menu button {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.map-context-menu button:hover { background: var(--surface-2); color: var(--text-primary); }
+.map-context-menu button[data-danger] { color: var(--critical); }
+.map-context-menu button[data-danger]:hover { background: rgba(208, 59, 59, 0.14); }
+.map-context-menu hr { border: 0; border-top: 1px solid var(--border); margin: 4px 2px; }
+
+/* -------------------------------------------------- right-drag area select
+   A plain screen-pixel overlay (not a Leaflet layer - see wireMapContextMenu()
+   for why), sized/positioned via inline style each mousemove. position:
+   fixed (viewport-relative), not absolute - #map-select-rect is a sibling
+   of #map, not a child, so "absolute" would resolve against whatever
+   positioned ancestor it happens to inherit (not #map's own box); JS
+   computes its left/top from #map's own getBoundingClientRect() each
+   drag-start, exactly like #map-select-area-label already has to. */
+.map-select-rect {
+  position: fixed;
+  z-index: 1150;
+  border: 1.5px dashed var(--accent);
+  background-color: rgba(253, 121, 36, 0.10);
+  background-image:
+    repeating-linear-gradient(to right, rgba(253, 121, 36, 0.35) 0 1px, transparent 1px var(--map-select-cell, 40px)),
+    repeating-linear-gradient(to bottom, rgba(253, 121, 36, 0.35) 0 1px, transparent 1px var(--map-select-cell, 40px));
+  pointer-events: none;
+}
+.map-select-rect[hidden] { display: none; }
+
+.map-select-area-label {
+  position: fixed;
+  z-index: 1200;
+  padding: 5px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(26, 26, 25, 0.98);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.map-select-area-label[hidden] { display: none; }
+
+/* Cursor/selection affordance while a right-drag is in progress - mirrors
+   the existing .ops-drawing class's role for the left-click sketch tool. */
+.map-rect-selecting, .map-rect-selecting .leaflet-container { cursor: crosshair !important; user-select: none; }
+
 .pill {
   display: inline-flex;
   align-items: center;

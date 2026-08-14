@@ -577,6 +577,362 @@
     picker.style.bottom = `${Math.round(mapRect.bottom - zoomRect.bottom)}px`;
   }
 
+  // ------------------------------------------------------ map context menu
+  //
+  // No right-click handling existed at all before this - a right-click just
+  // fell through to the browser's native menu, and there was no way to
+  // remove a placed tactical marker except finding its popup's small
+  // "remove" text button (still there, still works - see removeFeature() in
+  // operations.js - just easy to miss). This section adds: a short
+  // right-click (below the drag threshold) opens a menu of actions for that
+  // point or, if it landed on an existing feature, that feature; a
+  // right-click-and-drag shows a live grid+area overlay and opens a menu of
+  // actions for the dragged area on release.
+  //
+  // Both menus render through the same generic showContextMenu(items,
+  // screenPoint), exposed on window (matching the existing
+  // NexFiremapMap/NexPrintView convention) so operations.js can reuse it
+  // for its own feature-specific edit/remove menus and contribute
+  // "Add tactical marker here" without app.js needing any
+  // Incident-Command-specific knowledge - the same
+  // dispatchEvent(CustomEvent(...)) extensibility idiom
+  // publishSpreadAnalysis() already uses below for cross-module
+  // communication.
+
+  const MAP_RECT_DRAG_THRESHOLD_PX = 6; // below this, a right-click is a click, not a drag
+  // "Nice" round real-world distances for the drag-select grid's cell size -
+  // the same idea L.Control.Scale uses for its own bar, reimplemented as a
+  // small local helper rather than reaching into Leaflet's private
+  // scale-control internals.
+  const NICE_GRID_KM = [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
+
+  let contextMenuOpen = false;
+
+  /** Generic reusable context menu: fills #map-context-menu with `items`
+   * ({label, action, danger?, keepOpenMs?}[] - a falsy entry renders a
+   * divider) and positions it at `screenPoint` ({x,y} in viewport pixels),
+   * clamped so it never runs off the right/bottom edge. `keepOpenMs`
+   * (used by the copy-to-clipboard items) runs `action` without closing
+   * the menu first, then closes it after that many ms - long enough for
+   * the button's own "Copied" feedback to actually be seen. Exposed on
+   * window so operations.js's feature-specific menus (edit/remove) reuse
+   * this instead of duplicating menu-rendering. */
+  function showContextMenu(items, screenPoint) {
+    const el = $("#map-context-menu");
+    el.innerHTML = "";
+    items.forEach((item) => {
+      if (!item) {
+        el.appendChild(document.createElement("hr"));
+        return;
+      }
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.setAttribute("role", "menuitem");
+      btn.textContent = item.label;
+      if (item.danger) btn.dataset.danger = "";
+      btn.addEventListener("click", () => {
+        if (item.keepOpenMs) {
+          item.action(btn);
+          setTimeout(closeContextMenu, item.keepOpenMs);
+        } else {
+          closeContextMenu();
+          item.action();
+        }
+      });
+      el.appendChild(btn);
+    });
+    el.hidden = false;
+    contextMenuOpen = true;
+    // Measure after unhiding, so offsetWidth/Height reflect the real
+    // rendered size - clamped to stay fully on-screen near an edge rather
+    // than the natural "top-left corner at the cursor" placement running
+    // off it.
+    const rect = el.getBoundingClientRect();
+    const left = Math.min(screenPoint.x, window.innerWidth - rect.width - 8);
+    const top = Math.min(screenPoint.y, window.innerHeight - rect.height - 8);
+    el.style.left = `${Math.max(8, left)}px`;
+    el.style.top = `${Math.max(8, top)}px`;
+  }
+
+  function closeContextMenu() {
+    if (!contextMenuOpen) return;
+    $("#map-context-menu").hidden = true;
+    contextMenuOpen = false;
+  }
+
+  window.NexShowContextMenu = showContextMenu;
+  window.NexCloseContextMenu = closeContextMenu;
+
+  /** Copies `text` to the clipboard, falling back to a hidden textarea +
+   * execCommand("copy") when the Clipboard API is unavailable -
+   * navigator.clipboard requires a secure context (HTTPS or localhost),
+   * and this app explicitly also runs on a plain-HTTP incident LAN, where
+   * it's simply absent, not just occasionally blocked. Reports success or
+   * failure directly on `btn` (the clicked menu item, paired with a
+   * `keepOpenMs` item so the feedback is actually visible) rather than
+   * silently doing nothing either way - a failed copy still logs the text
+   * to the console so it's not lost. */
+  async function copyText(text, btn) {
+    const report = (msg) => { if (btn) btn.textContent = msg; };
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        report("Copied ✓");
+        return;
+      }
+    } catch (err) {
+      // Fall through to the legacy path below.
+    }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      report(ok ? "Copied ✓" : "Couldn't copy - see console");
+      if (!ok) console.info("Copy this:", text);
+    } catch (err) {
+      report("Couldn't copy - see console");
+      console.info("Copy this:", text);
+    }
+  }
+
+  /** Picks a "nice" round real-world grid-cell size (in screen pixels, at
+   * the map's current zoom/latitude) for the drag-select overlay - snaps
+   * to whichever NICE_GRID_KM value keeps the resulting cell in a legible
+   * ~40-100px range on screen. Computed once per drag (at its start
+   * point), not per mousemove - the zoom doesn't change mid-drag. */
+  function computeGridCell(atLatLng) {
+    const p1 = map.latLngToContainerPoint(atLatLng);
+    const p2 = map.containerPointToLatLng(L.point(p1.x + 100, p1.y));
+    const metersPerPx = atLatLng.distanceTo(p2) / 100 || 1;
+    const targetKm = (metersPerPx * 60) / 1000;
+    let cellKm = NICE_GRID_KM[0];
+    let bestDiff = Infinity;
+    for (const km of NICE_GRID_KM) {
+      const diff = Math.abs(Math.log(km) - Math.log(Math.max(targetKm, 1e-6)));
+      if (diff < bestDiff) { bestDiff = diff; cellKm = km; }
+    }
+    return { cellKm, cellPx: (cellKm * 1000) / metersPerPx };
+  }
+
+  /** Real-world area (km²) of the lat/lon rectangle spanned by `sw`/`ne`,
+   * via Leaflet's own LatLng.distanceTo() (haversine - no new projection
+   * math needed) - averages the north/south edge widths for the
+   * rectangle's own short-edge convergence rather than assuming a
+   * constant width top-to-bottom. A UI readout, not a scientific
+   * calculation, so this approximation is deliberately good enough, not
+   * exact. */
+  function rectAreaKm2(sw, ne) {
+    const nw = L.latLng(ne.lat, sw.lng);
+    const se = L.latLng(sw.lat, ne.lng);
+    const width = (nw.distanceTo(ne) + sw.distanceTo(se)) / 2;
+    const height = sw.distanceTo(nw);
+    return (width * height) / 1e6;
+  }
+
+  /** Wires right-click gesture detection on the map: a short right-click
+   * opens the point (or feature) menu; right-click-and-drag shows the
+   * live grid+area overlay and opens the area menu on release. */
+  function wireMapContextMenu() {
+    const rectEl = $("#map-select-rect");
+    const labelEl = $("#map-select-area-label");
+    let drag = null; // {startPoint, startLatLng, moved, mapRect, cell} while tracking
+    // Set by a non-drag mouseup, consumed by the *map's own* contextmenu
+    // handler below - not shown directly from mouseup, deliberately: the
+    // browser fires contextmenu right after mouseup, and if the click
+    // landed on an existing feature, that layer's own contextmenu handler
+    // (operations.js) runs first and calls stopPropagation, so this one
+    // never fires at all and the feature-specific menu shows instead of a
+    // conflicting generic one underneath it. Only a click that reaches
+    // *here* landed on empty map.
+    let pendingPointClick = null;
+
+    map.on("contextmenu", (e) => {
+      L.DomEvent.preventDefault(e); // always suppress the native menu, drag or click, feature or empty map
+      if (pendingPointClick) {
+        showPointContextMenu(pendingPointClick.latlng, pendingPointClick.screenPoint);
+        pendingPointClick = null;
+      }
+    });
+
+    map.on("mousedown", (e) => {
+      if (e.originalEvent.button !== 2) return;
+      L.DomEvent.preventDefault(e.originalEvent); // no native text-selection/drag-ghost while right-dragging
+      pendingPointClick = null;
+      drag = { startPoint: e.containerPoint, startLatLng: e.latlng, moved: false };
+    });
+
+    map.on("mousemove", (e) => {
+      if (!drag) return;
+      if (!drag.moved && e.containerPoint.distanceTo(drag.startPoint) < MAP_RECT_DRAG_THRESHOLD_PX) return;
+      if (!drag.moved) {
+        drag.moved = true;
+        map.getContainer().classList.add("map-rect-selecting");
+        drag.mapRect = map.getContainer().getBoundingClientRect();
+        drag.cell = computeGridCell(drag.startLatLng);
+      }
+      updateSelectRect(drag, e.containerPoint);
+    });
+
+    function endDrag() {
+      if (drag && drag.moved) map.getContainer().classList.remove("map-rect-selecting");
+      rectEl.hidden = true;
+      labelEl.hidden = true;
+      const finished = drag;
+      drag = null;
+      return finished;
+    }
+
+    map.on("mouseup", (e) => {
+      if (!drag || e.originalEvent.button !== 2) return;
+      const finished = endDrag();
+      const screenPoint = { x: e.originalEvent.clientX, y: e.originalEvent.clientY };
+      if (finished.moved) {
+        showAreaContextMenu(L.latLngBounds(finished.startLatLng, e.latlng), screenPoint);
+      } else {
+        // Not shown yet - see pendingPointClick's own comment above for why
+        // the map's contextmenu handler is what actually shows this.
+        pendingPointClick = { latlng: e.latlng, screenPoint };
+      }
+    });
+
+    // A right-drag that ends outside the map (mouseup off the container,
+    // e.g. released over the panel) or loses the window's focus entirely
+    // would otherwise leave the overlay and .map-rect-selecting cursor
+    // stuck forever - both just cancel the drag (no menu - there's no
+    // reliable release point to act on) rather than leaving it hanging.
+    document.addEventListener("mouseleave", () => { if (drag) endDrag(); });
+    window.addEventListener("blur", () => { if (drag) endDrag(); });
+
+    function updateSelectRect(d, endPoint) {
+      const left = Math.min(d.startPoint.x, endPoint.x);
+      const top = Math.min(d.startPoint.y, endPoint.y);
+      const width = Math.abs(endPoint.x - d.startPoint.x);
+      const height = Math.abs(endPoint.y - d.startPoint.y);
+
+      rectEl.style.left = `${d.mapRect.left + left}px`;
+      rectEl.style.top = `${d.mapRect.top + top}px`;
+      rectEl.style.width = `${width}px`;
+      rectEl.style.height = `${height}px`;
+      rectEl.style.setProperty("--map-select-cell", `${d.cell.cellPx}px`);
+      rectEl.hidden = false;
+
+      const sw = map.containerPointToLatLng([left, top + height]);
+      const ne = map.containerPointToLatLng([left + width, top]);
+      labelEl.textContent = `${fmtArea(rectAreaKm2(sw, ne))} · grid ${d.cell.cellKm} km`;
+      labelEl.style.left = `${d.mapRect.left + left + width / 2}px`;
+      labelEl.style.top = `${d.mapRect.top + top + height + 8}px`;
+      labelEl.style.transform = "translateX(-50%)";
+      labelEl.hidden = false;
+    }
+
+    // Dismiss the menu the same way closeBasemapFlyout() already does
+    // (Escape, click-outside) - plus (new here) immediately on
+    // movestart/zoomstart, since this menu is viewport-fixed, not tied to
+    // a map coordinate: panning away would otherwise leave it floating
+    // over the wrong spot instead of closing.
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && contextMenuOpen) closeContextMenu();
+    });
+    document.addEventListener("click", (event) => {
+      if (contextMenuOpen && !event.target.closest("#map-context-menu")) closeContextMenu();
+    });
+    map.on("movestart zoomstart", () => { if (contextMenuOpen) closeContextMenu(); });
+  }
+
+  /** Builds and shows the menu for a short right-click on empty map. */
+  function showPointContextMenu(latlng, screenPoint) {
+    const items = [
+      {
+        label: "Copy coordinates",
+        keepOpenMs: 900,
+        action: (btn) => copyText(window.NexCoords.format(latlng.lat, latlng.lng, window.NexCoords.currentSystem()), btn),
+      },
+      {
+        label: "What's here",
+        action: () => showWhatsHere(latlng),
+      },
+      {
+        label: "Zoom in here",
+        action: () => map.setView(latlng, Math.min(map.getMaxZoom(), map.getZoom() + 2)),
+      },
+    ];
+    // Lets operations.js (or any future module) contribute more items -
+    // e.g. "Add tactical marker here" - without this file needing any
+    // domain-specific knowledge. addItem pushes in place; listeners run
+    // synchronously before the menu is actually shown below.
+    window.dispatchEvent(new CustomEvent("nexfiremap:map-contextmenu", {
+      detail: { kind: "point", latlng, addItem: (item) => items.push(item) },
+    }));
+    showContextMenu(items, screenPoint);
+  }
+
+  /** Reverse-geocodes `latlng` and surfaces the result as a one-off
+   * status line inside the (already-closed) context menu's former spot -
+   * simplest to just reuse the map's own popup at that point, consistent
+   * with how every other "info about this spot" affordance on the map
+   * already works (detection markers, event markers, tactical features). */
+  async function showWhatsHere(latlng) {
+    const popup = L.popup({ maxWidth: 280 })
+      .setLatLng(latlng)
+      .setContent("Looking up this location…")
+      .openOn(map);
+    try {
+      const res = await fetch(`/api/geocode/reverse?lat=${latlng.lat}&lon=${latlng.lng}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data.error) {
+        popup.setContent(`Couldn't look this up: ${escapeHtml(data.error)}`);
+      } else if (!data.result) {
+        popup.setContent("No named place found here.");
+      } else {
+        popup.setContent(escapeHtml(data.result.label));
+      }
+    } catch (err) {
+      popup.setContent(`Couldn't look this up: ${escapeHtml(err.message || String(err))}`);
+    }
+  }
+
+  /** Builds and shows the menu for a completed right-click-drag area
+   * selection. */
+  function showAreaContextMenu(bounds, screenPoint) {
+    const items = [
+      {
+        label: "Zoom to this area",
+        action: () => map.fitBounds(bounds, { padding: [20, 20] }),
+      },
+      {
+        label: "Copy bounding box",
+        keepOpenMs: 900,
+        // Plain WGS84 decimal degrees, not the operator's display
+        // coordinate system - this is meant to be pasted back into the
+        // app/API, which already speaks this exact west,south,east,north
+        // convention everywhere else (see bboxParam()).
+        action: (btn) => copyText(
+          [bounds.getWest(), bounds.getSouth(), bounds.getEast(), bounds.getNorth()].map((v) => v.toFixed(5)).join(","),
+          btn
+        ),
+      },
+      null,
+      {
+        label: "Detect fire events in this area",
+        action: () => { map.fitBounds(bounds, { padding: [20, 20] }); detectEvents(); },
+      },
+      {
+        label: "Print this area",
+        action: () => { map.fitBounds(bounds, { padding: [20, 20] }); window.NexPrintView?.() ?? window.print(); },
+      },
+    ];
+    window.dispatchEvent(new CustomEvent("nexfiremap:map-contextmenu", {
+      detail: { kind: "area", bounds, addItem: (item) => items.push(item) },
+    }));
+    showContextMenu(items, screenPoint);
+  }
+
   // ---------------------------------------------------------- app switcher
   //
   // Four modes over one shared map: NexFiremap (satellite detections, the
@@ -3291,6 +3647,7 @@
     wireCoordSystemSelect();
     wireBasemapPicker();
     wireAppSwitcher();
+    wireMapContextMenu();
     applyFeatureAvailability();
     renderLegend();
 

@@ -760,11 +760,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if path != "/api/auth/logout" and not security.may_write(session.role, path):
                         return _json({"detail": "role is not permitted for this operation"}, 403)
             response = await call_next(request)
+            # StaticFiles (the /static mount) sets Last-Modified/ETag but no
+            # Cache-Control at all, so a browser's own heuristic freshness
+            # guess can keep serving an old app.js/app.css/operations.js
+            # indefinitely after a server update - no network request at
+            # all, not even a conditional one - with nothing to signal
+            # anything changed. Same bug already fixed for / and
+            # /service-worker.js below (see their own comments); this covers
+            # every other static asset the same way. no-cache (not
+            # no-store) still lets the browser skip re-downloading unchanged
+            # bytes via a 304, it just can't skip *asking*. Deliberately
+            # applies to vendored third-party libraries too, not just this
+            # project's own files - they get re-fetched in place on a
+            # version bump (scripts/vendor_assets.py) without their URL
+            # changing, so the same staleness risk applies to them.
+            # setdefault, not a plain assignment, so a route that already
+            # set a more specific Cache-Control (job result files, a couple
+            # of long-lived assets) isn't overridden.
+            if path.startswith("/static/"):
+                response.headers.setdefault("Cache-Control", "no-cache")
             # These apply to every response that actually reaches a route
             # handler (the 401/403s returned early above skip this and go
-            # out with only Starlette's default headers). setdefault, not
-            # a plain assignment, so a handler that already set one of
-            # these itself isn't overridden.
+            # out with only Starlette's default headers).
             response.headers.setdefault("X-Content-Type-Options", "nosniff")
             response.headers.setdefault("Referrer-Policy", "no-referrer")
             response.headers.setdefault("X-Frame-Options", "DENY")
@@ -942,6 +959,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def api_geocode(request: Request, q: str = Query("")) -> Response:
         geocode: GeocodeService = request.app.state.geocode
         return _json(await geocode.search(q))
+
+    @app.get("/api/geocode/reverse")
+    async def api_geocode_reverse(
+        request: Request, lat: float = Query(..., ge=-90, le=90), lon: float = Query(..., ge=-180, le=180)
+    ) -> Response:
+        geocode: GeocodeService = request.app.state.geocode
+        return _json(await geocode.reverse(lat, lon))
 
     @app.get("/api/status")
     async def api_status(request: Request, key: bool = Query(True)) -> Response:

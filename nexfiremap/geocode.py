@@ -44,11 +44,25 @@ from .config import Settings
 
 log = logging.getLogger("nexfiremap.geocode")
 
+# Distinct from a real cached "no address here" (a legitimate answer for
+# open ocean/remote wilderness - both real cases for a wildfire map, stored
+# as `None`) - a sentinel, not None, is what actually means "not cached
+# yet, go fetch it". Conflating the two would make an already-confirmed
+# "nothing here" re-fetch forever, exactly the kind of None-means-two-
+# things bug this project's own audit exists to catch elsewhere.
+_MISSING = object()
+
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
 CACHE_TTL_S = 7 * 86400  # place names/coordinates don't move; a week is plenty
 CACHE_MAX_ENTRIES = 500
 MIN_REQUEST_INTERVAL_S = 1.05  # Nominatim policy floor (1 req/s) plus a small margin
 MAX_QUERY_CHARS = 200
+# Cache key precision for reverse lookups - about 1m at the equator, far
+# finer than Nominatim's own address-level resolution, so two right-clicks
+# a few pixels apart in the same spot still share a cache entry instead of
+# each paying their own upstream request.
+REVERSE_CACHE_DECIMALS = 5
 
 
 class GeocodeService:
@@ -66,6 +80,11 @@ class GeocodeService:
             follow_redirects=True,
         )
         self._cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._reverse_cache: dict[tuple[float, float], tuple[float, dict[str, Any] | None]] = {}
+        # Shared with search()'s own throttle below - reverse() calls the
+        # same upstream Nominatim service, so both must serialize through
+        # one lock/timestamp pair (Nominatim's 1 req/s policy is per
+        # client, not per endpoint) rather than each getting its own budget.
         self._lock = asyncio.Lock()
         self._last_request = 0.0
 
@@ -137,6 +156,69 @@ class GeocodeService:
                 self._cache.pop(oldest_key, None)
             self._cache[key] = (time.time(), results)
             return {"query": q, "results": results, "error": None, "cached": False}
+
+    async def reverse(self, lat: float, lon: float) -> dict[str, Any]:
+        """Cached, rate-limited reverse lookup ("what's here") - same
+        always-a-dict-with-an-error-key contract as search(), and shares
+        its cache/rate-limit machinery (see __init__'s comment) rather than
+        duplicating it. ``result`` is None (not an error) for real ocean/
+        remote-wilderness coordinates Nominatim has no address for."""
+        key = (round(lat, REVERSE_CACHE_DECIMALS), round(lon, REVERSE_CACHE_DECIMALS))
+        cached = self._cached_reverse(key)
+        if cached is not _MISSING:
+            return {"lat": lat, "lon": lon, "result": cached, "error": None, "cached": True}
+
+        async with self._lock:
+            cached = self._cached_reverse(key)
+            if cached is not _MISSING:
+                return {"lat": lat, "lon": lon, "result": cached, "error": None, "cached": True}
+
+            wait = MIN_REQUEST_INTERVAL_S - (time.time() - self._last_request)
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+            try:
+                response = await self._client.get(NOMINATIM_REVERSE_URL, params={
+                    "lat": f"{lat:.6f}", "lon": f"{lon:.6f}", "format": "jsonv2", "addressdetails": "0",
+                })
+            except httpx.HTTPError as exc:
+                log.warning("Nominatim reverse lookup failed for %.5f,%.5f: %s", lat, lon, exc)
+                return {"lat": lat, "lon": lon, "result": None, "error": "Reverse lookup is unreachable right now."}
+            finally:
+                self._last_request = time.time()
+
+            if response.status_code != 200:
+                log.warning("Nominatim reverse HTTP %d for %.5f,%.5f", response.status_code, lat, lon)
+                return {"lat": lat, "lon": lon, "result": None, "error": f"Reverse lookup returned HTTP {response.status_code}."}
+
+            try:
+                payload = response.json()
+            except ValueError:
+                return {"lat": lat, "lon": lon, "result": None, "error": "Reverse lookup returned an unreadable response."}
+
+            # A coordinate with no nearby addressable feature (open ocean,
+            # remote wilderness - both real cases for a wildfire map) comes
+            # back as an "error" field in the payload itself, not an HTTP
+            # error - that's a genuine "nothing here", not a failure, so it
+            # caches and returns the same as a real match, just with
+            # result=None.
+            row = None if "error" in payload else self._row(payload)
+            if len(self._reverse_cache) >= CACHE_MAX_ENTRIES:
+                oldest_key = min(self._reverse_cache, key=lambda existing: self._reverse_cache[existing][0])
+                self._reverse_cache.pop(oldest_key, None)
+            self._reverse_cache[key] = (time.time(), row)
+            return {"lat": lat, "lon": lon, "result": row, "error": None, "cached": False}
+
+    def _cached_reverse(self, key: tuple[float, float]) -> dict[str, Any] | None | object:
+        """Returns the cached row, ``None`` (a real cached "no address
+        here"), or the ``_MISSING`` sentinel (not cached/expired - go
+        fetch it). Three distinguishable outcomes, not two - see
+        ``_MISSING``'s own comment for why collapsing the first two would
+        be a real bug, not just imprecise typing."""
+        entry = self._reverse_cache.get(key)
+        if entry and time.time() - entry[0] < CACHE_TTL_S:
+            return entry[1]
+        return _MISSING
 
     @staticmethod
     def _row(item: dict[str, Any]) -> dict[str, Any] | None:
