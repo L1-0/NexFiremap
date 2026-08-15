@@ -105,6 +105,7 @@ from .geo import (
     grid_xy_m,
     haversine_km,
     lon_km_per_deg,
+    unwrap_lons,
 )
 from .jobs import JobContext, register_kind
 
@@ -199,9 +200,18 @@ def _connected_components_on(
     # more accurate the smaller/tighter the subset gets, which is exactly
     # when recursive splitting is calling this on a shrinking piece.
     lat0 = float(np.mean(sub_lats))
-    lon0 = float(np.mean(sub_lons))
+    # Unwrapped around a circular mean, not an arithmetic one. Raw
+    # `sub_lons - mean(sub_lons)` is right everywhere except across the
+    # antimeridian, where it fails completely rather than approximately: two
+    # detections at 179.9 and -179.9 are ~22 km apart on the ground and 359.8
+    # degrees apart in that subtraction, so a fire crossing 180 clustered as
+    # two separate events - and the arithmetic mean of those longitudes is
+    # ~0, putting the projection origin on the far side of the planet from
+    # every point in the subset. The detections *query* has handled wraparound
+    # for a long time (`geo.lon_range_sql`); everything derived from it had not.
+    unwrapped, lon0 = unwrap_lons(sub_lons)
     lon_km = lon_km_per_deg(lat0)
-    x = (sub_lons - lon0) * lon_km
+    x = (unwrapped - lon0) * lon_km
     y = (sub_lats - lat0) * LAT_KM_PER_DEG
     points = np.column_stack([x, y])
 
@@ -248,8 +258,16 @@ def _span_km_of(indices: np.ndarray, lats: np.ndarray, lons: np.ndarray) -> floa
     speed), so a cluster that passes this check is the true distance the UI
     and detect_events' own defence-in-depth recheck will report."""
     sub_lats, sub_lons = lats[indices], lons[indices]
+    # Unwrapped before taking the extremes, for the same reason the projections
+    # are. On raw degrees an antimeridian-crossing cluster has min -179.9 and
+    # max 179.9, so this reports a span most of the way around the planet - and
+    # since this is the check that decides whether a cluster is oversized, such
+    # a cluster would be split over and over until the depth valve stopped it,
+    # producing a handful of fragments for one fire. haversine_km works from
+    # differences, so an unwrapped longitude past 180 is fine here.
+    unwrapped, _ = unwrap_lons(sub_lons)
     return haversine_km(
-        float(sub_lats.min()), float(sub_lons.min()), float(sub_lats.max()), float(sub_lons.max())
+        float(sub_lats.min()), float(unwrapped.min()), float(sub_lats.max()), float(unwrapped.max())
     )
 
 
@@ -310,9 +328,13 @@ def _split_to_span_bound(
 
     sub_lats, sub_lons = lats[indices], lons[indices]
     lat0 = float(np.mean(sub_lats))
-    lon0 = float(np.mean(sub_lons))
+    # Same wraparound correctness as _connected_components_on - this splitter
+    # picks its cut axis from the projected extent, and an antimeridian-crossing
+    # cluster would otherwise look ~40000 km wide and be cut in half at the
+    # wrong place, every time, until the depth valve stopped it.
+    unwrapped, lon0 = unwrap_lons(sub_lons)
     lon_km = lon_km_per_deg(lat0)
-    x = (sub_lons - lon0) * lon_km
+    x = (unwrapped - lon0) * lon_km
     y = (sub_lats - lat0) * LAT_KM_PER_DEG
 
     x_lo, x_hi = float(x.min()), float(x.max())

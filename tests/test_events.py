@@ -370,6 +370,59 @@ def test_spread_topology_job() -> None:
         )
 
 
+def test_fire_crossing_the_antimeridian_stays_one_event() -> None:
+    """A fire straddling 180 degrees must cluster as one event, not two.
+
+    Longitude is circular and the clustering projection subtracted raw degrees,
+    so 179.95 and -179.95 - about 11 km apart on the ground near the equator -
+    read as 359.9 degrees apart, far beyond any link radius. The fire split in
+    two, and the arithmetic mean of those longitudes is ~0, putting the
+    projection's origin on the opposite side of the planet from every detection
+    in the group. The raw-detection query already handled wraparound
+    (`geo.lon_range_sql`); everything derived from it did not.
+
+    Fiji, Kiribati, Chukotka and the Aleutians all sit on this line, and so
+    does a great deal of the fire-prone Russian Far East.
+    """
+    print("\nAntimeridian-crossing fire")
+    import numpy as np
+
+    from nexfiremap.geo import haversine_km, unwrap_lons
+
+    base = 1_760_000_000.0
+    # A compact line of detections marching across 180 degrees.
+    lons = [179.96, 179.98, -180.0, -179.98, -179.96]
+    rows = [{"lat": -16.5, "lon": lon, "ts": base + i * 1800, "scan": 0.4, "track": 0.4}
+            for i, lon in enumerate(lons)]
+
+    # The premise: these really are close together on the ground.
+    ends = haversine_km(-16.5, 179.96, -16.5, -179.96)
+    check("the fixture spans a short real distance", ends < 30.0, f"{ends:.1f} km")
+
+    clusters = cluster_detections(rows, v_max_kmh=8.0, max_dt_hours=168.0)
+    check("an antimeridian-crossing fire is a single event",
+          len(clusters) == 1, f"{len(clusters)} clusters: {clusters}")
+    if clusters:
+        check("...containing every detection", len(clusters[0]) == len(rows), str(clusters[0]))
+
+    # And the primitive behind it: unwrapping must keep the run continuous and
+    # centred on the fire, not on the far side of the planet.
+    unwrapped, reference = unwrap_lons(np.array(lons))
+    check("the reference lands on the fire, not at longitude 0",
+          abs(abs(reference) - 180.0) < 1.0, str(reference))
+    check("unwrapped longitudes form one continuous run",
+          float(unwrapped.max() - unwrapped.min()) < 1.0,
+          f"{unwrapped.min()} .. {unwrapped.max()}")
+
+    # A no-op away from the line: ordinary longitudes must be untouched.
+    plain = np.array([11.0, 11.5, 12.0])
+    plain_unwrapped, plain_reference = unwrap_lons(plain)
+    check("ordinary longitudes are unchanged",
+          np.allclose(plain_unwrapped, plain), str(plain_unwrapped))
+    check("...with a reference inside them",
+          11.0 <= plain_reference <= 12.0, str(plain_reference))
+
+
 def main() -> int:
     test_two_tight_groups_far_apart()
     test_chain_over_time_stays_one_event()
@@ -380,6 +433,7 @@ def main() -> int:
     test_chained_scatter_splits_instead_of_one_wide_event()
     test_detect_events_job()
     test_spread_topology_job()
+    test_fire_crossing_the_antimeridian_stays_one_event()
 
     print()
     if failures:

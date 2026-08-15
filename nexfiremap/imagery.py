@@ -50,7 +50,20 @@ STAC_TIMEOUT_S = 30.0
 GDAL_HTTP_TIMEOUT_S = "30"
 GDAL_HTTP_CONNECTTIMEOUT_S = "15"
 
-S2_NIR_BAND, S2_SWIR_BAND, S2_SCL_BAND = "B08", "B12", "SCL"
+# B8A, not B08, for the NIR half of NBR. Both are "near infrared" and B08 is
+# the more familiar name, but the severity thresholds this module classifies
+# against (SEVERITY_THRESHOLDS below - Key & Benson / USGS FIREMON) were
+# derived on *Landsat*, whose NIR band is narrow: SR_B5 spans 851-879 nm,
+# centre 865. B8A is the Sentinel-2 band built to match it - 855-875 nm,
+# centre 865 - while B08 is a wide 785-900 nm band centred at 842, 22 nm off
+# and four times the bandwidth, taking in wavelengths where water vapour
+# absorbs. Feeding B08 into a Landsat-calibrated threshold table shifts every
+# dNBR value by an amount that varies with atmospheric moisture, which then
+# lands scenes in the wrong severity class rather than merely adding noise.
+#
+# B8A is also 20 m like B12, so the two halves of the ratio now share a native
+# resolution instead of resampling a 10 m band against a 20 m one.
+S2_NIR_BAND, S2_SWIR_BAND, S2_SCL_BAND = "B8A", "B12", "SCL"
 LANDSAT_NIR_BAND, LANDSAT_SWIR_BAND, LANDSAT_QA_BAND = "SR_B5", "SR_B7", "qa_pixel"
 LANDSAT_SCALE, LANDSAT_OFFSET = 0.0000275, -0.2
 
@@ -210,7 +223,7 @@ def nbr_from_bands(nir: np.ndarray, swir: np.ndarray, bad_mask: np.ndarray) -> n
 def _asset_href(item: Any, band: str) -> str:
     """``item.assets[band].href``, but with an error a human (or a job's
     "error" field, which is what actually surfaces this) can act on. A bare
-    ``KeyError`` here stringifies to just ``"'B08'"`` with no indication of
+    ``KeyError`` here stringifies to just ``"'B8A'"`` with no indication of
     which scene, which collection, or that this means "Planetary Computer's
     asset naming changed" rather than a bug in the request itself."""
     asset = item.assets.get(band)

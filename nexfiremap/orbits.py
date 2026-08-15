@@ -310,12 +310,17 @@ def aoi_clear_passes(
     end_day = datetime.fromtimestamp(end_ts, tz=timezone.utc).date()
 
     clear: list[dict[str, Any]] = []
+    # Looked up once per satellite rather than per day: the cached element set
+    # does not change during one call, and `tle_age_days` is a query.
+    tle_ages: dict[str, float | None] = {}
     day = start_day
     while day <= end_day:
         for name, meta in SATELLITES.items():
             tle = ensure_tle(conn, name)
             if tle is None:
                 continue
+            if name not in tle_ages:
+                tle_ages[name] = tle_age_days(conn, name)
             try:
                 track = ground_track(tle[0], tle[1], name, day)
             except Exception:
@@ -347,7 +352,18 @@ def aoi_clear_passes(
                     abs(pass_ts - dt) <= coincidence_window_s for dt in detection_times
                 )
                 if not coincident:
-                    clear.append({"satellite": name, "ts": pass_ts})
+                    # The orbit's age travels with the pass. A clear pass is
+                    # *negative evidence* - it actively suppresses fire
+                    # likelihood at `likelihood._clear_pass_suppression` and
+                    # becomes a negative ground-truth point in validation - and
+                    # `ensure_tle` falls back to a cached element set with no
+                    # age ceiling when Celestrak is unreachable, which on an
+                    # incident LAN is the normal state. The age is already
+                    # reported for the coverage layer; without it here, the one
+                    # path that *reduces* how much fire the map shows was the
+                    # one with no indication of how old the orbit behind it is.
+                    clear.append({"satellite": name, "ts": pass_ts,
+                                  "tle_age_days": tle_ages.get(name)})
         day += timedelta(days=1)
     return clear
 

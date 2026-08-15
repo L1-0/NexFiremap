@@ -128,7 +128,14 @@ BARRIER_ROS_M_MIN = 1e-4
 ISOCHRONE_HOURS = (3, 6, 12, 24, 48)
 
 
-def _model_caveats(weather: dict[str, Any]) -> list[str]:
+#: Below this fraction of the ensemble, the weighted percentiles are effectively
+#: reporting one member and the spread between them is not an uncertainty range.
+#: 0.2 is a common working threshold for particle-filter degeneracy.
+ESS_DEGENERATE_FRACTION = 0.2
+
+
+def _model_caveats(weather: dict[str, Any], *, effective_sample_size: float | None = None,
+                   n_members: int | None = None) -> list[str]:
     """Named limitations of one run, for the operator rather than the log.
 
     The pattern this exists to break is a modelling input that is missing and
@@ -153,6 +160,22 @@ def _model_caveats(weather: dict[str, Any]) -> list[str]:
     if weather.get("relative_humidity_pct") is None:
         caveats.append(
             "No humidity observations - dead-fuel moisture rests on its seed value alone.")
+
+    # A collapsed ensemble is the subtlest failure here, because it produces a
+    # *more* confident-looking answer, not a worse-looking one. Assimilation
+    # weights members by likelihood; when one fits the observations far better
+    # than the rest its weight approaches 1 and every other member's approaches
+    # 0. The earliest/median/latest percentiles are then all drawn from that one
+    # member, so the "uncertainty band" narrows toward zero width - and a band
+    # that has stopped meaning anything is indistinguishable, on the map, from a
+    # genuinely well-constrained forecast. Withdrawal warnings key off the
+    # earliest arrival in that band, so this is the number that matters most.
+    if effective_sample_size is not None and n_members:
+        if effective_sample_size < max(1.0, n_members * ESS_DEGENERATE_FRACTION):
+            caveats.append(
+                f"The ensemble collapsed onto {effective_sample_size:.1f} of {n_members} members - "
+                "the earliest/latest arrival band is drawn from too few of them to read as a "
+                "genuine uncertainty range.")
     return caveats
 
 
@@ -1048,7 +1071,8 @@ def run_ensemble_assimilation(params: dict[str, Any], ctx: JobContext) -> dict[s
         # the result rather than something they would have to infer from a
         # suspiciously slow forecast. `situation.py` takes the same position:
         # "we did not ask" and "there is nothing there" are different answers.
-        "caveats": _model_caveats(weather),
+        "caveats": _model_caveats(weather, effective_sample_size=effective_sample_size,
+                                  n_members=n_members),
         "n_members": n_members,
         "effective_sample_size": round(effective_sample_size, 1),
         "seed_detections": len(seed_points),

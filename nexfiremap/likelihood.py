@@ -284,6 +284,7 @@ def _clear_pass_suppression(
     detections: list[dict[str, Any]],
     reference_ts: float,
     tau_hours: float = DEFAULT_TAU_HOURS,
+    details: dict[str, Any] | None = None,
 ) -> tuple[float, int]:
     """Aggregate suppression factor from valid clear satellite passes over
     this event's AOI (further_plan.md doc section 2/6's tri-state model).
@@ -353,12 +354,22 @@ def _clear_pass_suppression(
         return 1.0, 0
 
     if not clear_passes:
+        if details is not None:
+            details["max_tle_age_days"] = None
+            details["cloud_hours_available"] = 0
         return 1.0, 0
 
     west, south, east, north = bbox
     center_lat, center_lon = (south + north) / 2.0, (west + east) / 2.0
     cloud_by_hour = _fetch_cloud_cover(center_lat, center_lon, start_ts, reference_ts)
     factor = combine_clear_passes(clear_passes, reference_ts, tau_hours, cloud_by_hour)
+    if details is not None:
+        # Reported through an out-parameter rather than a wider return tuple:
+        # seven call sites unpack `(factor, count)` and none of them care about
+        # this, so widening the signature would be churn for its own sake.
+        ages = [p["tle_age_days"] for p in clear_passes if p.get("tle_age_days") is not None]
+        details["max_tle_age_days"] = max(ages) if ages else None
+        details["cloud_hours_available"] = len(cloud_by_hour)
     return factor, len(clear_passes)
 
 
@@ -629,8 +640,9 @@ def analyze_event(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         active = active_heat_raster(detections, geom, reference_ts, tau_hours)
         ctx.report_progress(45, note="active-heat raster done")
 
+        suppression_details: dict[str, Any] = {}
         suppression, clear_pass_count = _clear_pass_suppression(
-            conn, bbox, detections, reference_ts, tau_hours
+            conn, bbox, detections, reference_ts, tau_hours, details=suppression_details
         )
         if clear_pass_count:
             active = active * suppression
@@ -677,6 +689,16 @@ def analyze_event(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
             "max_probability": round(float(active.max()) if active.size else 0.0, 4),
             "envelope_count": len(envelopes),
             "clear_pass_count": clear_pass_count,
+            # What that suppression actually rested on. A clear pass *reduces*
+            # how much fire the map shows, so the two things that can quietly
+            # weaken it belong on the result: how old the orbit behind it was
+            # (`ensure_tle` falls back to a cached element set with no age
+            # ceiling when Celestrak is unreachable - the normal state on an
+            # incident LAN), and how many hours of cloud data were available to
+            # soften it (a missing hour counts as clear, which suppresses at
+            # full strength).
+            "clear_pass_max_tle_age_days": suppression_details.get("max_tle_age_days"),
+            "clear_pass_cloud_hours": suppression_details.get("cloud_hours_available", 0),
             "files": {
                 "active_heat": "active_heat.png",
                 "arrival_time": "arrival_time.png",

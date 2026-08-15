@@ -231,6 +231,37 @@ def utm_to_lonlat(easting: float, northing: float, zone: int, *, northern: bool 
     return math.degrees(central_meridian + longitude), math.degrees(latitude)
 
 
+def unwrap_lons(lons: np.ndarray, reference: float | None = None) -> tuple[np.ndarray, float]:
+    """Longitudes re-expressed as one continuous run, plus the reference used.
+
+    Longitude is circular, and every flat-projection distance calculation in
+    this codebase subtracts raw degrees. That is fine anywhere except across
+    the antimeridian, where it fails badly rather than approximately: 179.5 and
+    -179.5 are half a degree apart on the ground and 359 degrees apart in
+    arithmetic. A fire crossing 180 therefore clusters as two events, and the
+    arithmetic mean of its longitudes lands near 0 - the opposite side of the
+    planet from every detection in it.
+
+    The raw-detection query path already handles wraparound (`lon_range_sql`);
+    this is the same correctness for everything *derived* from those
+    detections. Returns values that may lie outside [-180, 180] by design - a
+    run spanning the antimeridian is continuous precisely because it is allowed
+    to read 179.5, 180.2, 180.8 - so callers must use it for differences and
+    means, not store it as a coordinate.
+
+    :param lons: Longitudes in degrees.
+    :param reference: Centre to unwrap around. Defaults to the *circular* mean,
+        which is the only mean that is meaningful for an angle.
+    """
+    lons = np.asarray(lons, dtype=np.float64)
+    if reference is None:
+        radians = np.radians(lons)
+        reference = math.degrees(math.atan2(float(np.sin(radians).mean()),
+                                            float(np.cos(radians).mean())))
+    # Each longitude moved to the equivalent angle nearest the reference.
+    return reference + ((lons - reference + 180.0) % 360.0) - 180.0, float(reference)
+
+
 def grid_geometry(
     bbox: tuple[float, float, float, float],
     desired_res_m: float = DEFAULT_RESOLUTION_M,

@@ -385,6 +385,25 @@ def test_model_caveats_name_missing_inputs() -> None:
     check("forecast-backfilled hours are disclosed",
           any("forecast" in c for c in backfilled), str(backfilled))
 
+    # A collapsed ensemble is the subtlest of these, because degeneracy makes
+    # the answer look *more* confident: every percentile is drawn from the one
+    # surviving member, so the earliest/latest band narrows toward zero width
+    # and reads as a well-constrained forecast. Withdrawal warnings key off the
+    # earliest arrival in that band.
+    healthy = {"wind_observed": True, "relative_humidity_pct": 40.0}
+    collapsed = _model_caveats(healthy, effective_sample_size=1.2, n_members=24)
+    check("a collapsed ensemble is called out",
+          any("collapsed" in c for c in collapsed), str(collapsed))
+    check("...naming how many members actually contributed",
+          any("1.2 of 24" in c for c in collapsed), str(collapsed))
+
+    spread = _model_caveats(healthy, effective_sample_size=18.0, n_members=24)
+    check("a healthy ensemble carries no collapse caveat", spread == [], str(spread))
+
+    # The threshold must scale with the ensemble, not be a fixed count.
+    small = _model_caveats(healthy, effective_sample_size=1.5, n_members=4)
+    check("a small but well-spread ensemble is not flagged", small == [], str(small))
+
 
 def main() -> int:
     test_circular_mean()
