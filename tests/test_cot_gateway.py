@@ -343,7 +343,75 @@ def main() -> None:
     check_mavlink_over_gateway()
     check_http_surface()
     check_security_carveout_stays_narrow()
+    check_one_bad_clock_does_not_blank_the_fleet()
     print("CoT gateway, OsmAnd and MAVLink checks passed.")
+
+
+def check_one_bad_clock_does_not_blank_the_fleet() -> None:
+    """A single unusable report must not cost every other unit its position.
+
+    One TCP frame from a TAK server carries many devices, and validation used
+    to abort the whole batch on the first bad report. So one crew member's
+    phone with a skewed clock rejected everybody else's position too, and the
+    gateway only logged a warning - the entire fleet went stale on the map with
+    nothing on screen to say why. A unit vanishing is the worst failure this
+    subsystem has.
+    """
+    import tempfile
+    from datetime import datetime, timedelta, timezone
+
+    from fastapi.testclient import TestClient
+
+    from nexfiremap.api import create_app
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        with TestClient(create_app(_settings(root))) as client:
+            incident = client.post("/api/operations/incidents", json={"name": "Fleet"}).json()["incident"]
+            feed = client.post(f"/api/operations/incidents/{incident['id']}/position-feeds",
+                               json={"name": "TAK"}).json()
+            now = datetime.now(timezone.utc)
+            good = now.isoformat(timespec="seconds")
+            skewed = (now + timedelta(hours=3)).isoformat(timespec="seconds")  # a device clock hours fast
+
+            response = client.post(
+                f"/api/feeds/positions/{feed['id']}",
+                headers={"X-Feed-Token": feed["ingest_token"]},
+                json={"positions": [
+                    {"external_id": "a1", "callsign": "FL 11/1", "observed_at": good,
+                     "latitude": 48.10, "longitude": 11.50},
+                    {"external_id": "b1", "callsign": "FL 11/2", "observed_at": skewed,
+                     "latitude": 48.11, "longitude": 11.51},
+                    {"external_id": "c1", "callsign": "FL 11/3", "observed_at": good,
+                     "latitude": 48.12, "longitude": 11.52},
+                ]},
+            )
+            assert response.status_code == 202, response.text
+            body = response.json()
+            assert body["accepted"] == 2, f"the good units were lost too: {body}"
+            assert len(body["rejected"]) == 1, body["rejected"]
+            # The bad device must be named, or a silent drop replaces a loud
+            # failure with an undiagnosable one.
+            assert body["rejected"][0]["callsign"] == "FL 11/2", body["rejected"]
+            assert "future" in body["rejected"][0]["reason"], body["rejected"]
+
+            positions = client.get(f"/api/operations/incidents/{incident['id']}/vehicle-positions/latest").json()
+            callsigns = {f["properties"]["callsign"] for f in positions["features"]}
+            assert {"FL 11/1", "FL 11/3"} <= callsigns, f"units missing from the map: {callsigns}"
+            assert "FL 11/2" not in callsigns, "a report from the future was accepted"
+
+            # A batch with nothing usable must still be an error, so a
+            # single-device feed reports its problem instead of appearing to
+            # succeed with zero positions.
+            only_bad = client.post(
+                f"/api/feeds/positions/{feed['id']}",
+                headers={"X-Feed-Token": feed["ingest_token"]},
+                json={"positions": [
+                    {"external_id": "d1", "callsign": "FL 11/4", "observed_at": skewed,
+                     "latitude": 48.13, "longitude": 11.53},
+                ]},
+            )
+            assert only_bad.status_code == 400, only_bad.status_code
 
 
 if __name__ == "__main__":

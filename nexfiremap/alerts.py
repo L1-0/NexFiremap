@@ -34,6 +34,7 @@ from typing import Any
 
 import httpx
 
+from . import netguard
 from .config import Settings
 from .db import Database
 from .ingest import IngestError
@@ -149,6 +150,13 @@ class AlertManager:
             timeout=httpx.Timeout(self.settings.request_timeout_s),
             headers={"User-Agent": self.settings.tile_user_agent},
             follow_redirects=True,
+            # Untrusted: `_poll_feed` follows links taken out of the feed
+            # *document*, so a spoofed or compromised upstream can name any
+            # address it likes and have this server connect to it blind. The
+            # hook fires per request, redirect hops included - a public URL
+            # answering 302 to an internal one is the obvious way past a check
+            # done only on the URL an operator configured.
+            event_hooks={"request": [netguard.request_guard(trusted=False)]},
         )
         self._task = asyncio.create_task(self._loop(), name="cap-poll")
         log.info("CAP alert polling started for %d feed(s)", len(self.feeds))

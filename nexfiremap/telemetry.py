@@ -277,44 +277,83 @@ class TelemetryManager:
         received_epoch = datetime.fromisoformat(received_at).timestamp()
         prepared: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for raw in reports:
+        # Per-report validation failures are collected rather than raised.
+        #
+        # One TCP frame from a TAK server carries many devices' positions, so an
+        # all-or-nothing batch made *one* crew member's phone with a skewed
+        # clock reject everybody else's position too - and the CoT gateway just
+        # logs a warning, so the whole fleet quietly went stale on the map with
+        # nothing on screen to explain it. A unit vanishing is the worst failure
+        # this subsystem has; losing one bad report is not.
+        #
+        # Structural problems with the batch itself (not a list, over the size
+        # cap, rate limited) still raise above: those are not about one device.
+        rejected: list[dict[str, Any]] = []
+
+        def reject(index: int, raw: Any, reason: str) -> None:
+            rejected.append({
+                "index": index,
+                "external_id": _text(raw.get("external_id"), 200) if isinstance(raw, dict) else None,
+                "callsign": _text(raw.get("callsign"), 200) if isinstance(raw, dict) else None,
+                "reason": reason,
+            })
+
+        for index, raw in enumerate(reports):
             if not isinstance(raw, dict):
-                raise TelemetryError("each position must be an object")
+                reject(index, raw, "each position must be an object")
+                continue
             external_id, callsign = _text(raw.get("external_id"), 200), _text(raw.get("callsign"), 200)
             if not external_id or not callsign:
-                raise TelemetryError("external_id and callsign are required")
+                reject(index, raw, "external_id and callsign are required")
+                continue
             if external_id in seen:
-                raise TelemetryError("external_id is duplicated within the batch")
-            seen.add(external_id)
-            observed_at, epoch = _time(raw.get("observed_at"))
+                reject(index, raw, "external_id is duplicated within the batch")
+                continue
+            try:
+                observed_at, epoch = _time(raw.get("observed_at"))
+            except TelemetryError as exc:
+                reject(index, raw, str(exc))
+                continue
             if epoch > received_epoch + 300:
-                raise TelemetryError("observed_at is more than five minutes in the future")
+                reject(index, raw, "observed_at is more than five minutes in the future")
+                continue
             try:
                 lat, lon = float(raw["latitude"]), float(raw["longitude"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise TelemetryError("latitude and longitude must be numbers") from exc
+            except (KeyError, TypeError, ValueError):
+                reject(index, raw, "latitude and longitude must be numbers")
+                continue
             if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
-                raise TelemetryError("latitude or longitude is outside the valid range")
+                reject(index, raw, "latitude or longitude is outside the valid range")
+                continue
             numeric: dict[str, float | None] = {}
+            problem: str | None = None
             for key in ("altitude_m", "speed_kmh", "heading_deg", "accuracy_m"):
                 value = raw.get(key)
                 try:
                     numeric[key] = None if value is None else float(value)
-                except (TypeError, ValueError) as exc:
-                    raise TelemetryError(f"{key} must be numeric") from exc
+                except (TypeError, ValueError):
+                    problem = f"{key} must be numeric"
+                    break
                 if numeric[key] is not None and not math.isfinite(numeric[key]):
-                    raise TelemetryError(f"{key} must be finite")
-            if numeric["speed_kmh"] is not None and numeric["speed_kmh"] < 0:
-                raise TelemetryError("speed_kmh cannot be negative")
-            if numeric["accuracy_m"] is not None and numeric["accuracy_m"] < 0:
-                raise TelemetryError("accuracy_m cannot be negative")
-            if numeric["heading_deg"] is not None and not 0 <= numeric["heading_deg"] <= 360:
-                raise TelemetryError("heading_deg must be between 0 and 360")
+                    problem = f"{key} must be finite"
+                    break
+            if problem is None:
+                if numeric["speed_kmh"] is not None and numeric["speed_kmh"] < 0:
+                    problem = "speed_kmh cannot be negative"
+                elif numeric["accuracy_m"] is not None and numeric["accuracy_m"] < 0:
+                    problem = "accuracy_m cannot be negative"
+                elif numeric["heading_deg"] is not None and not 0 <= numeric["heading_deg"] <= 360:
+                    problem = "heading_deg must be between 0 and 360"
+            if problem is not None:
+                reject(index, raw, problem)
+                continue
             resource_id = _text(raw.get("resource_id"), 64) or None
             if resource_id and self.db.conn.execute(
                 "SELECT 1 FROM incident_resources WHERE id=? AND incident_id=?", (resource_id, incident_id)
             ).fetchone() is None:
-                raise TelemetryError("resource_id does not belong to this incident")
+                reject(index, raw, "resource_id does not belong to this incident")
+                continue
+            seen.add(external_id)
             canonical = {"external_id": external_id, "callsign": callsign, "resource_id": resource_id,
                          "observed_at": observed_at, "latitude": lat, "longitude": lon, **numeric}
             # Preserve the complete sender object (including provider-specific
@@ -325,6 +364,12 @@ class TelemetryManager:
             # with different key ordering or whitespace still hashes the same.
             prepared.append({**canonical, "observed_epoch": epoch, "raw_json": raw_json,
                              "payload_sha256": hashlib.sha256(raw_json.encode()).hexdigest()})
+
+        # Nothing usable at all still raises, so a single-device feed - the
+        # ordinary HTTP case - reports its error exactly as before instead of
+        # silently succeeding with zero positions.
+        if not prepared and rejected:
+            raise TelemetryError(rejected[0]["reason"])
 
         accepted = replayed = 0
         with self.db._write_lock:
@@ -420,6 +465,12 @@ class TelemetryManager:
 
         return {"source_id": source_id, "incident_id": incident_id, "accepted": accepted,
                 "warnings": warnings,
+                # Reports skipped for their own data problems, named individually
+                # so a bad device is diagnosable. Silently dropping them would
+                # trade one loud failure (the old whole-batch rejection) for a
+                # quiet one, which for a unit that is no longer on the map is
+                # not an improvement.
+                "rejected": rejected,
                 "replayed": replayed, "received_at": received_at}
 
     def _evaluate_safety(self, incident_id: str, prepared: list[dict[str, Any]]) -> list[dict[str, Any]]:

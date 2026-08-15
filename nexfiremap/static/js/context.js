@@ -240,3 +240,58 @@ export async function fetchJson(url) {
   if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
   return payload;
 }
+
+// ------------------------------------------------- stale-replay surfacing
+
+/** Header the service worker sets on a response it replayed from cache. */
+const STALE_HEADER = "x-nexfiremap-stale";
+const CACHED_AT_HEADER = "x-nexfiremap-cached-at";
+
+/** Shows or clears the "showing cached data" banner.
+ *
+ * The service worker serves a cached API response when the command server is
+ * unreachable. That is the right behaviour - a field client keeping the last
+ * known picture beats a blank screen - but the replay used to be
+ * indistinguishable from a live 200, so days-old detections and unit positions
+ * rendered as current and every error path in the app was unreachable. The
+ * banner is the difference between an offline-tolerant tool and one that lies.
+ * @param {?string} cachedAt - ISO time the cached copy was fetched, if known. */
+function showStale(cachedAt) {
+  const banner = document.getElementById("stale-banner");
+  if (!banner) return;
+  if (cachedAt === null) {
+    banner.hidden = true;
+    return;
+  }
+  const when = cachedAt ? new Date(cachedAt) : null;
+  const time = when && !Number.isNaN(when.getTime())
+    ? when.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : null;
+  banner.textContent = time
+    ? `Command server unreachable - showing cached data from ${time}`
+    : "Command server unreachable - showing cached data";
+  banner.hidden = false;
+}
+
+// Installed once, at module scope, wrapping fetch itself rather than only
+// fetchJson: most call sites in app.js use fetch directly, and a marker that
+// only some of them honoured would be worse than none - it would make the
+// banner's absence meaningless.
+if (typeof window !== "undefined" && !window.__nexStaleWatch) {
+  window.__nexStaleWatch = true;
+  const nativeFetch = window.fetch.bind(window);
+  window.fetch = async (...args) => {
+    const response = await nativeFetch(...args);
+    try {
+      const url = new URL(response.url || String(args[0]), window.location.origin);
+      if (url.pathname.startsWith("/api/")) {
+        showStale(response.headers.get(STALE_HEADER)
+          ? response.headers.get(CACHED_AT_HEADER) || ""
+          : null);
+      }
+    } catch (_) {
+      /* never let the banner's bookkeeping break the request it observed */
+    }
+    return response;
+  };
+}

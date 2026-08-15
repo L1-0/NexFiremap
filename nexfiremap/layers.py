@@ -45,6 +45,7 @@ from uuid import uuid4
 
 import httpx
 
+from . import netguard
 from .config import Settings
 from .db import Database
 from .geo import tile_bounds_3857, tile_bounds_4326
@@ -429,7 +430,14 @@ class LayerRegistry:
 
         headers = {"User-Agent": self.settings.tile_user_agent} if self.settings else {}
         try:
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+            # Trusted: an administrator supplied this endpoint, and reaching a
+            # WMS on the incident LAN is the point of the feature. Loopback and
+            # link-local (the cloud metadata address) are still refused, and the
+            # hook re-checks each redirect hop.
+            async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=True, headers=headers,
+                event_hooks={"request": [netguard.request_guard(trusted=True)]},
+            ) as client:
                 response = await client.get(capabilities_url)
         except httpx.HTTPError as exc:
             # A probe failure is an ordinary outcome on an incident LAN with no

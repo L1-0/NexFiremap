@@ -14,6 +14,13 @@
 </head>
 <body>
 
+<!-- ========================= Stale-data banner ============================
+     Shown when the service worker had to replay a cached API response because
+     the command server was unreachable. Without it, offline replays arrive as
+     ordinary 200s and days-old detections read as the current picture - see
+     service-worker.js. Hidden until app.js sees the marker header. -->
+<div id="stale-banner" class="stale-banner" role="status" aria-live="polite" hidden></div>
+
 <!-- ============================ Sign-in dialog ============================
      Incident LAN auth (api.py / security.py). Native <dialog>, opened by
      app.js when a request needs a session the browser doesn't have yet. -->

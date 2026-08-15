@@ -19,6 +19,7 @@ from typing import Any, Iterator
 
 import httpx
 
+from . import netguard
 from .basemaps import BASEMAPS, OVERLAYS, TERRAIN_DEM
 from .config import Settings
 
@@ -92,6 +93,11 @@ class TileCache:
             timeout=httpx.Timeout(20.0),
             headers={"User-Agent": settings.tile_user_agent},
             follow_redirects=True,
+            # Trusted: every URL here comes from the built-in basemap table or
+            # an administrator-registered layer, and an incident-LAN tile
+            # server on a private address is a supported deployment. The guard
+            # still refuses loopback and link-local, and re-checks redirects.
+            event_hooks={"request": [netguard.request_guard(trusted=True)]},
         )
         # Caps how many upstream tile fetches run at once - keeps a fast pan
         # from bursting a tile provider, in line with normal usage-policy

@@ -1458,6 +1458,23 @@ code {
    than an id so any later one-shot entry groups itself the same way. */
 .nf-tool.is-action { margin-top: 6px; border-top: 1px solid var(--border); border-radius: 0 0 6px 6px; padding-top: 10px; }
 
+/* Stale-replay banner. Deliberately loud and full-width: it is saying that
+   everything else on screen may be out of date, which is not a footnote. */
+.stale-banner {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 2000;  /* over the topbar and the settings overlay */
+  padding: 6px 12px;
+  background: #8a3b12;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+  letter-spacing: .01em;
+}
+.stale-banner[hidden] { display: none; }
+@media print { .stale-banner { display: none !important; } }
+
 /* ------------------------------------------------------------ settings pane */
 
 .nf-set-overlay {
