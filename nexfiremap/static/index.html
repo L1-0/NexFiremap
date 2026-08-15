@@ -171,16 +171,35 @@
        tactics/calculators, model provenance, accounts, products, merge
        conflicts) - each gated to its owning app(s) via data-app. -->
   <section class="block operations-block" aria-labelledby="h-operations" data-app="incident-command ingest eventview">
-    <div class="block-head">
+    <!-- Two heads for one section: NexIncidentCommand and NexEventView get the
+         incident-command header with its selector; NexIngest is a feed
+         setup/status console and deliberately does NOT show command records -
+         its tools act on whatever incident is active, announced read-only in
+         #ingest-incident-line below (set by feeds.js via context.js). -->
+    <div class="block-head" data-app="incident-command eventview">
       <h2 id="h-operations">Incident command</h2>
       <button id="btn-new-incident" class="link-btn" type="button">new incident</button>
     </div>
-    <label class="field" data-app="incident-command ingest eventview">
+    <div class="block-head" data-app="ingest">
+      <h2 id="h-ingest">Live ingest</h2>
+      <button id="btn-feeds-refresh" class="link-btn" type="button">refresh status</button>
+    </div>
+    <label class="field" data-app="incident-command eventview">
       <span>Active incident</span>
       <select id="ops-incident"><option value="">No incident selected</option></select>
     </label>
+    <p class="hint" id="ingest-incident-line" data-app="ingest">No active incident &mdash; position feeds, drone and
+      field imports attach to the incident selected in NexIncidentCommand.</p>
+
+    <details class="ops-details" id="ops-feed-status" data-app="ingest" open>
+      <summary>Inbound channel status</summary>
+      <p class="hint">Every configured live-data channel and its last activity. "Disabled" means the channel is not
+        configured on this server (see <code>.env</code>) &mdash; that is a setting, not an error.</p>
+      <div id="feed-status-grid" class="feed-status-grid" aria-live="polite"><p class="hint">Checking channels&hellip;</p></div>
+    </details>
+
     <div id="ops-workspace" hidden>
-      <div data-app="incident-command ingest eventview">
+      <div data-app="incident-command eventview">
         <label class="field"><span>Operator / unit</span><input id="ops-operator" maxlength="200" value="local operator"></label>
         <div class="ops-context-grid">
           <label class="field"><span>Operational period</span><select id="ops-period"></select></label>
@@ -312,6 +331,26 @@
         <label class="field"><span>Capabilities</span><input id="ops-resource-capabilities" maxlength="10000"></label>
         <label class="field"><span>Assignment</span><input id="ops-resource-assignment" maxlength="10000"></label>
         <div class="button-row"><button id="btn-save-resource" class="btn ghost" type="button">add resource</button><button id="btn-cancel-resource" class="btn ghost" type="button" hidden>cancel edit</button></div>
+      </details>
+
+      <details class="ops-details" id="ops-position-feeds" data-app="ingest">
+        <summary>Position feeds (device tokens)</summary>
+        <p class="hint">Each field device posts positions with its own token, checked per request &mdash; no browser
+          session involved. A token is shown exactly once, at creation or rotation; only its hash is stored, so a
+          lost token can only be rotated, never recovered. Rotating locks the old token out immediately.</p>
+        <div id="position-feed-list"><p class="hint">No feeds loaded.</p></div>
+        <div class="ops-context-grid">
+          <label class="field"><span>New feed name</span><input id="feed-new-name" maxlength="200" placeholder="e.g. Engine 41 tablet"></label>
+          <label class="field"><span>Device kind</span><select id="feed-new-kind">
+            <option value="vehicle_gps">vehicle GPS</option>
+            <option value="crew_device">crew device</option>
+            <option value="drone">drone</option>
+            <option value="tracker">radio tracker</option>
+          </select></label>
+        </div>
+        <div class="button-row"><button id="btn-feed-create" class="btn ghost" type="button">create feed</button></div>
+        <div id="feed-token-reveal" hidden></div>
+        <p id="feed-admin-status" class="hint" aria-live="polite"></p>
       </details>
 
       <details class="ops-details" id="ops-live-telemetry" data-app="ingest">
@@ -803,5 +842,9 @@
 <!-- Optional: adds nothing to the page (not even its control) unless the
      server reports configured CAP warning feeds via /api/config. -->
 <script type="module" src="/static/js/alerts.js"></script>
+<!-- NexIngest's live-feed console: inbound channel status plus position-feed
+     administration. Standalone like alerts.js - reaches shared state only
+     through context.js (active incident) and its own fetches. -->
+<script type="module" src="/static/js/feeds.js"></script>
 </body>
 </html>

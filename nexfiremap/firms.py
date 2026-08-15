@@ -295,8 +295,16 @@ class FirmsClient:
         if not self.map_key:
             return {"ok": False, "error": "no map key configured"}
         try:
+            # A short timeout of its own, rather than the client's fetch
+            # timeout (90 s by default, sized for a multi-day CSV download).
+            # This call answers "how much of my key's budget is left" for a
+            # status panel; on a blackholing network the fetch timeout would
+            # hold that panel's request open for a minute and a half to report
+            # a number nobody is waiting on. The result - success or failure -
+            # is cached for 60 s by the caller either way.
             response = await self._client.get(
-                KEY_STATUS_URL, params={"MAP_KEY": self.map_key}
+                KEY_STATUS_URL, params={"MAP_KEY": self.map_key},
+                timeout=httpx.Timeout(10.0),
             )
             response.raise_for_status()
         except httpx.HTTPError as exc:

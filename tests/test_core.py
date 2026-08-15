@@ -295,6 +295,85 @@ def test_purge_cascades_events() -> None:
 
     test_purge_beyond_sql_variable_limit()
     test_failed_write_does_not_leak_a_transaction()
+    test_unbounded_tables_have_retention()
+
+
+def test_unbounded_tables_have_retention() -> None:
+    """The tables that grow forever must be bounded - carefully, by kind.
+
+    Four tables had no delete path at all. Two of them (`eumetsat_fires`,
+    `swath_coverage`) are caches of the same kind as detections - refetchable,
+    recomputable - and now expire on the same window. Position history is not:
+    it is evidence of where a crew was, so it gets its own far longer window
+    and is never removed while its incident is open. The audit log is not
+    purged at all; its size is reported so a human can decide.
+    """
+    import json
+    import tempfile
+    from datetime import timezone as _tz
+
+    with tempfile.TemporaryDirectory() as temp:
+        db = Database(Path(temp) / "retention.sqlite3")
+        now_iso = datetime.now(_tz.utc).isoformat()
+        old_ts = int(datetime(2026, 6, 1, tzinfo=_tz.utc).timestamp())
+
+        db.conn.execute(
+            "INSERT INTO eumetsat_fires (product_id, latitude, longitude, acq_ts, confidence)"
+            " VALUES ('p1', 40.0, 10.0, ?, 'high')", (old_ts,))
+        db.conn.execute(
+            "INSERT INTO swath_coverage (satellite, cell_x, cell_y, day, computed_at)"
+            " VALUES ('N', 1, 1, '2026-06-01', ?)", (old_ts,))
+
+        # Built through the real stores rather than hand-written SQL, so the
+        # fixture cannot drift from the schema and the retention rule is
+        # exercised against rows the application would actually produce.
+        from nexfiremap.operations import OperationsStore
+        from nexfiremap.telemetry import TelemetryManager
+        from nexfiremap.config import load_settings
+
+        store = OperationsStore(db)
+        telemetry = TelemetryManager(store, load_settings())
+
+        def add_incident(name: str, status: str, updated: str) -> str:
+            incident = store.create_incident({"name": name}, "t")
+            feed = telemetry.create_source(incident["id"], {"name": "feed"}, "t")
+            telemetry.ingest(feed["id"], feed["ingest_token"], [{
+                "external_id": f"ext-{name}", "callsign": "FL 1",
+                "observed_at": updated, "latitude": 48.0, "longitude": 11.0,
+            }])
+            with db._write():
+                db.conn.execute("UPDATE incidents SET status=?, updated_at=? WHERE id=?",
+                                (status, updated, incident["id"]))
+                db.conn.commit()
+            return incident["id"]
+
+        closed_old = add_incident("closed-old", "closed", "2026-01-05T10:00:00+00:00")
+        open_old = add_incident("open-old", "active", "2026-01-05T10:00:00+00:00")
+        closed_recent = add_incident("closed-recent", "closed", now_iso)
+
+        db.purge_older_than(date(2026, 7, 1))
+        check("eumetsat_fires expire on the detection window",
+              db.conn.execute("SELECT COUNT(*) FROM eumetsat_fires").fetchone()[0] == 0)
+        check("swath_coverage expires on the detection window",
+              db.conn.execute("SELECT COUNT(*) FROM swath_coverage").fetchone()[0] == 0)
+
+        removed = db.purge_positions(date(2026, 6, 1))
+        survivors = {r[0] for r in db.conn.execute(
+            "SELECT incident_id FROM vehicle_position_reports").fetchall()}
+        check("a closed, long-past incident's positions are removed", removed == 1, str(removed))
+        check("an OPEN incident keeps its positions however old they are",
+              open_old in survivors, str(survivors))
+        check("a recently closed incident keeps its positions",
+              closed_recent in survivors, str(survivors))
+        check("...and the closed old one is gone", closed_old not in survivors, str(survivors))
+
+        sizes = db.table_sizes()
+        check("table_sizes reports the audit log rather than purging it",
+              "incident_audit_log" in sizes, json.dumps(sizes))
+        check("table_sizes counts surviving positions", sizes["vehicle_position_reports"] == 2,
+              json.dumps(sizes))
+
+        db.close()
 
 
 def test_failed_write_does_not_leak_a_transaction() -> None:

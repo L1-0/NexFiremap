@@ -452,6 +452,61 @@ def test_clear_pass_suppression_does_not_compound_over_many_passes() -> None:
     )
 
 
+def test_cloud_archive_gap_triggers_backfill() -> None:
+    """The archive's unfinalised tail must be recognised as a gap, not as clear sky.
+
+    Open-Meteo's archive is a reanalysis product days behind real time, so the
+    most recent hours come back absent. Every missing hour is then treated as
+    fully clear, which applies *full* suppression to the heat layer - a fire
+    under multi-day overcast damped by passes that may have been looking at
+    cloud tops. And because pass combination is recency-weighted, the deciding
+    pass is nearly always inside that same unfinalised window, so this was the
+    common case rather than an edge one.
+
+    Pure decision logic, so it is testable without touching the network - which
+    matters here, because the code path it guards only runs when the network is
+    up and this suite runs offline.
+    """
+    print("\nCloud archive lag detection")
+    import time as _time
+
+    from nexfiremap.likelihood import CLOUD_ARCHIVE_LAG_DAYS, _needs_recent_backfill
+
+    now = _time.time()
+    hour = 3600.0
+
+    # A window ending an hour ago with nothing in the recent tail: the archive
+    # has not settled it, so the forecast endpoint must be asked.
+    check(
+        "a recent window with no samples asks for backfill",
+        _needs_recent_backfill({}, now - 6 * hour, now - hour),
+    )
+
+    # The same window, but the tail is already populated - nothing to fetch.
+    covered = {now - i * hour: 40.0 for i in range(1, 7)}
+    check(
+        "a recent window that is already covered does not",
+        not _needs_recent_backfill(covered, now - 6 * hour, now - hour),
+    )
+
+    # A window entirely older than the lag is settled; the archive is
+    # authoritative there and a second request would be waste.
+    old_end = now - (CLOUD_ARCHIVE_LAG_DAYS + 5) * 86400.0
+    check(
+        "a fully settled window never triggers a backfill",
+        not _needs_recent_backfill({}, old_end - 6 * hour, old_end),
+    )
+
+    # A long window straddling the boundary: settled hours present, recent tail
+    # missing. This is the shape a real multi-day event produces, and the one
+    # that silently defaulted to "clear" before.
+    straddling = {old_end + i * hour: 30.0 for i in range(5)}
+    check(
+        "a window straddling the lag boundary backfills its recent tail",
+        _needs_recent_backfill(straddling, old_end, now - hour),
+    )
+
+
 def test_clear_pass_cloud_cover_softens_suppression() -> None:
     print("\n_clear_pass_suppression: a cloudy 'clear' pass suppresses less than a clear one")
     # further_plan.md section 2's tri-state model treats cloud as "unknown",
@@ -534,6 +589,7 @@ def main() -> int:
     test_analyze_event_clear_pass_suppression()
     test_clear_pass_suppression_does_not_compound_over_many_passes()
     test_clear_pass_cloud_cover_softens_suppression()
+    test_cloud_archive_gap_triggers_backfill()
 
     print()
     if failures:

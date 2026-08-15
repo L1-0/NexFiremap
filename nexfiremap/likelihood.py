@@ -108,6 +108,13 @@ CLEAR_PASS_CLOUD_MIN_CLARITY = 0.3
 # a pass for a data gap that isn't its fault.
 CLEAR_PASS_CLOUD_MAX_GAP_S = 2 * 3600.0
 OPEN_METEO_CLOUD_URL = "https://archive-api.open-meteo.com/v1/archive"
+#: Near-real-time endpoint used to fill the hours the archive has not settled
+#: yet - see `_fetch_cloud_cover`. Same source and reasoning as terrain.py's
+#: wind/humidity backfill.
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+#: How far back the archive can be behind. Hours newer than this are assumed
+#: unfinalised and worth asking the forecast endpoint for.
+CLOUD_ARCHIVE_LAG_DAYS = 7
 
 # Same OKLCH-validated single-hue fire ramp used for point styling in
 # app.css (dark-tone steps) - one visual language for "how hot/how recent"
@@ -180,6 +187,7 @@ def _fetch_cloud_cover(lat: float, lon: float, start_ts: float, end_ts: float) -
     this is explicitly a best-effort softening, not something event
     analysis should ever fail over.
     """
+    out: dict[float, float] = {}
     try:
         import httpx
 
@@ -199,18 +207,75 @@ def _fetch_cloud_cover(lat: float, lon: float, start_ts: float, end_ts: float) -
         )
         response.raise_for_status()
         hourly = response.json()["hourly"]
-        out: dict[float, float] = {}
         for t, cover in zip(hourly["time"], hourly["cloud_cover"]):
             if cover is None:
                 continue
             ts = datetime.fromisoformat(t).replace(tzinfo=timezone.utc).timestamp()
             out[ts] = float(cover)
-        return out
     except Exception:
         log.warning(
-            "Cloud-cover lookup failed - clear passes keep full suppression weight", exc_info=True
+            "Cloud-cover archive lookup failed - falling back to the forecast window", exc_info=True
         )
-        return {}
+
+    # The archive is a reanalysis product finalised days behind real time, so
+    # the most recent hours - the ones that decide this - routinely come back
+    # null or absent. Every missing hour is then treated as *clear*, which
+    # applies full suppression: the heat layer is damped by passes that may
+    # well have been looking at cloud tops. Since the pass combination is
+    # recency-weighted, the winning pass is almost always inside that same
+    # unfinalised window, so this was not a rare edge.
+    #
+    # terrain.py already learned this for wind and humidity and backfills from
+    # the forecast endpoint, which blends recent observation rather than
+    # waiting on reanalysis. The same fix, applied here, for the same reason -
+    # duplicated rather than shared because terrain.py imports *this* module,
+    # so the dependency cannot run the other way.
+    if _needs_recent_backfill(out, start_ts, end_ts):
+        out.update(_fetch_recent_cloud_cover(lat, lon, start_ts, end_ts, have=out))
+    return out
+
+
+def _needs_recent_backfill(have: dict[float, float], start_ts: float, end_ts: float) -> bool:
+    """Whether the requested window's recent tail is missing from the archive."""
+    recent_cutoff = datetime.now(timezone.utc).timestamp() - CLOUD_ARCHIVE_LAG_DAYS * 86400.0
+    if end_ts < recent_cutoff:
+        return False  # entirely settled; the archive is authoritative
+    tail_start = max(start_ts, recent_cutoff)
+    return not any(tail_start <= ts <= end_ts for ts in have)
+
+
+def _fetch_recent_cloud_cover(lat: float, lon: float, start_ts: float, end_ts: float,
+                              *, have: dict[float, float]) -> dict[float, float]:
+    """Cloud cover for the recent tail, from Open-Meteo's forecast endpoint.
+
+    Only fills hours the archive did not supply - an archive value is the
+    settled one and is never overwritten by a near-real-time estimate.
+    """
+    filled: dict[float, float] = {}
+    try:
+        import httpx
+
+        response = httpx.get(
+            OPEN_METEO_FORECAST_URL,
+            params={
+                "latitude": lat, "longitude": lon, "hourly": "cloud_cover",
+                "past_days": CLOUD_ARCHIVE_LAG_DAYS, "forecast_days": 1, "timezone": "UTC",
+            },
+            timeout=15.0,
+        )
+        response.raise_for_status()
+        hourly = response.json()["hourly"]
+        for t, cover in zip(hourly["time"], hourly["cloud_cover"]):
+            if cover is None:
+                continue
+            ts = datetime.fromisoformat(t).replace(tzinfo=timezone.utc).timestamp()
+            if start_ts <= ts <= end_ts and ts not in have:
+                filled[ts] = float(cover)
+    except Exception:
+        # Still best-effort: with neither endpoint reachable the caller keeps
+        # the purely geometric suppression, which is the documented behaviour.
+        log.warning("Recent cloud-cover backfill failed", exc_info=True)
+    return filled
 
 
 def _clear_pass_suppression(

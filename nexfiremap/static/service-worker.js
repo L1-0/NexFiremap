@@ -42,12 +42,25 @@ self.addEventListener("fetch", (event) => {
     try {
       const response = await fetch(request);
       if (response.ok && (isApi || SHELL.includes(url.pathname))) {
-        const cache = await caches.open(isApi ? READ_CACHE : SHELL_CACHE);
-        // Stamp when this was actually fetched. Without it a replay can only
-        // say "this is old", not "this is from 09:14" - and the second is what
-        // lets an operator judge whether it still means anything.
-        await cache.put(request, await stamp(response.clone(), CACHED_AT, new Date().toISOString()));
-        if (isApi) trimReadCache();
+        // Cached *off* the response path, via waitUntil. Stamping means reading
+        // the body to a blob, and awaiting that before returning would put a
+        // full copy of every API payload between the server and the page - on
+        // every single request. The page gets its response immediately; the
+        // worker stays alive to finish writing.
+        const copy = response.clone();
+        event.waitUntil((async () => {
+          try {
+            const cache = await caches.open(isApi ? READ_CACHE : SHELL_CACHE);
+            // Stamp when this was actually fetched. Without it a replay can
+            // only say "this is old", not "this is from 09:14" - and the
+            // second is what lets an operator judge whether it still means
+            // anything.
+            await cache.put(request, await stamp(copy, CACHED_AT, new Date().toISOString()));
+            if (isApi) await trimReadCache();
+          } catch (_) {
+            /* caching is an optimisation; never let it affect the response */
+          }
+        })());
       }
       return response;
     } catch (_) {

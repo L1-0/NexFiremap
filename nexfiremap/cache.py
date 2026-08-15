@@ -575,6 +575,16 @@ class CacheManager:
                 coverage,
                 cutoff.isoformat(),
             )
+        # Position history is on its own, much longer window and never touches
+        # an open incident - see `Database.purge_positions`. Kept out of the
+        # tuple this returns so the existing "detections, coverage" contract
+        # (and every caller and test of it) is unchanged.
+        retention_days = getattr(self.settings, "position_retention_days", 0)
+        if retention_days > 0:
+            positions = self.db.purge_positions(utc_today() - timedelta(days=retention_days))
+            if positions:
+                log.info("Purged %d position report(s) from incidents closed before %s",
+                         positions, (utc_today() - timedelta(days=retention_days)).isoformat())
         return detections, coverage
 
     # --------------------------------------------------------------- status

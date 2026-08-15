@@ -28,7 +28,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -1475,6 +1475,24 @@ class Database:
                 "DELETE FROM coverage WHERE day < ?", (cutoff_day,)
             ).rowcount
 
+            # Two more caches that are the same *kind* of thing as detections
+            # and coverage - observations and derived geometric bookkeeping,
+            # both recomputable - but which had no retention path at all.
+            # `eumetsat_fires` accumulates global fire pixels every ~10 minutes
+            # and `swath_coverage` a row per satellite/cell/day, forever. On a
+            # week-scale incident deployment they are the realistic way a field
+            # laptop's disk fills, and a full disk stops the whole application,
+            # not just the layer that grew.
+            #
+            # Deliberately *not* extended to `incident_audit_log`: an audit
+            # trail is evidence, and silently deleting it to save space is a
+            # policy decision for whoever owns the incident record, not
+            # something upkeep should decide on its own. Its size is reported
+            # instead - see `table_sizes`.
+            cutoff_epoch = datetime.combine(cutoff, datetime.min.time(), tzinfo=timezone.utc).timestamp()
+            self.conn.execute("DELETE FROM eumetsat_fires WHERE acq_ts < ?", (cutoff_epoch,))
+            self.conn.execute("DELETE FROM swath_coverage WHERE day < ?", (cutoff_day,))
+
             if affected:
                 placeholders = "SELECT event_id FROM temp.purge_events"
                 # Drop events with no surviving members *before* the
@@ -1542,6 +1560,58 @@ class Database:
             self.conn.execute("DROP TABLE IF EXISTS temp.purge_events")
             self.conn.commit()
         return max(det, 0), max(cov, 0)
+
+    def purge_positions(self, cutoff: date) -> int:
+        """Drop position reports from incidents closed before ``cutoff``.
+
+        Separate from `purge_older_than` because position history is a
+        different kind of record. Detections are a cache of somebody else's
+        data, refetchable at will; a position report is evidence of where a
+        crew was, and is not recoverable once gone. So it gets its own, far
+        longer window (`settings.position_retention_days`), and two guards:
+
+        * an incident that is not **closed** is never touched, whatever the age
+          of its reports - an incident running longer than the retention window
+          is a large incident, precisely the one whose history matters most;
+        * age is measured from the incident's own last update, not from each
+          report, so a closed incident's track is removed whole rather than
+          eroded from the front into a partial trail that looks like a unit
+          appeared from nowhere.
+
+        Returns the number of reports removed.
+        """
+        cutoff_iso = cutoff.isoformat()
+        with self._write():
+            removed = self.conn.execute(
+                """
+                DELETE FROM vehicle_position_reports
+                WHERE incident_id IN (
+                    SELECT id FROM incidents
+                    WHERE status = 'closed' AND substr(updated_at, 1, 10) < ?
+                )
+                """,
+                (cutoff_iso,),
+            ).rowcount
+            self.conn.commit()
+        return max(removed, 0)
+
+    def table_sizes(self) -> dict[str, int]:
+        """Row counts for the tables that grow without bound, for `/api/status`.
+
+        Reported rather than purged for `incident_audit_log`: an audit trail is
+        evidence, and deleting it to reclaim space is a decision for whoever
+        owns the incident record. Making the size visible is what lets them
+        make it, instead of discovering the problem as a full disk.
+        """
+        watched = ("detections", "vehicle_position_reports", "incident_audit_log",
+                   "eumetsat_fires", "swath_coverage", "alerts")
+        sizes: dict[str, int] = {}
+        for table in watched:
+            try:
+                sizes[table] = int(self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            except sqlite3.Error:  # pragma: no cover - table absent on an old file
+                continue
+        return sizes
 
     def vacuum(self) -> None:
         """Reclaim space left by purged rows by rewriting the whole file.

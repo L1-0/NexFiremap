@@ -272,6 +272,15 @@ class Settings:
     position_max_speed_kmh: float = 180.0
     telemetry_max_batch: int = 1000
     telemetry_requests_per_minute: int = 120
+    # How long a position report is kept once its incident is closed. Position
+    # history is operational evidence - who was where, when - so it is not
+    # discarded on the ordinary detection retention window, and never while the
+    # incident is still open regardless of age. It is also the highest-volume
+    # table in the application: a twenty-vehicle fleet reporting every few
+    # seconds is on the order of a hundred megabytes a week, and it previously
+    # had no retention path at all. A year is long enough to outlast any
+    # plausible after-action review; set 0 to keep positions indefinitely.
+    position_retention_days: int = 365
     drone_dir: Path = field(default_factory=lambda: ROOT_DIR / "data" / "drone")
     drone_max_upload_mb: int = 200
     drone_max_pixels: int = 200_000_000

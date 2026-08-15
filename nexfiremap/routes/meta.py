@@ -189,6 +189,12 @@ async def api_status(request: Request, key: bool = Query(True)) -> Response:
         {
             "has_map_key": settings.has_map_key,
             "cache": stats,
+            # Row counts for the tables that grow with time rather than with
+            # the map's extent. The audit log in particular is deliberately
+            # never purged - it is evidence - so its size has to be visible
+            # somewhere, or the first sign of it is a full disk during an
+            # incident.
+            "table_rows": await asyncio.to_thread(db.table_sizes),
             "fetcher": cache.status(),
             "tiles": tile_stats,
             "jobs": job_stats,

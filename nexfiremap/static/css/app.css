@@ -1624,3 +1624,52 @@ body.nf-tool-measure #map { cursor: crosshair; }
   font-size: 10px;
   line-height: 1.2;
 }
+
+/* --- NexIngest live-feed console (feeds.js) ------------------------------
+   Channel cards and position-feed rows. Reuses the panel's surface/border
+   vocabulary; the state pill is the only new element - green/amber semantics
+   deliberately come from --cat-3/--warning/--critical rather than the fire
+   ramp, which is reserved for data. */
+.feed-status-grid { display: flex; flex-direction: column; gap: 8px; }
+.feed-card {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.feed-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.feed-state {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 1px 7px;
+  border-radius: 99px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.feed-state-ok { color: var(--cat-3); border-color: var(--cat-3); }
+.feed-state-off { color: var(--text-muted); }
+.feed-state-err { color: var(--critical); border-color: var(--critical); }
+.feed-fact {
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  padding: 1px 0;
+}
+.feed-fact > span:first-child { color: var(--text-muted); flex: none; }
+.feed-fact > span:last-child { text-align: right; overflow-wrap: anywhere; }
+.feed-fact code { font-size: 10.5px; user-select: all; }
+#feed-token-reveal {
+  margin-top: 8px;
+  border: 1px solid var(--warning);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
