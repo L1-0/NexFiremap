@@ -33,6 +33,19 @@
     <p id="auth-error" class="auth-error" role="alert" aria-live="polite"></p>
     <button class="btn" type="submit">Sign in</button>
   </form>
+  <!-- Agency SSO. The OIDC flow (code + PKCE, discovery, single-use state) has
+       been complete and tested on both sides since the federation work, and
+       /api/auth/providers exists precisely so this screen can offer it - but
+       nothing called it, so the only way in was to hand-type /auth/oidc/login,
+       which no field user will do. INCIDENT_LAN_RUNBOOK.md:71 and MANUAL 11.2.5
+       both promise "a separate button on the login screen"; this is it.
+       Hidden unless the server reports a provider configured, so an install
+       without SSO shows no dead control. Local password login stays above it as
+       the documented break-glass path. -->
+  <div id="auth-federated" hidden>
+    <p class="auth-divider">or</p>
+    <a id="auth-oidc-button" class="btn ghost" href="/auth/oidc/login">Sign in with your agency account</a>
+  </div>
 </dialog>
 
 <div id="map" role="application" aria-label="Fire detection map"></div>
@@ -411,7 +424,16 @@
           <label class="field"><span>Georeference type</span><select id="ops-drone-georef-kind"><option value="">evidence only</option><option value="nadir">nadir</option><option value="orthorectified">orthorectified</option></select></label>
         </div>
         <label class="field"><span>Four corners (JSON: TL, TR, BR, BL)</span><textarea id="ops-drone-corners" rows="2" placeholder='[[11.0,48.1],[11.1,48.1],[11.1,48.0],[11.0,48.0]]'></textarea></label>
-        <button id="btn-upload-drone-image" class="btn ghost" type="button">retain image</button>
+        <!-- MANUAL 8.3 has documented a "suggest corners (where offered)"
+             affordance since the photogrammetry work; the endpoint behind it
+             (POST .../suggest-georeference) was complete and tested and had no
+             caller, so it was never offered. It proposes only: the corners land
+             in the textarea above for the operator to accept or discard, and
+             georef_kind stays their affirmation. -->
+        <div class="button-row">
+          <button id="btn-suggest-drone-corners" class="btn ghost" type="button">suggest corners from image metadata</button>
+          <button id="btn-upload-drone-image" class="btn ghost" type="button">retain image</button>
+        </div>
         <div id="ops-drone-assets" class="ops-resource-list"></div>
         <div class="ops-context-grid">
           <label class="field"><span>Mosaic name</span><input id="ops-drone-mosaic-name" maxlength="200" value="Operational drone mosaic"></label>
@@ -471,7 +493,7 @@
       <details class="ops-details" id="ops-field-import" data-app="ingest">
         <summary>Import field observations</summary>
         <p class="hint">GeoJSON, GPX, KML, KMZ, vector GeoPackage and CSV are previewed against the current map view before any incident records change.</p>
-        <label class="field"><span>Source file</span><input id="ops-field-import-file" type="file" accept=".geojson,.json,.gpx,.kml,.kmz,.gpkg,.csv"></label>
+        <label class="field"><span>Source file</span><input id="ops-field-import-file" type="file" accept=".geojson,.json,.gpx,.kml,.kmz,.gpkg,.csv,.zip"></label>
         <div class="ops-context-grid">
           <label class="field"><span>Default object type</span><select id="ops-field-import-type"><option value="">automatic by geometry</option></select></label>
           <label class="field"><span>Source / organisation</span><input id="ops-field-import-source" maxlength="500"></label>

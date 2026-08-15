@@ -166,6 +166,19 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
     }
     if (response.status !== 401) throw new Error(`Authentication check failed (HTTP ${response.status})`);
     const dialog = $("#auth-dialog");
+    // Offer agency SSO only when this install actually has a provider - an
+    // always-present button that dead-ends is worse than none. Failure to ask
+    // simply leaves password login, which is the documented break-glass path
+    // and must keep working whatever the federation config is doing.
+    try {
+      const providers = await fetch("/api/auth/providers", { cache: "no-store" }).then((r) => r.json());
+      if (providers.oidc && providers.oidc_login_url) {
+        $("#auth-oidc-button").href = providers.oidc_login_url;
+        $("#auth-federated").hidden = false;
+      }
+    } catch (error) {
+      console.warn("could not read login providers", error);
+    }
     if (!dialog.open) dialog.showModal();
     $("#auth-username").focus();
     await new Promise((resolve) => {
@@ -1187,6 +1200,48 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
     $("#ops-drone-status").textContent = payload.offline_source_id ? "Image retained and registered as a local map layer; reload layer controls to display it." : "Image retained as unreferenced evidence.";
   }
 
+  /** Asks the server to propose ground corners from the image's own metadata.
+   *
+   * `photogrammetry.py` reads the EXIF/DJI-XMP flight record - position,
+   * height above ground, gimbal attitude, focal length - and casts the four
+   * image corners onto the ground. The endpoint has been complete and tested
+   * since that work and had no caller, while MANUAL 8.3 told operators about a
+   * "suggest corners" button that was never offered.
+   *
+   * Fills the corners field and nothing else. `georef_kind` stays the
+   * operator's own affirmation, and the suggestion arrives with the
+   * assumptions it rests on and a confidence - a proposal to check, not an
+   * answer to accept. Nothing is stored by asking.
+   */
+  async function suggestDroneCorners() {
+    const missionId = $("#ops-drone-mission").value, file = $("#ops-drone-file").files?.[0];
+    if (!missionId || !file) throw new Error("Select a mission and image first.");
+    const status = $("#ops-drone-status");
+    status.textContent = `Reading flight metadata from ${file.name}…`;
+
+    const headers = { "Content-Type": file.type || "application/octet-stream", "X-Operator": operator() };
+    if (state.auth.csrf) headers["X-CSRF-Token"] = state.auth.csrf;
+    const response = await fetch(
+      `/api/operations/incidents/${state.incidentId}/drone-missions/${missionId}/suggest-georeference`,
+      { method: "POST", headers, body: file });
+    const payload = await response.json();
+    if (!response.ok) {
+      // A 422 means the image simply carries no usable geometry, and the
+      // server says which piece was missing - that is an answer, not a fault,
+      // so it is reported plainly rather than thrown as an error.
+      status.textContent = `No footprint could be suggested: ${payload.detail || response.status}`;
+      return;
+    }
+
+    $("#ops-drone-corners").value = JSON.stringify(payload.corners);
+    const tilt = payload.tilt_from_nadir_deg;
+    status.textContent =
+      `Suggested from ${payload.height_source} (${payload.height_m} m AGL, ${tilt}° from straight down, ` +
+      `${payload.confidence} confidence, ~${payload.ground_span_m} m across). ` +
+      `Check it against the map before affirming a georeference type. ` +
+      payload.assumptions.join(" ");
+  }
+
   async function createDroneMosaic() {
     const missionId = $("#ops-drone-mission").value;
     const assetIds = [...document.querySelectorAll("[data-drone-asset]:checked")].map((item) => item.dataset.droneAsset);
@@ -1615,10 +1670,16 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
 
   async function previewFieldImport() {
     const file = $("#ops-field-import-file").files?.[0];
-    if (!file) return setStatus("Choose a GeoJSON, GPX, KML, KMZ, vector GeoPackage or CSV source file.", true);
+    if (!file) return setStatus("Choose a GeoJSON, GPX, KML, KMZ, vector GeoPackage, CSV or zipped Shapefile source file.", true);
     if (file.size > 20 * 1024 * 1024) return setStatus("Field source file exceeds the 20 MB import limit.", true);
     let payload;
-    if (file.name.toLowerCase().endsWith(".kmz") || file.name.toLowerCase().endsWith(".gpkg")) {
+    // .zip is a zipped Shapefile bundle - field_import._format maps it to "shp"
+    // and it is as binary as KMZ and GeoPackage. It was missing from both this
+    // list and the picker's accept attribute, so the Shapefile support the
+    // backend has (and test_shapefile.py covers) was unreachable from the panel:
+    // the file could not be chosen, and had it been, reading it as text would
+    // have corrupted it before it ever reached the server.
+    if (/\.(kmz|gpkg|zip)$/i.test(file.name)) {
       const bytes = new Uint8Array(await file.arrayBuffer()); let binary = "";
       for (let offset = 0; offset < bytes.length; offset += 32768) {
         binary += String.fromCharCode(...bytes.subarray(offset, offset + 32768));
@@ -1948,6 +2009,7 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
     // ---- drone missions, imagery & mosaics ----
     $("#btn-create-drone-mission").addEventListener("click", () => createDroneMission().catch(showError));
     $("#ops-drone-mission").addEventListener("change", () => loadDroneAssets().catch(showError));
+    $("#btn-suggest-drone-corners").addEventListener("click", () => suggestDroneCorners().catch(showError));
     $("#btn-upload-drone-image").addEventListener("click", () => uploadDroneImage().catch(showError));
     $("#btn-create-drone-mosaic").addEventListener("click", () => createDroneMosaic().catch(showError));
 

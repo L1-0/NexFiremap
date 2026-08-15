@@ -1268,6 +1268,18 @@ code {
 .auth-dialog h2, .auth-dialog p { margin: 0; }
 .auth-dialog p { color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
 .auth-dialog .auth-error { min-height: 1.2em; color: #ff7770; }
+/* Agency SSO, below the local form: local password login is the break-glass
+   path and stays first, so a federated provider being down never hides it. */
+#auth-federated { margin-top: 14px; display: grid; gap: 10px; }
+#auth-federated[hidden] { display: none; }
+.auth-divider {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--text-muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+}
+.auth-divider::before, .auth-divider::after {
+  content: ""; flex: 1; height: 1px; background: var(--border);
+}
+#auth-oidc-button { text-align: center; text-decoration: none; }
 #ops-workspace { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 #ops-workspace[hidden] { display: none; }
 #ops-workspace h3 { margin: 3px 0 -2px; font-size: 12px; font-weight: 650; }
