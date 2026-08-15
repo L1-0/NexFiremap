@@ -234,6 +234,54 @@ async def api_situation(
     return _json(await asyncio.to_thread(report, request.app, lat, lon, radius_km))
 
 
+@router.get("/api/operations/incidents/{incident_id}/safety-warnings")
+async def api_safety_warnings(
+    request: Request,
+    incident_id: str,
+    since: str | None = Query(None, description="ISO timestamp; only entries after it"),
+    limit: int = Query(50, ge=1, le=500),
+) -> Response:
+    """Recent automatic safety warnings and AOI-watch hits for one incident.
+
+    The read side of the loop `safety.py` has been running all along. Every
+    accepted position is checked against hazard areas and against the arrival
+    band of the scenario's adopted model, and every new detection is checked
+    against active AOIs - and all of it was written to an audit log with no
+    reader. The most safety-relevant code in the product was addressed to
+    nobody: "L-1 is inside the forecast perimeter" existed only in a table and
+    in the HTTP response handed back to the *device* that posted the position.
+
+    Both kinds come from one query because they answer the same operator
+    question - what has the system noticed that I have not? - and they are
+    already interleaved in one trail in the order they happened.
+    """
+    store: OperationsStore = request.app.state.operations
+    store.get_incident(incident_id)  # 404s rather than returning an empty list for a bad id
+
+    # Repair the one URL-encoding slip these timestamps invite. `utcnow()` emits
+    # "+00:00", and a "+" that reaches a query string unencoded arrives as a
+    # space - so "…T10:00:00 00:00" is compared against stored "…T10:00:00+00:00"
+    # and, because space sorts below "+", every entry at that exact instant
+    # comes back again on the next poll. Silently repeating a safety warning
+    # forever is worse than the caller's mistake, and a space is never valid
+    # there, so the intent is unambiguous.
+    if since and " " in since:
+        since = since.replace(" ", "+")
+
+    entries = await asyncio.to_thread(
+        store.audit_log.recent, incident_id,
+        entity_types=("safety_warning", "aoi_watch"), since=since, limit=limit,
+    )
+    return _json({
+        "incident_id": incident_id,
+        "entries": entries,
+        # Split out so a caller can badge the two independently without
+        # re-deriving the classification the server already knows.
+        "warning_count": sum(1 for e in entries if e["entity_type"] == "safety_warning"),
+        "watch_count": sum(1 for e in entries if e["entity_type"] == "aoi_watch"),
+    })
+
+
 @router.get("/api/operations/watch")
 async def api_aoi_watch(
     request: Request,

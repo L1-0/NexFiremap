@@ -959,6 +959,28 @@ input[type="range"] { accent-color: var(--accent); }
 .analysis-caveats li + li { margin-top: 4px; }
 .analysis-caveats[hidden] { display: none; }
 
+/* Automatic safety warnings: a unit inside a hazard area, fire modelled to
+   reach a unit within the warning horizon, new detections inside an AOI.
+   Deliberately red rather than the caveats' amber - a caveat qualifies how far
+   to trust a forecast, this says someone may be in danger now, and the two must
+   not read as the same weight of message. */
+.ops-safety-alerts {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 73, 61, 0.55);
+  background: rgba(255, 73, 61, 0.10);
+  color: #ff8b7a;
+}
+.ops-safety-alerts[hidden] { display: none; }
+.ops-safety-alerts-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  margin-bottom: 6px;
+}
+.ops-safety-alerts ul { margin: 0; padding-left: 18px; }
+.ops-safety-alerts li { font-size: 12px; line-height: 1.5; }
+.ops-safety-alerts li + li { margin-top: 4px; }
+
 .event-analysis {
   margin-top: 4px;
   padding-top: 10px;

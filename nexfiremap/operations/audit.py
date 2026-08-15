@@ -63,3 +63,48 @@ class AuditLog:
         self.db.conn.execute(
             "UPDATE incidents SET updated_at=? WHERE id=?", (changed_at, incident_id)
         )
+
+    def recent(self, incident_id: str, *, entity_types: tuple[str, ...] | None = None,
+               since: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """Read back the trail, newest first.
+
+        This class was write-only until now, which is why the most safety-
+        relevant output in the product was invisible: `safety.record_warnings`
+        writes "this crew is inside the forecast perimeter" here, and
+        `safety.record_watch` writes "a new detection landed in this incident's
+        AOI" - and nothing could read either one back. Both were computed on
+        every accepted position, tested, and then addressed to nobody. The only
+        way to see them was to download the whole handover export and read the
+        JSON.
+
+        `entity_types` narrows to the kinds a caller cares about rather than
+        making it filter a whole incident's history client-side; the
+        `(incident_id, changed_at DESC)` index makes both shapes cheap.
+        """
+        clauses = ["incident_id = ?"]
+        params: list[Any] = [incident_id]
+        if entity_types:
+            clauses.append(f"entity_type IN ({','.join('?' for _ in entity_types)})")
+            params.extend(entity_types)
+        if since:
+            clauses.append("changed_at > ?")
+            params.append(since)
+        params.append(max(1, min(int(limit), 1000)))
+        rows = self.db.conn.execute(
+            f"SELECT id, incident_id, entity_type, entity_id, action, revision, actor, "
+            f"changed_at, payload_json FROM incident_audit_log "
+            f"WHERE {' AND '.join(clauses)} ORDER BY changed_at DESC, id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.pop("payload_json") or "{}")
+            except (TypeError, ValueError):
+                # A malformed payload must not hide the fact that the event
+                # happened - the row itself is the record.
+                item["payload"] = {}
+                item.pop("payload_json", None)
+            out.append(item)
+        return out

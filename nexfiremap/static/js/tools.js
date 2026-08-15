@@ -125,6 +125,25 @@ export function setTool(id, options = {}) {
   return true;
 }
 
+/** Recomputes every tool's enabled state and redraws the palette.
+ *
+ * A tool's `available()` reads live application state - the Sketch tool asks
+ * whether an incident and an operational period are selected - but the palette
+ * only ever rendered on `registerTool` and on a tool switch. Nothing redrew it
+ * when that state changed, so selecting an incident and a period left the
+ * Sketch button disabled, still showing "select an incident and operational
+ * period first", and the tactical-drawing entry point was unreachable for the
+ * whole session. The state was right; the button had simply been painted once,
+ * before it was true.
+ *
+ * Exported so the module that owns the state can say when it changed, rather
+ * than this file polling or guessing at a domain it deliberately knows nothing
+ * about.
+ */
+export function refreshTools() {
+  renderPalette();
+}
+
 /** Rebuilds the palette's buttons to match the registered tools and the
  * active one. Cheap enough to redo wholesale on every change. */
 function renderPalette() {

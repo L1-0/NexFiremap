@@ -199,6 +199,22 @@
     </details>
 
     <div id="ops-workspace" hidden>
+      <!-- Automatic safety warnings and AOI-watch hits.
+           safety.py has evaluated every accepted position against hazard areas
+           and the adopted model's arrival band since the integration work, and
+           written the result to an audit log nothing could read - so "L-1 is
+           inside the forecast perimeter" reached the device that posted the
+           position and no one else. This is the first screen that shows it, and
+           it sits above every collapsible section on purpose: a warning behind
+           a <details> an operator has to think to open is not a warning.
+           role=alert because these are unsolicited and time-critical. -->
+      <section id="ops-safety-alerts" class="ops-safety-alerts" role="alert" aria-live="assertive" hidden>
+        <div class="ops-safety-alerts-head">
+          <strong>Automatic warnings</strong>
+          <button id="btn-dismiss-safety-alerts" class="link-btn" type="button">mark seen</button>
+        </div>
+        <ul id="ops-safety-alerts-list"></ul>
+      </section>
       <div data-app="incident-command eventview">
         <label class="field"><span>Operator / unit</span><input id="ops-operator" maxlength="200" value="local operator"></label>
         <div class="ops-context-grid">

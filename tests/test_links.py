@@ -207,6 +207,81 @@ def check_export_import_round_trip() -> None:
             target_db.close()
 
 
+def check_safety_warnings_are_readable() -> None:
+    """The safety loop's output must be readable back, not just recorded.
+
+    `record_warnings` and `record_watch` have written into the incident audit
+    trail since the integration work, and `AuditLog` had no read method at all -
+    so the most safety-relevant output in the product ("this crew is inside the
+    forecast perimeter") reached the device that posted the position, and the
+    log, and nobody else. The only way to see it was to download the whole
+    handover export. This pins the read surface that closes that loop.
+    """
+    from fastapi.testclient import TestClient
+
+    from nexfiremap import safety
+    from nexfiremap.api import create_app
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        settings = dataclasses.replace(
+            load_settings(), db_path=root / "w.sqlite3", tile_cache_dir=root / "tiles",
+            lan_mode=False)
+        with TestClient(create_app(settings)) as client:
+            incident = client.post("/api/operations/incidents",
+                                   json={"name": "Warning surface"}).json()["incident"]
+            base = f"/api/operations/incidents/{incident['id']}/safety-warnings"
+
+            empty = client.get(base)
+            assert empty.status_code == 200, empty.text
+            assert empty.json()["entries"] == []
+            assert empty.json()["warning_count"] == 0
+
+            store = client.app.state.operations
+            safety.record_warnings(store, incident["id"], [
+                {"code": "inside_hazard", "feature_id": "f1",
+                 "callsign": "FL 11/1", "message": "FL 11/1 is inside a burn area"},
+                {"code": "modelled_arrival", "feature_id": "f2",
+                 "callsign": "FL 11/2", "message": "fire modelled to reach FL 11/2 in 0.6 h"},
+            ])
+
+            body = client.get(base).json()
+            assert body["warning_count"] == 2, body
+            assert {e["entity_type"] for e in body["entries"]} == {"safety_warning"}
+            messages = [e["payload"]["message"] for e in body["entries"]]
+            assert any("inside a burn area" in m for m in messages), messages
+            # Newest first, so a panel showing the top N shows the latest N.
+            assert body["entries"] == sorted(
+                body["entries"], key=lambda e: e["changed_at"], reverse=True)
+
+            # `since` is what keeps the poll incremental rather than re-rendering
+            # the same warnings on every 15-second cycle. Tested with the
+            # timestamp both properly encoded and passed raw: `utcnow()` emits
+            # "+00:00", an unencoded "+" arrives as a space, and a space sorts
+            # below "+" - so the naive form used to return every entry at that
+            # instant again, repeating a safety warning forever.
+            from urllib.parse import quote
+
+            newest = body["entries"][0]["changed_at"]
+            assert client.get(f"{base}?since={quote(newest)}").json()["entries"] == []
+            assert client.get(f"{base}?since={newest}").json()["entries"] == [], \
+                "an unencoded '+' in the timestamp re-delivered warnings already seen"
+
+            # An unknown incident is a 404, not an empty list that reads as
+            # "nothing is wrong".
+            assert client.get("/api/operations/incidents/nope/safety-warnings").status_code == 404
+
+            # A malformed payload must not hide that the event happened.
+            with store.db._write_lock:
+                store.db.conn.execute(
+                    "UPDATE incident_audit_log SET payload_json='{bad' "
+                    "WHERE entity_type='safety_warning' AND entity_id='f1'")
+                store.db.conn.commit()
+            survived = client.get(base).json()
+            assert survived["warning_count"] == 2, "a bad payload dropped the whole row"
+            assert any(e["payload"] == {} for e in survived["entries"])
+
+
 def check_safety_loop() -> None:
     """A crew inside a hazard area, and a crew in the modelled path, both get
     warned - and neither warning is allowed to cost the position."""
@@ -416,6 +491,7 @@ def main() -> None:
     check_point_in_polygon()
     check_export_import_round_trip()
     check_safety_loop()
+    check_safety_warnings_are_readable()
     check_control_lines()
     check_http_surface()
     print("Cross-module link, AOI and safety-loop checks passed.")

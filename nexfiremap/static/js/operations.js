@@ -11,7 +11,7 @@ import {
   whenMap, setPrintView, onMapContextMenu, setActiveIncident,
   getSpreadAnalysis, onSpreadAnalysis, onIncidentCreated,
 } from "./context.js";
-import { registerTool, setTool } from "./tools.js";
+import { registerTool, setTool, refreshTools } from "./tools.js";
 
   const $ = (s) => document.querySelector(s);
   // Almost every innerHTML template below interpolates operator-supplied
@@ -287,7 +287,9 @@ import { registerTool, setTool } from "./tools.js";
     state.incidentId = id;
     localStorage.setItem("nexfiremap.activeIncident", id);
     $("#ops-workspace").hidden = !id;
-    if (!id) { setActiveIncident(null); return; }
+    // Deselecting has to re-disable the Sketch tool, and this branch returns
+    // before renderCommandForms() (which carries the other refresh) ever runs.
+    if (!id) { setActiveIncident(null); refreshTools(); return; }
     state.workspace = await api(`/api/operations/incidents/${id}`);
     // Publish the incident being worked so the analytical side (integration.js)
     // can offer "attach to <name>" without app.js or this module importing each
@@ -304,6 +306,7 @@ import { registerTool, setTool } from "./tools.js";
     renderFeatures();
     renderResources();
     await refreshVehicleTelemetry();
+    await refreshSafetyAlerts();
     await loadDroneMissions();
     await loadSafety();
     await loadSnapshots();
@@ -348,6 +351,14 @@ import { registerTool, setTool } from "./tools.js";
     const copyTarget = $("#ops-copy-target-period"); copyTarget.replaceChildren(option("", "select another period"));
     state.workspace.operational_periods.filter((item) => item.id !== state.periodId).forEach((item) => copyTarget.append(option(item.id, item.name)));
     $("#ops-copy-scenario-name").value = `${scenario?.name || "Plan"} carry-forward`;
+    // The Sketch tool's `available()` reads state.incidentId/periodId, but the
+    // palette only repainted on tool registration and tool switches - so
+    // selecting an incident and a period left the button disabled with a hint
+    // that was no longer true, and tactical drawing had no reachable entry
+    // point. This is the choke point every selection change already passes
+    // through (selectIncident, rebuildScenarioSelect, and the period/scenario
+    // change handlers all call it).
+    refreshTools();
   }
 
   // -------------------------------------------- feature styling & records
@@ -969,6 +980,61 @@ import { registerTool, setTool } from "./tools.js";
    * marker) but never silently dropped - the position still renders, since
    * a suspicious-but-real fix is still better tactical information than no
    * fix at all. */
+  /** Polls the automatic warnings the safety loop has been writing all along.
+   *
+   * `safety.evaluate_position` runs on every accepted position - is this unit
+   * inside a hazard area, and does the adopted model expect fire to reach it
+   * within the warning horizon - and `safety.watch_detections` asks whether new
+   * detections landed in an active AOI. Both recorded into the incident audit
+   * trail, which had no reader: the warning reached the *device* that posted
+   * the position, and the log, and nothing else.
+   *
+   * Polled on the telemetry cycle rather than pushed, matching how the rest of
+   * this panel stays current, and asked for since the last poll so a long
+   * session does not re-render the same warnings forever.
+   */
+  async function refreshSafetyAlerts() {
+    const host = $("#ops-safety-alerts");
+    const list = $("#ops-safety-alerts-list");
+    if (!host || !list) return;
+    if (!state.incidentId) { host.hidden = true; list.replaceChildren(); return; }
+
+    let payload;
+    try {
+      payload = await api(`/api/operations/incidents/${state.incidentId}/safety-warnings?limit=25`);
+    } catch (error) {
+      // Never let the warnings poll break the telemetry refresh it rides on -
+      // losing a unit's position to a failed warnings fetch is the worse trade.
+      console.warn("safety warnings unavailable", error);
+      return;
+    }
+
+    const seenAt = state.safetyAlertsSeenAt || "";
+    const unseen = payload.entries.filter((entry) => entry.changed_at > seenAt);
+    host.hidden = unseen.length === 0;
+    list.replaceChildren();
+    unseen.forEach((entry) => {
+      const item = document.createElement("li");
+      const when = localTime(entry.changed_at);
+      if (entry.entity_type === "aoi_watch") {
+        const count = entry.payload.detection_count ?? "new";
+        item.textContent = `${count} new detection(s) inside this incident's area of interest · ${when}`;
+      } else {
+        const p = entry.payload || {};
+        const who = p.callsign || p.resource_id || "a tracked unit";
+        const message = p.message || p.code || "safety warning";
+        // safety.py writes some messages already naming the unit ("FL 11/1 is
+        // inside Raeumung Nord") and others not ("fire modelled to arrive in
+        // ~0.5 h"), so prefixing unconditionally produced "FL 11/1: FL 11/1
+        // is inside…". Prefix only when the message does not already say who.
+        item.textContent = message.startsWith(who)
+          ? `${message} · ${when}`
+          : `${who}: ${message} · ${when}`;
+      }
+      list.append(item);
+    });
+  }
+
   async function refreshVehicleTelemetry() {
     state.vehicleLayer.clearLayers(); state.vehicleTrackLayer.clearLayers();
     const status = $("#ops-vehicle-status");
@@ -2076,7 +2142,20 @@ import { registerTool, setTool } from "./tools.js";
     await restoreSketchDraft();
     await loadBackupStatus();
     setInterval(() => loadBackupStatus().catch(console.warn), 60000);
-    setInterval(() => { if (state.incidentId) refreshVehicleTelemetry().catch(console.warn); }, 15000);
+    setInterval(() => {
+      if (!state.incidentId) return;
+      refreshVehicleTelemetry().catch(console.warn);
+      refreshSafetyAlerts().catch(console.warn);
+    }, 15000);
+    // "Mark seen" hides what is currently shown without deleting anything - the
+    // audit trail is the record, this panel is only the notification. Stamped
+    // from the newest entry rather than the clock so a warning that arrives
+    // during the click is not silently swallowed.
+    $("#btn-dismiss-safety-alerts")?.addEventListener("click", () => {
+      const newest = $("#ops-safety-alerts-list")?.firstElementChild;
+      state.safetyAlertsSeenAt = newest ? new Date().toISOString() : state.safetyAlertsSeenAt;
+      $("#ops-safety-alerts").hidden = true;
+    });
     await checkConnectivity(); setInterval(checkConnectivity, 15000);
     // The analysis half publishes whichever run is on the map; take it as the
     // default for "attach model run" instead of asking for it to be retyped.
