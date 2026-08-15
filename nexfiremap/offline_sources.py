@@ -63,6 +63,26 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+#: Marks a source created from drone imagery flown for an incident mission.
+#: `drone.py` writes `mission:<id>` for a single georeferenced frame and
+#: `drone-mission:<id>` for a mosaic of several; both are mission imagery and
+#: both must stack, so both are listed. These strings are the only link between
+#: the two modules - deliberately, so neither imports the other.
+MISSION_SOURCE_PREFIXES = ("mission:", "drone-mission:")
+
+
+def is_mission_imagery(record: dict[str, Any]) -> bool:
+    """Whether a source is drone imagery flown for an incident mission.
+
+    Mission imagery covers a few hundred metres of ground and is meaningful
+    only *over* a map, layered with the other passes of the same fire. An
+    imported MBTiles pack or a downloaded satellite scene is a whole basemap
+    and replaces one. That difference is what this predicate encodes.
+    """
+    return (record.get("kind") == "raster"
+            and str(record.get("source") or "").startswith(MISSION_SOURCE_PREFIXES))
+
+
 class OfflineSourceManager:
     """Import, validate, store and serve operator-supplied offline map
     sources. Each source has two files on disk: the data itself
@@ -347,6 +367,15 @@ class OfflineSourceManager:
         return rows
 
     def public_layers(self) -> list[dict[str, Any]]:
+        """Every imported source as a frontend layer definition.
+
+        `overlay` is the load-bearing field. Drone imagery arrives here as a
+        raster source tied to a mission, and treating it as a *basemap* made it
+        mutually exclusive with every other layer - so an operator could see
+        exactly one drone frame at a time, never a newer pass over an older one,
+        and never any of it over a map. Marking mission rasters as overlays is
+        what lets them stack; `acquired_at` is what orders that stack.
+        """
         return [{
             "id": f"mbtiles-{item['id']}", "source_id": item["id"], "name": item["name"],
             "url": f"/offline-tiles/{item['id']}/{{z}}/{{x}}/{{y}}",
@@ -355,6 +384,7 @@ class OfflineSourceManager:
             "acquired_at": item["acquired_at"], "source": item["source"],
             "licence": item["licence"], "limitations": item["limitations"],
             "source_kind": item.get("kind", "mbtiles"),
+            "overlay": is_mission_imagery(item),
         } for item in self.list()]
 
     def tile(self, source_id: str, zoom: int, x: int, y: int) -> tuple[bytes, str] | None:

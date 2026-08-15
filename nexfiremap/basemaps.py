@@ -78,6 +78,17 @@ BASEMAPS: list[dict] = [
         "attribution": "Imagery &copy; Esri, Maxar, Earthstar Geographics",
         "max_zoom": 19,
         "dark": True,
+        # JPEG, like its sibling terrain service below - confirmed live, this
+        # endpoint answers "content-type: image/jpeg" at every zoom. It was
+        # declared PNG here, so the tile route labelled JPEG bytes as
+        # image/png on the way out and cached them under a .png name. Browsers
+        # sniff the real type and render it anyway, which is exactly why this
+        # survived unnoticed after the same mistake was caught and fixed on
+        # esri-terrain.
+        "tile_ext": "jpg",
+        # Genuine imagery all the way to max_zoom: confirmed live, tiles at
+        # z8/10/12/14/16/18/19 over the same point are all distinct, so there
+        # is no native-resolution ceiling to declare (contrast esri-terrain).
     },
     {
         "id": "esri-terrain",

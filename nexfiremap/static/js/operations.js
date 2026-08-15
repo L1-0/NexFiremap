@@ -6,7 +6,7 @@
    context-menu renderer is a direct import rather than a global that only
    existed because app.js's <script> tag came first. */
 
-import { showContextMenu } from "./app.js";
+import { showContextMenu, prepareMapForPrint } from "./app.js";
 import { whenMap, setPrintView, onMapContextMenu, setActiveIncident } from "./context.js";
 import { registerTool, setTool } from "./tools.js";
 
@@ -1383,8 +1383,11 @@ import { registerTool, setTool } from "./tools.js";
         `<span>Satellite and analysis layers retain their own displayed source and freshness limitations.</span>`;
     }
     title.setAttribute("aria-hidden", "false");
-    state.map.invalidateSize();
-    setTimeout(() => window.print(), 150);
+    // Wait for the map to actually finish drawing at print size rather than
+    // guessing at 150ms. See prepareMapForPrint in app.js: the old fixed delay
+    // was a race that usually lost, producing a print preview with a
+    // half-blank map.
+    prepareMapForPrint().then(() => window.print());
   }
 
   // --------------------------------- backups, recovery & offline packages

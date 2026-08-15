@@ -62,6 +62,7 @@ from .tiles import TileCache
 from .webhooks import WebhookError, WebhookManager
 from .tactics import TacticsManager
 from .security import SecurityManager
+from . import settings_store
 from .telemetry import TelemetryError, TelemetryManager, TelemetryRateLimit
 from .wind import WindError, WindManager
 
@@ -127,9 +128,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         is, since everything in this function runs to completion before
         the `yield`.
         """
+        nonlocal settings
         if settings.lan_mode and len(settings.admin_password) < 12:
             raise RuntimeError("LAN mode requires NEXFIREMAP_ADMIN_PASSWORD with at least 12 characters")
         db = Database(settings.db_path)
+
+        # Fold any operator-stored settings over the environment-derived ones
+        # before anything is constructed from them. This has to happen here and
+        # not in `load_settings`, because the overrides live in the database and
+        # the database path is itself a setting - there is no earlier point at
+        # which both are available. Everything below therefore sees the
+        # effective configuration, so a FIRMS key typed into the settings pane
+        # reaches `CacheManager`'s `FirmsClient` on the next start.
+        #
+        # `base_settings` is kept unfolded on app.state so the settings routes
+        # can recompute from it: re-folding over already-folded settings would
+        # make clearing an override impossible, since the environment value
+        # beneath it would already have been overwritten.
+        app.state.base_settings = settings
+        setting_overrides = settings_store.read_overrides(db)
+        settings = settings_store.apply_overrides(settings, setting_overrides)
+        app.state.setting_overrides = setting_overrides
+
         cache = CacheManager(settings, db)
         # The layer registry has to exist before the tile cache, which
         # consults it on every lookup so an operator-added WMS/WMTS/XYZ layer

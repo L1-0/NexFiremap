@@ -669,6 +669,25 @@ CREATE TABLE IF NOT EXISTS custom_layers (
 );
 CREATE INDEX IF NOT EXISTS idx_custom_layers_active ON custom_layers (active, name);
 
+-- Operator-editable settings, overriding the environment-derived `Settings`.
+--
+-- Deliberately a key/value table rather than one column per setting: the set of
+-- editable settings is defined in `settings_store.EDITABLE`, and adding one
+-- there should not need a schema migration. The value is JSON so a list
+-- (`cap_feeds`) and an integer (`cache_days`) survive the round trip as
+-- themselves rather than as strings the reader has to guess the type of.
+--
+-- This table holds API keys. It inherits whatever protection the database file
+-- itself has and nothing more - which is the same footing as `.env`, the place
+-- these values live today. What it must never do is hand them back out: see
+-- `settings_store.public_view`, which returns only a masked hint.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_by TEXT NOT NULL DEFAULT 'local operator',
+    updated_at TEXT NOT NULL
+);
+
 -- Official public warnings polled from CAP feeds (MoWaS/NINA, DWD, IPAWS...).
 --
 -- Keyed on the alert's own upstream `identifier`, not a generated id, so
@@ -903,7 +922,10 @@ MIGRATIONS: tuple[MigrationStep, ...] = (
 # no rung for any of them in MIGRATIONS - the runner stamps the gap once the
 # ladder is done. The version still has to move, or an existing database would never
 # trigger the pre-migration backup.
-SCHEMA_VERSION = 6
+#
+# v7 adds `app_settings` (operator-editable settings overriding the environment).
+# Another brand-new table, so - like v5 - it needs the version bump but no rung.
+SCHEMA_VERSION = 7
 
 
 def _refuse_downgrade(current: int, target: int) -> None:

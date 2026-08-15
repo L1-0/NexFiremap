@@ -87,6 +87,52 @@ async def api_drone_asset_create(
     return _json(result, 201)
 
 
+@router.post("/api/operations/incidents/{incident_id}/drone-missions/{mission_id}/suggest-georeference")
+async def api_drone_suggest_georeference(
+    request: Request, incident_id: str, mission_id: str,
+    terrain_elevation_m: float | None = None,
+) -> Response:
+    """Propose a footprint from an image's own flight metadata. Writes nothing.
+
+    Deliberately a separate endpoint from asset upload rather than a flag on
+    it. The suggestion is a *proposal* an operator confirms - it carries the
+    assumptions it rests on and a confidence - and folding it into the upload
+    would make the confirmation step easy to skip, which is precisely how
+    imagery ends up sitting authoritatively in the wrong field. The operator
+    posts the returned corners back through the ordinary asset route, where
+    `georef_kind` remains their affirmation.
+
+    The image is read but never stored here; nothing about this call is
+    persisted, so it is safe to run on a frame the operator then discards.
+    """
+    limit = request.app.state.settings.drone_max_upload_mb * 1024 * 1024
+    length = request.headers.get("content-length")
+    if length:
+        try:
+            if int(length) > limit:
+                raise HTTPException(413, "drone image exceeds configured upload limit")
+        except ValueError as exc:
+            raise HTTPException(400, "invalid Content-Length") from exc
+    content = await request.body()
+    if len(content) > limit:
+        raise HTTPException(413, "drone image exceeds configured upload limit")
+
+    manager: DroneManager = request.app.state.drone
+    await asyncio.to_thread(manager.get_mission, incident_id, mission_id)
+
+    from ..photogrammetry import PhotogrammetryError, suggest
+
+    try:
+        result = await asyncio.to_thread(suggest, content, terrain_elevation_m=terrain_elevation_m)
+    except PhotogrammetryError as exc:
+        # 422, not 400: the request is well-formed and the file is a valid
+        # image - it simply does not carry geometry this can use. The message
+        # names the missing piece so the operator knows whether to supply
+        # terrain elevation or fall back to entering corners by hand.
+        raise HTTPException(422, str(exc)) from exc
+    return _json(result)
+
+
 @router.get("/api/operations/incidents/{incident_id}/drone-missions/{mission_id}/assets/{asset_id}/{rendition}")
 async def api_drone_asset_file(
     request: Request, incident_id: str, mission_id: str, asset_id: str, rendition: str,

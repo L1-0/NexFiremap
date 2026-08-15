@@ -25,7 +25,7 @@ from ..db import Database
 from ..geocode import GeocodeService
 from ..jobs import JobManager
 from ..operations import AREA_TYPES, FEATURE_TYPES, LINE_TYPES, POINT_TYPES, SAFETY_CHECKS
-from .. import symbology
+from .. import settings_store, symbology
 from ..tiles import TileCache, public_layer
 from . import common
 from .common import _json
@@ -84,10 +84,17 @@ async def api_config(request: Request) -> Response:
             # URL. Custom layers are split by their own `overlay` flag, since
             # a hydrant or cadastre layer belongs over the basemap, not
             # instead of it.
+            # Offline sources are split by the same `overlay` flag as custom
+            # layers: an imported MBTiles pack or satellite scene *is* a
+            # basemap, while drone imagery flown for a mission covers a few
+            # hundred metres and only means anything drawn over one - and
+            # stacked with the other passes over the same fire, which a
+            # mutually-exclusive basemap can never be.
             "basemaps": [public_layer(bm) for bm in BASEMAPS]
-            + request.app.state.offline_sources.public_layers()
+            + [item for item in request.app.state.offline_sources.public_layers() if not item["overlay"]]
             + [item for item in request.app.state.layers.public_layers() if not item["overlay"]],
             "overlays": [public_layer(ov) for ov in OVERLAYS]
+            + [item for item in request.app.state.offline_sources.public_layers() if item["overlay"]]
             + [item for item in request.app.state.layers.public_layers() if item["overlay"]],
             "terrain_dem": public_layer(TERRAIN_DEM),
             "refresh_minutes": settings.refresh_interval_minutes,
@@ -103,6 +110,20 @@ async def api_config(request: Request) -> Response:
             # operator configure a sensible non-world-view default without
             # every visitor needing to pan/zoom in by hand first.
             "startup_bbox": list(settings.startup_bbox) if settings.startup_bbox else None,
+            # Shared display preferences, set once by an administrator in the
+            # settings pane and picked up by every client from here. They ride
+            # on /api/config rather than on the administrator-only
+            # /api/settings precisely because everyone needs them: an incident
+            # where each browser shows coordinates in a different format is a
+            # readback error waiting to happen. An empty string means "no
+            # shared preference", and the client keeps its own local choice.
+            "client_settings": {
+                name: request.app.state.setting_overrides.get(name, "")
+                for name in settings_store.CLIENT_PREFERENCES
+            },
+            # Not a client preference but the same kind of shared decision:
+            # which tactical symbol set the whole room reads.
+            "symbology_profile": settings.symbology_profile,
         }
     )
 

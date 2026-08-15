@@ -48,4 +48,14 @@
         stroke-width="2" stroke-linejoin="round"/>
   <path d="M14 5l5 5" stroke="currentColor" stroke-width="2"/>
 </symbol>
+
+<!-- Settings: the conventional gear. Unlike the others this is not a drawing
+     mode - it is a one-shot button that opens the settings pane - so it sits
+     apart at the foot of the palette. -->
+<symbol id="nf-tool-settings" viewBox="0 0 24 24">
+  <path d="M12 15.2a3.2 3.2 0 100-6.4 3.2 3.2 0 000 6.4z" fill="none"
+        stroke="currentColor" stroke-width="2"/>
+  <path d="M19.4 13a7.6 7.6 0 000-2l2-1.5-2-3.4-2.3 1a7.6 7.6 0 00-1.7-1L14.8 3h-4l-.6 2.6a7.6 7.6 0 00-1.7 1l-2.3-1-2 3.4L6.2 11a7.6 7.6 0 000 2l-2 1.5 2 3.4 2.3-1a7.6 7.6 0 001.7 1l.6 2.6h4l.6-2.6a7.6 7.6 0 001.7-1l2.3 1 2-3.4z"
+        fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+</symbol>
 </svg>

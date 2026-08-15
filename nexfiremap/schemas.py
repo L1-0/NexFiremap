@@ -494,3 +494,19 @@ class AccountCreateRequest(BaseModel):
     username: str = Field(..., min_length=1, max_length=100)
     role: str = Field(..., min_length=1, max_length=30)
     password: str = Field(..., min_length=12, max_length=1000)
+
+
+# ------------------------------------------------------------ settings
+
+class SettingsUpdateRequest(BaseModel):
+    """A partial settings update: only the names present are touched.
+
+    `values` is an open dict rather than one optional field per setting,
+    because the set of editable settings is defined once in
+    `settings_store.EDITABLE` and duplicating it here would create two lists to
+    keep in step. Validation - unknown names, type coercion, the closed
+    symbology vocabulary - therefore happens in `settings_store.write`, which
+    rejects rather than silently storing.
+    """
+
+    values: dict[str, object] = Field(..., min_length=1)

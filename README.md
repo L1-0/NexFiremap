@@ -585,6 +585,7 @@ nexfiremap/
  backups.py Scheduled/manual atomic SQLite backups with integrity verification
  map_packs.py Offline AOI tile manifests, completeness and SHA-256 verification
  offline_sources.py Validated local MBTiles ingestion, metadata and XYZ serving
+ photogrammetry.py Footprint *suggestion* from a drone image's own EXIF/DJI-XMP flight metadata
  field_import.py Previewed GeoJSON/GPX/KML/KMZ/CSV observations with source provenance
  tactics.py Tactical measurements, warning acknowledgement and calculators
  products.py Classified deterministic PDF/vector/raster portable products
@@ -595,6 +596,7 @@ nexfiremap/
  rasterpng.py Minimal stdlib-only PNG encoder (no Pillow dependency)
  db.py SQLite schema and queries
  config.py Settings from environment / .env
+ settings_store.py Operator-editable settings overriding the above; API keys never read back out
  basemaps.py Selectable basemap + overlay definitions + the terrain DEM source
  static/ Frontend (Leaflet + MapLibre GL JS, vanilla JS, CSS)
  img/ Logo (also the favicon)

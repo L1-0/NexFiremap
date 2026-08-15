@@ -785,6 +785,10 @@
 <!-- The map tool palette. Registers "Select" (the existing behaviour) and
      "Waypoint"; other modules register their own tools with it. -->
 <script type="module" src="/static/js/tools.js"></script>
+<!-- The global settings pane. Registers itself as a one-shot palette button
+     rather than a tool, since it has no business owning the map's left click.
+     Loads after tools.js so the palette exists to register with. -->
+<script type="module" src="/static/js/settings.js"></script>
 <!-- Optional: adds nothing to the page (not even its control) unless the
      server reports configured CAP warning feeds via /api/config. -->
 <script type="module" src="/static/js/alerts.js"></script>

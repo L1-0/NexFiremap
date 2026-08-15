@@ -77,7 +77,16 @@ async function writeJson(url, body, method = "POST") {
 /** Registers a tool. Tools are plain objects with `activate`/`deactivate`, so a
  * module can contribute one (operations.js registers its sketch tool) without
  * this file knowing anything about its domain.
- * @param {object} tool - {id, label, key, hint, activate, deactivate, hasUnsavedWork?} */
+ *
+ * An entry may instead supply `action`, which makes it a one-shot button rather
+ * than a mode: it runs and the active tool is left alone. That distinction is
+ * the palette's central contract showing through - a mode claims the left
+ * click, and something like the settings pane has no business claiming it. The
+ * alternative (a settings "tool" that opens a dialog and then hands the click
+ * back) would put the map in a state where what a click does depends on a
+ * dialog nobody can see any more.
+ * @param {object} tool - {id, label, key, hint, activate, deactivate, hasUnsavedWork?}
+ *   or {id, label, key, action} for a one-shot button. */
 export function registerTool(tool) {
   tools.set(tool.id, tool);
   if (container) renderPalette();
@@ -93,6 +102,9 @@ export function registerTool(tool) {
  * @param {{force?: boolean}} [options] - force skips the unsaved-work prompt.
  * @returns {boolean} Whether the switch happened. */
 export function setTool(id, options = {}) {
+  // One-shot entries run without disturbing the active tool - see registerTool.
+  const target = tools.get(id);
+  if (target?.action) { target.action(); return true; }
   const current = tools.get(getActiveTool());
   if (current && current.id === id) return true;
   if (current && !options.force && current.hasUnsavedWork?.()) {
@@ -118,11 +130,23 @@ export function setTool(id, options = {}) {
 function renderPalette() {
   if (!container) return;
   const active = getActiveTool();
-  container.innerHTML = [...tools.values()].map((tool) => {
+  // Modes first, one-shot buttons last - by *kind*, not by registration order.
+  // Order of registration is really module evaluation order, which is not a
+  // design decision: settings.js registers at module scope while the drawing
+  // tools wait for whenMap(), so a settings button would otherwise sit above
+  // Select purely because it needs no map. A stable sort keeps each group in
+  // its own registration order.
+  const ordered = [...tools.values()].sort((a, b) => Number(!!a.action) - Number(!!b.action));
+  container.innerHTML = ordered.map((tool) => {
     const disabled = tool.available && !tool.available();
-    return `<button type="button" class="nf-tool${tool.id === active ? " is-active" : ""}"
+    // A one-shot button is never "the active tool", so it gets neither the
+    // active styling nor aria-pressed - it is a button, not a toggle, and a
+    // screen reader should not announce it as one.
+    const pressed = tool.action ? "" : `aria-pressed="${tool.id === active}"`;
+    return `<button type="button" class="nf-tool${
+        !tool.action && tool.id === active ? " is-active" : ""}${tool.action ? " is-action" : ""}"
       data-tool="${escapeHtml(tool.id)}" ${disabled ? "disabled" : ""}
-      aria-pressed="${tool.id === active}"
+      ${pressed}
       title="${escapeHtml(tool.label)}${tool.key ? ` (${tool.key.toUpperCase()})` : ""}${
         disabled && tool.unavailableHint ? ` - ${escapeHtml(tool.unavailableHint)}` : ""}">
       <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#nf-tool-${escapeHtml(tool.id)}"/></svg>

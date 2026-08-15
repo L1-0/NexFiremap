@@ -557,6 +557,10 @@ html, body {
 }
 .basemap-overlays label:hover { color: var(--text-primary); }
 .basemap-overlays input { accent-color: var(--accent); margin: 0; }
+/* Capture time on drone imagery. It is the field the stacking order is derived
+   from - newest on top - so it earns a place in the list rather than only a
+   tooltip. */
+.overlay-when { display: block; color: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 
 /* ------------------------------------------------------- map context menu
    Same translucent-card language as .app-switcher-menu/.basemap-flyout,
@@ -1301,7 +1305,15 @@ code {
      covers it. .basemap-picker sits outside .topbar (a sibling of #map,
      not the Leaflet control container) and was the one piece of floating
      map chrome this rule didn't already reach. */
-  .topbar, .panel, .setup, .map3d-wrap, .leaflet-control-container, .basemap-picker { display: none !important; }
+  /* .map-tools/.map-tool-panel are siblings of #map, like .basemap-picker -
+     not inside .topbar or the Leaflet control container - so they need
+     naming here explicitly or the tool palette prints over the map. */
+  .topbar, .panel, .setup, .map3d-wrap, .leaflet-control-container,
+  .basemap-picker, .map-tools, .map-tool-panel, .map-context-menu,
+  .map-select-rect, .map-select-area-label,
+  /* The settings dialog is appended to <body> and covers the whole viewport, so
+     printing with it open would produce a page of dialog and no map at all. */
+  .nf-set-overlay { display: none !important; }
   #map { position: fixed; inset: 25mm 0 0; border: 1px solid #444; }
   .ops-print-title[aria-hidden="false"] {
     position: fixed; display: grid; grid-template-columns: 2fr 1fr 1fr;
@@ -1440,6 +1452,77 @@ code {
 .nf-tool:disabled { opacity: .4; cursor: not-allowed; }
 .nf-tool-label { font-size: 12px; font-weight: 600; opacity: 0; transition: opacity .12s ease; }
 .map-tools:hover .nf-tool-label { opacity: 1; }
+/* One-shot buttons (Settings) sit apart from the drawing modes, because they
+   are a different kind of thing: they run and hand control straight back
+   rather than claiming the left click. The rule reads off `.is-action` rather
+   than an id so any later one-shot entry groups itself the same way. */
+.nf-tool.is-action { margin-top: 6px; border-top: 1px solid var(--border); border-radius: 0 0 6px 6px; padding-top: 10px; }
+
+/* ------------------------------------------------------------ settings pane */
+
+.nf-set-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1400;  /* over the topbar (1000) and the palette (900) */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, .55);
+}
+.nf-set-overlay[hidden] { display: none; }
+.nf-set-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  border-radius: 10px;
+  background: var(--surface-1, #1a1a19);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 40px rgba(0, 0, 0, .6);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.nf-set-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 14px 16px; border-bottom: 1px solid var(--border);
+}
+.nf-set-header h2 { margin: 0; font-size: 15px; }
+.nf-set-close {
+  border: 0; background: transparent; color: var(--text-secondary);
+  font-size: 22px; line-height: 1; cursor: pointer; padding: 0 4px;
+}
+.nf-set-close:hover { color: var(--text-primary); }
+.nf-set-body { overflow-y: auto; padding: 4px 16px 12px; }
+.nf-set-body section { padding: 12px 0; border-bottom: 1px solid var(--border); }
+.nf-set-body section:last-child { border-bottom: 0; }
+.nf-set-body h3 { margin: 0 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-muted); }
+.nf-set-note { margin: 0 0 10px; color: var(--text-muted); font-size: 12px; }
+.nf-set-note.is-error { color: #ff8b7a; }
+.nf-set-field { margin-bottom: 12px; }
+.nf-set-field label { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-weight: 600; }
+.nf-set-field input, .nf-set-field select, .nf-set-field textarea {
+  width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-2); color: var(--text-primary); font: inherit;
+}
+.nf-set-field textarea { resize: vertical; font-family: var(--font-mono, monospace); font-size: 12px; }
+.nf-set-field .nf-panel-btn { width: auto; margin-top: 6px; }
+.nf-set-help { margin: 4px 0 0; color: var(--text-muted); font-size: 11px; }
+/* The state line for a credential. It is the only thing standing in for a value
+   the page deliberately never receives, so it has to be readable, not subtle. */
+.nf-set-state { display: inline-block; margin-top: 5px; font-size: 11px; color: var(--text-muted); }
+.nf-set-state.is-set { color: var(--accent); }
+.nf-set-restart {
+  font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: .05em;
+  padding: 1px 5px; border-radius: 3px; background: var(--surface-2); color: var(--text-muted);
+}
+.nf-set-footer {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 16px; border-top: 1px solid var(--border);
+}
+.nf-set-footer .nf-panel-btn { width: auto; margin-top: 0; }
+.nf-set-status { flex: 1; margin: 0; color: var(--text-muted); font-size: 12px; }
+.nf-set-status.is-error { color: #ff8b7a; }
 
 /* The waypoint/area side panel: situation report while it is one point, commit
    bar once it is an area. */
@@ -1553,3 +1636,13 @@ body.nf-tool-measure .leaflet-nfTools-pane {
   pointer-events: auto;
 }
 body.nf-tool-measure #map { cursor: crosshair; }
+
+/* Native-resolution note on a basemap tile. A provider that stops gaining
+   detail before max_zoom gets upscaled past that point; without saying so, a
+   soft-looking layer reads as bad imagery rather than as a known limit. */
+.basemap-tile-cap {
+  display: block;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.2;
+}

@@ -410,10 +410,22 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
       tile.dataset.basemapId = bm.id;
       tile.setAttribute("role", "menuitemradio");
       tile.setAttribute("aria-checked", "false");
-      tile.title = bm.name;
+      // A layer whose provider runs out of real resolution before max_zoom is
+      // upscaled by Leaflet past that point - it goes soft, and an operator
+      // reasonably reads that as "this imagery is inaccurate" rather than
+      // "there is no more detail to show". Saying so in the tooltip and with a
+      // small badge is the difference between a known limit and a suspected
+      // fault. (esri-terrain, for instance, serves byte-identical tiles from
+      // z10 onward - confirmed live; see basemaps.py.)
+      const nativeCap = bm.max_native_zoom || null;
+      tile.title = nativeCap
+        ? `${bm.name} - full detail to zoom ${nativeCap}; enlarged beyond that`
+        : bm.name;
       tile.innerHTML =
         `<span class="basemap-tile-thumb"><span class="basemap-tile-check" aria-hidden="true" hidden>✓</span></span>` +
-        `<span class="basemap-tile-label">${escapeHtml(bm.name)}</span>`;
+        `<span class="basemap-tile-label">${escapeHtml(bm.name)}` +
+        (nativeCap ? `<small class="basemap-tile-cap">to z${nativeCap}</small>` : "") +
+        `</span>`;
       tile.addEventListener("click", () => {
         selectBasemap(bm.id);
         closeBasemapFlyout();
@@ -428,14 +440,38 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
 
     const overlays = $("#basemap-overlays");
     overlays.innerHTML = "";
+    // Drone imagery stacks by capture time, newest on top: a later pass over
+    // the same ground is by definition the more current picture of the fire, so
+    // an older frame must never hide it. Sorting the *list* is not enough -
+    // Leaflet draws same-pane tile layers in the order they were added to the
+    // map, which is the order the operator happens to tick the boxes in - so
+    // each layer also gets an explicit zIndex derived from its capture time.
+    const captured = (ov) => Date.parse(ov.acquired_at || "") || 0;
+    const timed = config.overlays.filter(captured).sort((a, b) => captured(a) - captured(b));
+    const zIndexFor = (ov) => {
+      const rank = timed.indexOf(ov);
+      // Base 300 keeps these above the basemap (Leaflet's tilePane, zIndex 200)
+      // and below the marker/overlay panes that carry the tactical picture -
+      // imagery must not bury the symbols drawn on it.
+      return rank < 0 ? 300 : 301 + rank;
+    };
+
     config.overlays.forEach((ov) => {
       overlayLayers[ov.id] = L.tileLayer(ov.url, {
         attribution: ov.attribution,
         maxZoom: ov.max_zoom || 19,
+        minZoom: ov.min_zoom || 0,
         pane: "shadowPane",
+        zIndex: zIndexFor(ov),
       });
       const label = document.createElement("label");
-      label.innerHTML = `<input type="checkbox" value="${ov.id}"><span>${escapeHtml(ov.name)}</span>`;
+      // Captured-at is the field the stacking order is derived from, so showing
+      // it is what makes "why is that one on top?" answerable from the UI.
+      const when = ov.acquired_at
+        ? `<small class="overlay-when">${escapeHtml(String(ov.acquired_at).replace("T", " ").slice(0, 16))}</small>`
+        : "";
+      label.innerHTML = `<input type="checkbox" value="${ov.id}"><span>${escapeHtml(ov.name)}${when}</span>`;
+      if (ov.limitations) label.title = ov.limitations;
       overlays.appendChild(label);
       label.querySelector("input").addEventListener("change", (e) => {
         if (e.target.checked) overlayLayers[ov.id].addTo(map);
@@ -666,7 +702,53 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
     contextMenuOpen = false;
   }
 
-  export { showContextMenu, closeContextMenu };
+  /** Re-lays out the map for the print sheet and waits for its tiles.
+   *
+   * Printing changes the map's size (the print stylesheet gives #map the whole
+   * page), so Leaflet has to be told to re-measure and then fetch the tiles
+   * that newly came into view. The old code did `invalidateSize()` and then
+   * `setTimeout(window.print, 150)` - a race it usually lost, because 150ms is
+   * nowhere near enough for a tile round trip, let alone a cold cache. The
+   * result was a print preview with a half-blank map, which is what "print to
+   * PDF does not support previews" actually was.
+   *
+   * Waits on the active basemap's own `load` event, which Leaflet fires once
+   * every visible tile has arrived. The timeout ceiling matters as much as the
+   * wait: with the WAN down no tile will ever load, and printing what is on
+   * screen beats refusing to print at all.
+   * @param {number} [timeoutMs] - Give up waiting and print anyway.
+   * @returns {Promise<void>} */
+  function prepareMapForPrint(timeoutMs = 6000) {
+    map.invalidateSize();
+    // `activeBasemap` is what selectBasemap() maintains; there is no
+    // state.basemapId.
+    const active = activeBasemap?.layer;
+    if (!active) return new Promise((resolve) => setTimeout(resolve, 250));
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        active.off("load", done);
+        // One frame after the last tile, so the browser has actually painted
+        // it before the print dialog snapshots the page.
+        requestAnimationFrame(() => setTimeout(resolve, 60));
+      };
+      active.on("load", done);
+      setTimeout(done, timeoutMs);
+      // Leaflet only fires `load` at the end of an actual loading run, so when
+      // the resize needed no new tiles the event never comes and this would
+      // sit out the whole timeout before every print. `_loading` is GridLayer
+      // internals, but it is the only signal for "there is nothing pending" -
+      // guarded so a future Leaflet that drops it just falls back to the
+      // timeout rather than breaking.
+      requestAnimationFrame(() => {
+        if (active._loading === false || active._loading === undefined) done();
+      });
+    });
+  }
+
+  export { showContextMenu, closeContextMenu, prepareMapForPrint };
 
   /** Copies `text` to the clipboard, falling back to a hidden textarea +
    * execCommand("copy") when the Clipboard API is unavailable -
@@ -3449,11 +3531,20 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
     // registers it partway through an async init() that a public-role
     // session returns early from, so "is it available yet" is a real
     // question an import couldn't answer.
-    $("#btn-print-view").addEventListener("click", () => {
+    $("#btn-print-view").addEventListener("click", async () => {
       const printView = getPrintView();
-      if (typeof printView === "function") printView();
-      else window.print();
+      if (typeof printView === "function") { printView(); return; }
+      // No incident-command print view registered (public/viewer session, or
+      // operations.js not loaded): still wait for tiles before printing.
+      await prepareMapForPrint();
+      window.print();
     });
+
+    // Ctrl+P and the browser's own print entry bypass the button entirely, so
+    // the map still has to be re-measured for the print layout. This cannot
+    // await - beforeprint is synchronous - but invalidateSize alone at least
+    // gets the geometry right, and the tiles already on screen are painted.
+    window.addEventListener("beforeprint", () => map.invalidateSize());
 
     $("#btn-cache-view").addEventListener("click", async (e) => {
       const btn = e.currentTarget;
@@ -3819,6 +3910,16 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
     // dependency like rasterio might be missing) - gates the corresponding
     // buttons instead of letting a request 503 with no explanation.
     state.features = config.features || {};
+
+    // The coordinate framework an administrator set for the whole incident.
+    // Applied once per change rather than on every load, so it reaches browsers
+    // that already made a local choice without overriding one made since - see
+    // Coords.adoptSharedSystem.
+    // Order matters: the definition has to be in place before "custom" becomes
+    // the active system, or the first format() call after adoption finds no
+    // projection and renders nothing.
+    Coords.adoptSharedProj4(config.client_settings?.custom_proj4);
+    Coords.adoptSharedSystem(config.client_settings?.coordinate_system);
 
     initMap(config);
     // Deliberate global, and the only one left: the CDP-driven browser test

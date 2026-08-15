@@ -404,4 +404,49 @@
     }
   }
 
-  export { SYSTEMS, parse, parseBbox, detectFormat, format, currentSystem, setSystem, NATIONAL_GRIDS };
+  /** Adopts the server-wide coordinate system chosen in the settings pane.
+   *
+   * A *shared* setting has to actually reach browsers that already made a local
+   * choice, or "set it globally" would only apply to people who had never
+   * touched the picker - which is nobody, after an incident has been running a
+   * while. But it must not overwrite a local choice on every page load either,
+   * or an operator could never deviate.
+   *
+   * So: adopt the server value once, each time it *changes*. The last adopted
+   * value is remembered, and a local change afterwards sticks until the
+   * administrator picks something different again.
+   * @param {string} id - The server's preferred SYSTEMS id, or "" for none.
+   * @returns {boolean} Whether the shared value was adopted just now. */
+  function adoptSharedSystem(id) {
+    if (!id || !SYSTEMS.some((system) => system.id === id)) return false;
+    try {
+      if (localStorage.getItem("nexfiremap.coords.shared") === id) return false;
+      localStorage.setItem("nexfiremap.coords.shared", id);
+    } catch (_) {
+      return false;  // no storage: cannot tell new from already-applied, so leave it alone
+    }
+    setSystem(id);
+    return true;
+  }
+
+  /** Adopts the server-wide proj4/EPSG definition backing the "custom" system.
+   *
+   * Separate from adoptSharedSystem because the two are set together but read
+   * apart: `format`/`parse` look the definition up on every call, so a shared
+   * "custom" system with no definition behind it would silently format nothing.
+   * Adopted unconditionally rather than once-per-change - unlike the system
+   * choice this is not a preference anyone would deviate from locally, it is
+   * the definition of what "custom" *means* here.
+   * @param {string} definition - A proj4 string or EPSG code, or "" for none. */
+  function adoptSharedProj4(definition) {
+    const text = String(definition || "").trim();
+    if (!text) return;
+    try {
+      localStorage.setItem("nexfiremap.coords.customProj4", text);
+    } catch (_) {
+      /* private mode: the custom system stays unavailable, which format() already handles */
+    }
+  }
+
+  export { SYSTEMS, parse, parseBbox, detectFormat, format, currentSystem, setSystem,
+           adoptSharedSystem, adoptSharedProj4, NATIONAL_GRIDS };
