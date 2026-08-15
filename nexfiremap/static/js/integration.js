@@ -17,7 +17,9 @@
    The first of those replaces roughly five minutes of an incident commander's
    first ten, at the moment they have least attention to spare. */
 
-import { onMapContextMenu, getActiveIncident, whenMap, fetchJson } from "./context.js";
+import {
+  onMapContextMenu, getActiveIncident, whenMap, fetchJson, emitIncidentCreated,
+} from "./context.js";
 
 /** Escapes a value for interpolation into innerHTML. Place names and incident
  * names are operator- and geocoder-supplied, so they are untrusted at the
@@ -76,6 +78,10 @@ async function createIncident(map, body, at) {
   try {
     const created = await postJson("/api/operations/incidents/from_context", body);
     const name = created.incident?.name || "incident";
+    // Tell the workspace an incident now exists. Without this the record was
+    // real server-side but absent from the operations panel's list until a full
+    // page reload - the operator's next click after "created!" found nothing.
+    if (created.incident) emitIncidentCreated(created.incident);
     flash(map, at,
       `<strong>${escapeHtml(name)}</strong><br>` +
       `Incident created with an operational period, a first scenario` +

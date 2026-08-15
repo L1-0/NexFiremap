@@ -768,6 +768,14 @@
       <button id="btn-validate-event" class="btn ghost" type="button">validate model (rolling backtest)</button>
       <button id="btn-view-3d" class="btn ghost" type="button">view in 3D terrain</button>
       <p class="hint" id="analysis-status"></p>
+      <!-- Named model caveats from the run itself ("the run assumes calm - real
+           wind would spread the fire faster and further downwind than shown").
+           The backend has produced these since the propagation rewrite and no
+           frontend file read them, so the one mechanism that distinguishes
+           "calm day" from "no wind data, this forecast is optimistic" was
+           invisible. role=status because it appears asynchronously when a run
+           finishes and an operator must not have to go looking for it. -->
+      <ul id="analysis-caveats" class="analysis-caveats" role="status" aria-live="polite" hidden></ul>
       <div id="structure-exposure" class="structure-exposure" hidden>
         <div class="block-head">
           <h3>Structures at risk over time</h3>

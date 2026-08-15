@@ -177,6 +177,43 @@ export function onActiveIncident(callback) {
   callback(activeIncident);
 }
 
+/* Incidents created outside the operations workspace.
+
+   `setActiveIncident` answers "which incident is being worked", which is not
+   the same question as "the set of incidents changed". Creating one from the
+   map's right-click menu wrote a real incident server-side that the operations
+   panel's own list knew nothing about, so it stayed invisible until a full page
+   reload - the two halves shared a selection but not a creation.
+
+   A separate channel rather than overloading the active-incident one, because
+   the subscriber's job is different: reload the list, then select. This is
+   notification, not state, so there is no getter and no late-subscriber replay -
+   an incident created before a subscriber existed is already in the list that
+   subscriber loads on startup. */
+
+/** @type {Array<function(object): void>} */
+const incidentCreatedSubscribers = [];
+
+/** Announces an incident created outside the workspace that owns the list.
+ * @param {{id: string, name: string}} incident */
+export function emitIncidentCreated(incident) {
+  if (!incident) return;
+  incidentCreatedSubscribers.forEach((callback) => {
+    try {
+      callback(incident);
+    } catch (error) {
+      // One bad subscriber must not stop the others from refreshing.
+      console.warn("incident-created subscriber failed", error);
+    }
+  });
+}
+
+/** Subscribes to incidents created elsewhere.
+ * @param {function(object): void} callback */
+export function onIncidentCreated(callback) {
+  incidentCreatedSubscribers.push(callback);
+}
+
 // ----------------------------------------------------------- active tool
 
 /* Which map tool currently owns the left click.

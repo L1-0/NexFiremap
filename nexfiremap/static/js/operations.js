@@ -7,7 +7,10 @@
    existed because app.js's <script> tag came first. */
 
 import { showContextMenu, prepareMapForPrint } from "./app.js";
-import { whenMap, setPrintView, onMapContextMenu, setActiveIncident } from "./context.js";
+import {
+  whenMap, setPrintView, onMapContextMenu, setActiveIncident,
+  getSpreadAnalysis, onSpreadAnalysis, onIncidentCreated,
+} from "./context.js";
 import { registerTool, setTool } from "./tools.js";
 
   const $ = (s) => document.querySelector(s);
@@ -1337,6 +1340,30 @@ import { registerTool, setTool } from "./tools.js";
     $("#ops-model-status").textContent = rows.length ? `${rows.length} auditable model record(s) attached.` : "No model output is attached to this scenario.";
   }
 
+  /** Prefills the model-run job id from whichever analysis is on the map.
+   *
+   * app.js has published the active analysis on the context bus all along
+   * (`setSpreadAnalysis`, carrying its jobId); this panel ignored it and asked
+   * the operator to read a number off one screen and type it into another.
+   * That is precisely the "operator retyping" step the integration layer was
+   * built to remove, and a mistyped job id attaches the wrong provenance to a
+   * plan - silently, because any completed job is a valid id.
+   *
+   * Only ever *prefills*: the field stays editable, and a value the operator
+   * has already typed is never overwritten.
+   * @param {?{jobId: number}} analysis */
+  function prefillModelJobId(analysis) {
+    const field = $("#ops-model-job-id");
+    if (!field || !analysis?.jobId) return;
+    if (field.value.trim() && field.dataset.prefilled !== "1") return;  // operator's own entry wins
+    field.value = String(analysis.jobId);
+    field.dataset.prefilled = "1";
+    const hint = $("#ops-model-status");
+    if (hint && !hint.textContent.trim()) {
+      hint.textContent = `Job ${analysis.jobId} is the analysis currently shown on the map.`;
+    }
+  }
+
   async function attachModelRun() {
     if (!state.incidentId || !state.scenarioId) throw new Error("Select a plan scenario first.");
     const jobId = Number($("#ops-model-job-id").value);
@@ -2051,6 +2078,19 @@ import { registerTool, setTool } from "./tools.js";
     setInterval(() => loadBackupStatus().catch(console.warn), 60000);
     setInterval(() => { if (state.incidentId) refreshVehicleTelemetry().catch(console.warn); }, 15000);
     await checkConnectivity(); setInterval(checkConnectivity, 15000);
+    // The analysis half publishes whichever run is on the map; take it as the
+    // default for "attach model run" instead of asking for it to be retyped.
+    // getSpreadAnalysis() first so a run that finished before this panel
+    // initialised is not missed - the bus's late-subscriber pattern.
+    prefillModelJobId(getSpreadAnalysis());
+    onSpreadAnalysis(prefillModelJobId);
+    // An incident created from the map's right-click menu is a real record this
+    // panel's list has never seen. Reload and select it, so "created!" is
+    // followed by the incident actually being there. `loadIncidents` already
+    // takes the id to prefer, which is exactly this case.
+    onIncidentCreated((incident) => {
+      loadIncidents(incident.id).catch(showError);
+    });
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("/service-worker.js").catch(console.warn);
   }
 

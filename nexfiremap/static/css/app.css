@@ -941,6 +941,24 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .event-wide-span-warning[hidden] { display: none; }
 
+/* Named model caveats from a run ("assumes calm", "ensemble collapsed").
+   Shares the wide-span banner's warning palette on purpose: both answer the
+   same question - "how far should I trust what I am looking at?" - and giving
+   them one visual language means an operator learns to read amber once. */
+.analysis-caveats {
+  margin: 6px 0 0;
+  padding: 8px 10px 8px 26px;
+  list-style: disc;
+  border-radius: 7px;
+  border: 1px solid rgba(250, 178, 25, 0.4);
+  background: rgba(250, 178, 25, 0.08);
+  color: var(--warning);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.analysis-caveats li + li { margin-top: 4px; }
+.analysis-caveats[hidden] { display: none; }
+
 .event-analysis {
   margin-top: 4px;
   padding-top: 10px;

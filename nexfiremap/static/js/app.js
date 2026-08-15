@@ -2349,6 +2349,49 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
         // to the event rather than failing.
         if (state.features.likelihood !== false) analyzeEvent(ev.id);
       });
+
+      // Right-click on the event itself. integration.js has shipped
+      // "Attach event to <incident>" and "Create incident from this event" -
+      // with the snapshot plumbing behind them - since the integration work,
+      // but they were unreachable: `emitMapContextMenu` was only ever called
+      // with kind "point" and kind "area", so no menu ever carried an event.
+      // Committing to *the event* therefore meant right-clicking near it and
+      // creating from a bare point instead, losing the event link and the
+      // frozen bbox/centroid/count snapshot that goes with it.
+      box.on("contextmenu", (menuEvent) => {
+        L.DomEvent.stopPropagation(menuEvent);
+        L.DomEvent.preventDefault(menuEvent);
+        const items = [
+          {
+            label: `Analyze event #${ev.id}`,
+            action: () => analyzeEvent(ev.id),
+          },
+        ];
+        emitMapContextMenu({
+          kind: "event",
+          eventId: ev.id,
+          latlng: menuEvent.latlng,
+          // The snapshot integration.js freezes onto the link. Sent from here
+          // because this is the module that knows what an event *is*; the
+          // integration layer stays domain-agnostic.
+          snapshot: {
+            event_id: ev.id,
+            detection_count: ev.detection_count,
+            first_seen: ev.first_seen,
+            last_seen: ev.last_seen,
+            bbox: [ev.bbox_west, ev.bbox_south, ev.bbox_east, ev.bbox_north],
+            centroid: [ev.centroid_lon, ev.centroid_lat],
+          },
+          addItem: (item) => items.push(item),
+        });
+        // Viewport pixels, matching showPointContextMenu - containerPoint is
+        // relative to the map element and would misplace the menu whenever the
+        // map is not flush with the window.
+        showContextMenu(items, {
+          x: menuEvent.originalEvent.clientX,
+          y: menuEvent.originalEvent.clientY,
+        });
+      });
     });
     eventMarkersLayer = L.layerGroup(boxes).addTo(map);
   }
@@ -2690,6 +2733,32 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
   }
 
   /**
+   * Renders a run's named caveats, or hides the list when there are none.
+   *
+   * The backend has produced these since the propagation rewrite - "the run
+   * assumes calm; real wind would spread the fire faster and further downwind
+   * than shown", "no humidity observations", "the ensemble collapsed onto 1.2
+   * of 24 members" - expressly "for the operator rather than the log"
+   * (terrain.py `_model_caveats`). No frontend file read them, so the single
+   * mechanism separating "calm day" from "no wind data, this forecast is
+   * optimistic" never reached a screen. Under this project's own rule that
+   * "we did not ask" and "there is nothing there" are different answers, a
+   * silent optimistic forecast is the exact failure the field exists to
+   * prevent.
+   *
+   * Hidden rather than emptied when there is nothing to say: an always-present
+   * empty box trains the eye to skip the place warnings appear.
+   * @param {string[]|null|undefined} caveats
+   */
+  function showCaveats(caveats) {
+    const host = $("#analysis-caveats");
+    if (!host) return;
+    const items = Array.isArray(caveats) ? caveats.filter(Boolean) : [];
+    host.hidden = items.length === 0;
+    host.innerHTML = items.map((text) => `<li>${escapeHtml(text)}</li>`).join("");
+  }
+
+  /**
    * Selects an event and kicks off every analysis it supports as
    * independent background jobs (see the comment further down for why
    * they're all fired up front rather than lazily per-click). Also resets
@@ -2736,6 +2805,7 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
     $("#event-analysis").hidden = false;
     $("#h-analysis-event").textContent = `Event #${eventId}`;
     $("#analysis-status").textContent = "Analyzing…";
+    showCaveats(null);  // a new event's caveats are not the previous one's
     // Same wide_span flag the list badge already showed - repeated here as
     // a persistent banner since an operator can open an event straight from
     // a map click (renderEventMarkers()'s bbox rectangles) without ever
@@ -3047,6 +3117,7 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
         `Ensemble probability (${result.n_members} members, ESS ${result.effective_sample_size.toFixed(1)}) · ` +
         `seeded from ${result.seed_detections} early detection(s), scored against ${result.assimilated_observations} later ` +
         `observation(s) · Modelled physics ensemble, not an observation`;
+      showCaveats(result.caveats);
       return;
     }
 
@@ -3089,10 +3160,16 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
 
       const w = result.weather;
       $("#analysis-status").textContent =
-        `Modelled spread (Rothermel-inspired + fast marching) · wind ${w.wind_speed_ms.toFixed(1)} m/s · ` +
+        `Modelled spread (Rothermel + anisotropic graph solve) · wind ${w.wind_speed_ms.toFixed(1)} m/s · ` +
         `${result.grid.nx}×${result.grid.ny} cells @ ${result.grid.res_m.toFixed(0)}m · ` +
         `isochrones shaded soonest (bright) → furthest out (faint) · ` +
-        `wind/slope affect speed, not direction (isotropic solve) · Modelled, not an observation`;
+        // This used to read "wind/slope affect speed, not direction (isotropic
+        // solve)", which stopped being true at the terrain.py rewrite: each
+        // cell carries its own elliptical spread rate and the solver travels 16
+        // bearings. A crew reading the old line would have discounted exactly
+        // the directional spread the model does compute.
+        `wind and slope set both speed and direction · Modelled, not an observation`;
+      showCaveats(result.caveats);
       return;
     }
 
@@ -3137,6 +3214,7 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
         .catch((err) => console.error(err));
     }
 
+    showCaveats(result.caveats);
     const label = state.analysisMode === "arrival" ? "Arrival-time estimate" : "Active-heat likelihood";
     const clearNote = result.clear_pass_count
       ? ` · informed by ${result.clear_pass_count} clear satellite pass(es) (no-fire evidence)`
