@@ -354,6 +354,38 @@ def test_weighted_percentile() -> None:
     check("high percentile picks the largest member", np.allclose(p99, values[2]), str(p99))
 
 
+def test_model_caveats_name_missing_inputs() -> None:
+    """A missing model input must be reported, not silently made reassuring.
+
+    With no wind samples, `fetch_weather` still returns a number because the
+    kernel needs one - but 0 m/s is the *optimistic* end for a spread model: it
+    slows the head fire and pushes arrival times later, which is the direction
+    that gets a crew placed too close. Nothing distinguished that from a
+    genuinely still day, so the run has to say which it was.
+    """
+    print("\nModel caveats for missing inputs")
+    from nexfiremap.terrain import _model_caveats
+
+    absent = _model_caveats({"wind_observed": False, "wind_speed_ms": 0.0,
+                             "relative_humidity_pct": 45.0})
+    check("no wind data is reported as a caveat", len(absent) == 1, str(absent))
+    check("the caveat says the run assumes calm", "calm" in absent[0].lower(), str(absent))
+    check("...and names the consequence, not just the gap",
+          "further" in absent[0] or "faster" in absent[0], str(absent))
+
+    observed = _model_caveats({"wind_observed": True, "wind_speed_ms": 4.2,
+                               "relative_humidity_pct": 45.0})
+    check("a fully observed window carries no caveats", observed == [], str(observed))
+
+    humidity = _model_caveats({"wind_observed": True, "relative_humidity_pct": None})
+    check("missing humidity is reported too", any("humidity" in c for c in humidity), str(humidity))
+
+    backfilled = _model_caveats({"wind_observed": True, "relative_humidity_pct": 40.0,
+                                 "hours_backfilled_recent": 3})
+    check("forecast-backfilled hours are disclosed",
+          any("forecast" in c for c in backfilled), str(backfilled))
+
+
 def main() -> int:
     test_circular_mean()
     test_slope_from_dem()
@@ -366,6 +398,7 @@ def main() -> int:
     test_isochrone_contours_excludes_barrier_cells()
     test_sample_ensemble()
     test_weighted_percentile()
+    test_model_caveats_name_missing_inputs()
 
     print()
     if failures:

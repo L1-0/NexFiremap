@@ -22,15 +22,19 @@ from __future__ import annotations
 
 import json
 import math
+import logging
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from .geo import lon_range_sql
+
+log = logging.getLogger("nexfiremap.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS detections (
@@ -1084,11 +1088,46 @@ class Database:
         self._registry_lock = threading.Lock()
         self._connections: list[sqlite3.Connection] = []
         self._closed = False
+        # Guards against a *stale* rollback: if a write method is interrupted
+        # before its own connection has begun a transaction, rolling back is a
+        # harmless no-op, so this needs no bookkeeping of its own.
         try:
             self._init_schema()
         except Exception:
             self.close()
             raise
+
+    @contextmanager
+    def _write(self):
+        """Hold the write lock, and roll back if the body raises.
+
+        Every write method in this class used to take `_write_lock` directly and
+        commit at the end, with no rollback path. A failure partway through -
+        disk full, a constraint violation, a bug - therefore left an *open
+        transaction* on the shared connection. Two consequences follow, and the
+        second is the dangerous one: every other writer then blocks on SQLite's
+        busy timeout, and the next write on this connection to succeed commits
+        the earlier partial batch along with its own, silently.
+
+        The newer managers (`operations`, `alerts`, `telemetry`, the settings
+        store) all wrap their writes in try/commit/except-rollback already; this
+        class predates that discipline. Keeping the existing `commit()` calls
+        inside the body means the change is one line per method rather than a
+        restructuring: on success the commit has already happened and the
+        rollback is unreachable; on failure it runs.
+
+        Not reentrant, like the plain lock it replaces - no write method may
+        call another.
+        """
+        with self._write_lock:
+            try:
+                yield self.conn
+            except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:  # pragma: no cover - a connection already gone
+                    log.exception("Rollback failed after a write error")
+                raise
 
     # ------------------------------------------------------------------ core
 
@@ -1150,7 +1189,7 @@ class Database:
         `CREATE TABLE IF NOT EXISTS` is idempotent and the ladder skips
         steps at or below the file's own version, so a database already on
         the current schema just gets a cheap no-op pass."""
-        with self._write_lock:
+        with self._write():
             conn = self.conn
             current = int(conn.execute("PRAGMA user_version").fetchone()[0])
             # Checked before anything is written: a newer file opened by
@@ -1212,7 +1251,7 @@ class Database:
             f"ON CONFLICT ({', '.join(key_columns)}) DO UPDATE SET {set_clause}"
         )
         payload = [tuple(row.get(col) for col in DETECTION_COLUMNS) for row in rows]
-        with self._write_lock:
+        with self._write():
             cur = self.conn.executemany(sql, payload)
             self.conn.commit()
             return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
@@ -1361,7 +1400,7 @@ class Database:
         payload = [
             (source, cell_x, cell_y, day, now, row_count, status, note) for day in days
         ]
-        with self._write_lock:
+        with self._write():
             self.conn.executemany(
                 "INSERT INTO coverage "
                 "(source, cell_x, cell_y, day, fetched_at, row_count, status, note) "
@@ -1398,7 +1437,7 @@ class Database:
         drift apart as its detections get purged out from under it.
         """
         cutoff_day = cutoff.isoformat()
-        with self._write_lock:
+        with self._write():
             # Everything below addresses the expiring rows through *subqueries*
             # rather than by pulling their ids into Python and binding one
             # placeholder each. That earlier shape had a hard ceiling: SQLite
@@ -1508,7 +1547,7 @@ class Database:
         """Reclaim space left by purged rows by rewriting the whole file.
         Exclusive and can take a while on a large database, so callers only
         run this from an explicit maintenance action, never on a hot path."""
-        with self._write_lock:
+        with self._write():
             self.conn.execute("VACUUM")
 
     def stats(self) -> dict[str, Any]:
@@ -1547,7 +1586,7 @@ class Database:
 
     def set_meta(self, key: str, value: str) -> None:
         """Set (or overwrite) a ``meta`` key/value pair."""
-        with self._write_lock:
+        with self._write():
             self.conn.execute(
                 "INSERT INTO meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
@@ -1574,7 +1613,7 @@ class Database:
     def set_tle(self, satellite: str, line1: str, line2: str) -> None:
         """Cache a freshly-fetched TLE, replacing whatever was stored for
         that satellite before."""
-        with self._write_lock:
+        with self._write():
             self.conn.execute(
                 "INSERT INTO tle (satellite, line1, line2, fetched_at) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT (satellite) DO UPDATE SET "
@@ -1625,7 +1664,7 @@ class Database:
             (satellite, x, y, day, count, first_ts, last_ts, now)
             for (x, y), (count, first_ts, last_ts) in cells.items()
         ]
-        with self._write_lock:
+        with self._write():
             self.conn.executemany(
                 "INSERT INTO swath_coverage "
                 "(satellite, cell_x, cell_y, day, pass_count, first_ts, last_ts, computed_at) "
@@ -1768,7 +1807,7 @@ class Database:
         ``params`` is stored as JSON so job kinds can carry arbitrary
         argument shapes without schema changes; a worker process picks the
         row up and updates it via the standalone helpers in jobs.py."""
-        with self._write_lock:
+        with self._write():
             cur = self.conn.execute(
                 "INSERT INTO jobs (kind, params_json, status, created_at) "
                 "VALUES (?, ?, 'queued', ?)",
@@ -1811,7 +1850,7 @@ class Database:
         if not fields:
             return
         set_clause = ", ".join(f"{key} = ?" for key in fields)
-        with self._write_lock:
+        with self._write():
             self.conn.execute(
                 f"UPDATE jobs SET {set_clause} WHERE id = ?",
                 [*fields.values(), job_id],
@@ -1822,7 +1861,7 @@ class Database:
         """Drop finished jobs older than max_age_seconds, always keeping the
         most recent ``keep_last`` regardless of age (handy history in the UI)."""
         cutoff = int(time.time()) - max_age_seconds
-        with self._write_lock:
+        with self._write():
             cur = self.conn.execute(
                 "DELETE FROM jobs WHERE status IN ('done', 'error') "
                 "AND finished_at < ? AND id NOT IN ("

@@ -3608,7 +3608,8 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
     // Delegates to coords.js: decimal degrees, DMS, DDM, MGRS and UTM are
     // all self-describing enough to auto-detect; a bare "number number"
     // pair with none of those markers falls back to whatever coordinate
-    // system is currently selected (see wireCoordSystemSelect() below),
+    // system is currently shared for the incident (set in the settings
+    // pane; see coords.currentSystem),
     // WGS84 decimal degrees by default.
     // A bounding box is tried first: "50.7,6.3,50.9,6.5" is four numbers, and
     // parseDecimalPair would otherwise happily read the first two and silently
@@ -3637,33 +3638,13 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
     };
   }
 
-  /** Populates the coordinate-system dropdown from coords.js's registry, restores the last-selected system (and any saved custom proj4 string), and wires changes to persist. */
-  function wireCoordSystemSelect() {
-    const select = $("#coord-system-select");
-    const customInput = $("#coord-custom-proj4");
-    select.innerHTML = Coords.SYSTEMS.map(
-      (system) => `<option value="${system.id}">${escapeHtml(system.label)}</option>`
-    ).join("");
-    const stored = Coords.currentSystem();
-    select.value = Coords.SYSTEMS.some((system) => system.id === stored) ? stored : "wgs84";
-    customInput.hidden = select.value !== "custom";
-    try {
-      customInput.value = localStorage.getItem("nexfiremap.coords.customProj4") || "";
-    } catch (_) {
-      /* private mode/storage pressure - custom definition just starts blank */
-    }
-    select.addEventListener("change", () => {
-      Coords.setSystem(select.value);
-      customInput.hidden = select.value !== "custom";
-    });
-    customInput.addEventListener("change", () => {
-      try {
-        localStorage.setItem("nexfiremap.coords.customProj4", customInput.value.trim());
-      } catch (_) {
-        /* private mode/storage pressure - custom definition just won't persist */
-      }
-    });
-  }
+  // The coordinate-system dropdown and its custom proj4 box used to be wired up
+  // here, next to the search box. Both moved into the settings pane: the
+  // coordinate framework is a decision for the whole incident, not for one
+  // browser, and having it in two places meant the room could disagree with
+  // itself about what format a readback was in. `Coords.currentSystem()` still
+  // answers for parsing and display; the settings pane and
+  // `Coords.adoptSharedSystem` are what set it now.
 
   /** Closes and clears the search results dropdown. */
   function closeSearchResults() {
@@ -3942,7 +3923,6 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
     buildSourceList(config);
     wireControls();
     wireSearchControl();
-    wireCoordSystemSelect();
     wireBasemapPicker();
     wireAppSwitcher();
     wireMapContextMenu();

@@ -317,45 +317,6 @@ html, body {
 }
 .map-search-clear:hover { background: var(--surface-2); color: var(--text-primary); }
 
-/* Which coordinate format a typed "number, number" pair is read as, and
-   which format shown coordinates use - see coords.js. Sits inside the
-   search pill's own right-hand padding, matching the clear button. */
-.coord-system-select {
-  position: absolute;
-  right: 6px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 60px;
-  padding: 3px 2px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--surface-2);
-  color: var(--text-secondary);
-  font: inherit;
-  font-size: 9.5px;
-  cursor: pointer;
-}
-.coord-system-select:hover { color: var(--text-primary); }
-
-.coord-custom-proj4 {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  right: 0;
-  z-index: 1001;
-  padding: 8px 12px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: rgba(26, 26, 25, 0.98);
-  backdrop-filter: blur(10px);
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
-  color: var(--text-primary);
-  font: inherit;
-  font-size: 12px;
-}
-.coord-custom-proj4::placeholder { color: var(--text-muted); }
-.coord-custom-proj4[hidden] { display: none; }
-
 .map-search-results {
   position: absolute;
   top: calc(100% + 6px);

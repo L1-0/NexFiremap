@@ -114,8 +114,12 @@
       placeholder="Search places, or lat, lon" aria-label="Search places or coordinates"
       role="combobox" aria-expanded="false" aria-controls="map-search-results" aria-autocomplete="list">
     <button id="map-search-clear" class="map-search-clear" type="button" hidden aria-label="Clear search">✕</button>
-    <select id="coord-system-select" class="coord-system-select" title="Coordinate format for typed entry and shown coordinates" aria-label="Coordinate format"></select>
-    <input id="coord-custom-proj4" class="coord-custom-proj4" type="text" placeholder="Custom proj4 definition, e.g. +proj=utm +zone=32 +datum=WGS84 +units=m +no_defs" aria-label="Custom proj4 definition" hidden>
+    <!-- The coordinate-format picker and its custom proj4 box used to sit here.
+         They now live in the settings pane, where the choice is shared across
+         the whole incident rather than being one browser's local preference -
+         two controls for one setting, in two places, is how a room ends up
+         reading coordinates in different formats. The search box still accepts
+         and detects every format regardless of which is selected. -->
     <ul id="map-search-results" class="map-search-results" role="listbox" aria-label="Search results" hidden></ul>
   </div>
   <div class="topbar-status">

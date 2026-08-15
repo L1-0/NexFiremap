@@ -294,6 +294,61 @@ def test_purge_cascades_events() -> None:
         db.close()
 
     test_purge_beyond_sql_variable_limit()
+    test_failed_write_does_not_leak_a_transaction()
+
+
+def test_failed_write_does_not_leak_a_transaction() -> None:
+    """A write that fails partway must not leave an open transaction behind.
+
+    Every write method in `Database` took the write lock and committed at the
+    end with no rollback path, so a mid-batch failure left the shared
+    connection inside a transaction. The next successful write on that
+    connection then committed the earlier *partial* batch along with its own -
+    silently, and long after the error that caused it was reported. Every newer
+    manager in the codebase already wraps its writes in
+    try/commit/except-rollback; this class predated that.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as temp:
+        db = Database(Path(temp) / "rollback.sqlite3")
+
+        good = {
+            "source": "VIIRS_NOAA20_NRT", "satellite": "N", "instrument": "VIIRS",
+            "latitude": 47.0, "longitude": 11.0, "acq_date": "2026-08-14",
+            "acq_time": "1200", "acq_ts": 1_786_000_000, "brightness": 300.0,
+            "brightness2": 280.0, "scan": 0.4, "track": 0.4, "confidence_raw": "n",
+            "confidence_pct": None, "confidence_level": "nominal", "frp": 3.0,
+            "daynight": "D", "version": "2.0NRT",
+        }
+        # A second row that will blow up mid-batch: acq_ts is NOT NULL, and the
+        # failure lands after the first row has already been inserted.
+        poison = {**good, "latitude": 47.5, "acq_ts": None}
+
+        try:
+            db.upsert_detections([good, poison])
+        except Exception:
+            pass
+        else:
+            raise AssertionError("the poisoned batch was accepted")
+
+        check(
+            "no transaction left open after a failed write",
+            not db.conn.in_transaction,
+            "connection is still inside a transaction",
+        )
+        check(
+            "the partial batch was rolled back, not left pending",
+            db.conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0] == 0,
+            str(db.conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]),
+        )
+
+        # ...and the next write must commit only its own work.
+        db.upsert_detections([{**good, "latitude": 48.0}])
+        rows = db.conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
+        check("a later write does not resurrect the failed batch", rows == 1, str(rows))
+
+        db.close()
 
 
 def test_purge_beyond_sql_variable_limit() -> None:

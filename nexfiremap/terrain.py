@@ -64,7 +64,7 @@ from .geo import (
     row_to_lat,
     to_north_first,
 )
-from .imagery import read_band_on_grid
+from .imagery import STAC_TIMEOUT_S, read_band_on_grid
 from .jobs import JobContext, register_kind
 from .likelihood import (
     probability_envelopes,
@@ -128,6 +128,34 @@ BARRIER_ROS_M_MIN = 1e-4
 ISOCHRONE_HOURS = (3, 6, 12, 24, 48)
 
 
+def _model_caveats(weather: dict[str, Any]) -> list[str]:
+    """Named limitations of one run, for the operator rather than the log.
+
+    The pattern this exists to break is a modelling input that is missing and
+    then silently substituted with the *reassuring* value - no wind data
+    becoming "calm", which slows the head fire and pushes arrival later. That
+    is the direction that gets a crew placed too close, and nothing on screen
+    would have distinguished it from a genuinely still day.
+
+    A caveat here is not an error. The run is still the best available estimate
+    and is still worth having; it just says out loud which parts of it rest on
+    an absence. Same position `situation.py` takes with its `unavailable` list.
+    """
+    caveats: list[str] = []
+    if not weather.get("wind_observed", True):
+        caveats.append(
+            "No wind observations were available for this window - the run assumes calm. "
+            "Real wind would spread the fire faster and further downwind than shown.")
+    elif weather.get("hours_backfilled_recent"):
+        caveats.append(
+            f"{weather['hours_backfilled_recent']} weather hour(s) came from the forecast "
+            "endpoint rather than the settled archive.")
+    if weather.get("relative_humidity_pct") is None:
+        caveats.append(
+            "No humidity observations - dead-fuel moisture rests on its seed value alone.")
+    return caveats
+
+
 # ------------------------------------------------------------- DEM & fuel
 
 
@@ -135,8 +163,17 @@ def _catalog() -> pystac_client.Client:
     """Microsoft Planetary Computer STAC client, with the ``pc.sign_inplace``
     modifier so every search result's asset hrefs come back pre-signed -
     the DEM/WorldCover fetchers below can hand them straight to
-    ``read_band_on_grid`` without a separate signing step."""
-    return pystac_client.Client.open(STAC_URL, modifier=pc.sign_inplace)
+    ``read_band_on_grid`` without a separate signing step.
+
+    The timeout is not optional. pystac_client has none by default, so on a
+    network that accepts connections and then goes silent - a captive portal, a
+    blackholing firewall, the WAN dying mid-incident - a propagation run would
+    hold one of the (small, cpu_count-1) job-worker slots for the full 1800 s
+    job timeout with nothing to show for it. `imagery.py` learned this and set
+    `STAC_TIMEOUT_S` for exactly this reason; this sibling never got it, so the
+    same stall was reachable through the propagation path. Reusing that module's
+    constant rather than a second literal keeps the two from drifting."""
+    return pystac_client.Client.open(STAC_URL, modifier=pc.sign_inplace, timeout=STAC_TIMEOUT_S)
 
 
 def fetch_dem(bbox: tuple[float, float, float, float], geom: dict[str, Any]) -> np.ndarray:
@@ -327,8 +364,18 @@ def fetch_weather(lat: float, lon: float, start_ts: float, end_ts: float) -> dic
     humidity = [hourly["relative_humidity_2m"][i] for i in in_window if hourly["relative_humidity_2m"][i] is not None]
 
     return {
+        # A window with no usable samples still yields a number, because the
+        # kernel needs one - but 0 m/s is *not* a neutral choice. Calm is the
+        # optimistic end of the range for a spread model: it slows the head
+        # fire and pushes arrival times later, which is the direction that gets
+        # a crew placed too close. So the absence is reported rather than
+        # dressed as an observation. `wind_observed` False means "we do not
+        # know", not "it was still" - the two are indistinguishable in the
+        # number alone, which is exactly the problem.
         "wind_speed_ms": float(np.mean(speeds)) if speeds else 0.0,
         "wind_direction_deg": circular_mean_deg(dirs) if dirs else 0.0,
+        "wind_observed": bool(speeds),
+        "wind_hours_observed": len(speeds),
         "relative_humidity_pct": float(np.mean(humidity)) if humidity else None,
         "hours_sampled": len(in_window),
         # How many of those hours were null from the archive and had to be
@@ -738,6 +785,11 @@ def run_propagation(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         "grid": {"nx": geom["nx"], "ny": geom["ny"], "res_m": geom["res_m"]},
         "reference_ts": reference_ts,
         "weather": {k: v for k, v in weather.items() if not k.startswith("hourly_")},
+        # Named model caveats, so a data gap is something the operator reads on
+        # the result rather than something they would have to infer from a
+        # suspiciously slow forecast. `situation.py` takes the same position:
+        # "we did not ask" and "there is nothing there" are different answers.
+        "caveats": _model_caveats(weather),
         "dead_fuel_moisture": {"1h": round(float(moisture[0]), 3), "10h": round(float(moisture[1]), 3), "100h": round(float(moisture[2]), 3)},
         "typical_max_travel_hours": typical_max_hours,
         # Distinct hour levels actually drawn, not the raw feature count -
@@ -992,6 +1044,11 @@ def run_ensemble_assimilation(params: dict[str, Any], ctx: JobContext) -> dict[s
         "grid": {"nx": geom["nx"], "ny": geom["ny"], "res_m": geom["res_m"]},
         "reference_ts": reference_ts,
         "weather": {k: v for k, v in weather.items() if not k.startswith("hourly_")},
+        # Named model caveats, so a data gap is something the operator reads on
+        # the result rather than something they would have to infer from a
+        # suspiciously slow forecast. `situation.py` takes the same position:
+        # "we did not ask" and "there is nothing there" are different answers.
+        "caveats": _model_caveats(weather),
         "n_members": n_members,
         "effective_sample_size": round(effective_sample_size, 1),
         "seed_detections": len(seed_points),
