@@ -7,7 +7,7 @@
    existed because app.js's <script> tag came first. */
 
 import { showContextMenu } from "./app.js";
-import { whenMap, setPrintView, onMapContextMenu } from "./context.js";
+import { whenMap, setPrintView, onMapContextMenu, setActiveIncident } from "./context.js";
 
   const $ = (s) => document.querySelector(s);
   // Almost every innerHTML template below interpolates operator-supplied
@@ -262,8 +262,12 @@ import { whenMap, setPrintView, onMapContextMenu } from "./context.js";
     state.incidentId = id;
     localStorage.setItem("nexfiremap.activeIncident", id);
     $("#ops-workspace").hidden = !id;
-    if (!id) return;
+    if (!id) { setActiveIncident(null); return; }
     state.workspace = await api(`/api/operations/incidents/${id}`);
+    // Publish the incident being worked so the analytical side (integration.js)
+    // can offer "attach to <name>" without app.js or this module importing each
+    // other - see context.js's active-incident registry.
+    setActiveIncident({ id, name: state.workspace.incident?.name || id });
     const periods = state.workspace.operational_periods;
     const periodSelect = $("#ops-period");
     periodSelect.replaceChildren();

@@ -148,7 +148,9 @@ async def api_model_run_attach(
 ) -> Response:
     store: OperationsStore = request.app.state.operations
     result = await asyncio.to_thread(
-        store.attach_model_run, incident_id, scenario_id, body.job_id, _operator(request)
+        # ..._linked also records the run in the incident's unified link list,
+        # so "what is this incident based on" has one answer rather than two.
+        store.attach_model_run_linked, incident_id, scenario_id, body.job_id, _operator(request)
     )
     return _json(result, 201)
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import math
 import secrets
 import threading
@@ -33,6 +34,9 @@ from uuid import uuid4
 
 from .config import Settings
 from .operations import NotFoundError, OperationsStore, utcnow
+
+
+log = logging.getLogger("nexfiremap.telemetry")
 
 
 class TelemetryError(ValueError):
@@ -400,8 +404,51 @@ class TelemetryManager:
             except Exception:
                 self.db.conn.rollback()
                 raise
+        # Safety evaluation runs *after* the transaction has committed, never
+        # inside it. A position that is stored is a unit that stays on the map;
+        # an evaluation that fails - a pruned job directory, a missing optional
+        # dependency - must not be able to roll back the position that
+        # triggered it. `evaluate_position` returns warnings-or-nothing and
+        # never raises, and this is wrapped as well because the one thing worse
+        # than an unraised warning is a lost position.
+        warnings: list[dict[str, Any]] = []
+        if accepted:
+            try:
+                warnings = self._evaluate_safety(incident_id, prepared)
+            except Exception:  # noqa: BLE001 - see above
+                log.debug("Safety evaluation failed for incident %s", incident_id, exc_info=True)
+
         return {"source_id": source_id, "incident_id": incident_id, "accepted": accepted,
+                "warnings": warnings,
                 "replayed": replayed, "received_at": received_at}
+
+    def _evaluate_safety(self, incident_id: str, prepared: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Check each unit's newest position against hazards and the model.
+
+        Only the *newest* position per callsign is evaluated, not every report
+        in the batch: a device catching up after a signal gap can deliver
+        several minutes of history at once, and warning about where a crew was
+        ten minutes ago - possibly repeatedly - would bury the one warning that
+        is about where they are now.
+        """
+        from .safety import evaluate_position, record_warnings
+
+        newest: dict[str, dict[str, Any]] = {}
+        for item in prepared:
+            current = newest.get(item["callsign"])
+            if current is None or item["observed_epoch"] > current["observed_epoch"]:
+                newest[item["callsign"]] = item
+
+        warnings: list[dict[str, Any]] = []
+        for callsign, item in newest.items():
+            warnings.extend(evaluate_position(
+                self.db, self.settings, incident_id, callsign=callsign,
+                latitude=item["latitude"], longitude=item["longitude"]))
+        if warnings:
+            record_warnings(self.store, incident_id, warnings)
+            for warning in warnings:
+                log.warning("SAFETY: %s", warning["message"])
+        return warnings
 
     def latest(self, incident_id: str) -> dict[str, Any]:
         """Most recent position per (source, callsign), as a point

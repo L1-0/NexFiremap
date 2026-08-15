@@ -411,6 +411,36 @@ All settings are environment variables (or put them in `.env`). See
 | `NEXFIREMAP_DRONE_DIR` | `data/drone` | Preserved drone originals and previews |
 | `NEXFIREMAP_DRONE_MAX_UPLOAD_MB` | `200` | Per-image raw upload bound |
 
+## Closing the operator's loop
+
+The analytical layers (detections, events, propagation models, structures) and
+the operational layers (incidents, scenarios, resources, telemetry) now talk to
+each other, so the loop **See → Assess → Commit → Plan → Execute → Verify →
+Feed back** no longer has a retyping step in the middle.
+
+| Action | What it does |
+|---|---|
+| Right-click → **Create incident here** | One request builds the incident, its first operational period, its first scenario, an area of interest from the event bbox or dragged rectangle, and a snapshot link to what was observed — named via reverse geocoding ("Wildfire near Ismaning") |
+| Right-click → **Situation here** | Asks every module about one point: nearest detections and their age, the event it belongs to, **modelled arrival band**, structures at risk, warnings in force, nearest tracked unit, next satellite overpass |
+| Automatic on every position | A crew inside a burn/evacuation area, or standing where the attached model expects fire within two hours, raises a warning into the audit trail |
+| `GET /api/operations/watch` | New detections inside an active incident's AOI ("14 new detections inside your area of interest") |
+| Built control lines | Rasterise into the propagation model as barriers, so a run made after a dozer line went in stops projecting fire through it |
+
+One rule governs all of it: **cross-module data crosses as an immutable
+snapshot, never a live reference.** Events get re-clustered and models re-run,
+so a plan justified by "the 09:40 run" keeps meaning that afterwards — the
+snapshot is also the only thing that carries meaning across a handover, since
+the receiving installation has none of the source events or jobs.
+
+Two honesty properties worth knowing:
+
+- Modelled arrival is reported as an **earliest/median/latest band**, never one
+  number, and always labelled "modelled, not observed". Withdrawal warnings key
+  off the *earliest* band, not the median.
+- The situation report **names** any provider it could not consult rather than
+  omitting it. "We did not ask" and "there is nothing there" must not look the
+  same to someone deciding whether to send a crew.
+
 ## Emergency-services interoperability
 
 NexFiremap speaks the formats a department's existing equipment already emits,

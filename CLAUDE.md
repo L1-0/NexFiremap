@@ -106,6 +106,56 @@ Two things to keep in mind when editing here:
   it once claimed `application/json` and silently hijacked every native JSON
   batch. There is a regression test for exactly that.
 
+## Analytical ↔ operational integration
+
+The app has two halves - detections/events/models, and incidents/scenarios/
+resources - and until recently the only thing joining them was an operator
+retyping. `nexfiremap/operations/links.py` is that join, and it enforces one
+rule that must not be relaxed:
+
+**Cross-module data crosses as an immutable snapshot with provenance, never as
+a live reference.** Events are re-clustered (their integer ids are not stable),
+models are re-run, detections are purged on the retention window. A plan line
+justified by "the 09:40 propagation run" has to keep meaning that after the
+model is re-run at 11:00. So `incident_links.snapshot_json` is mandatory and
+non-empty, and `add_link` refuses a link without one.
+
+Pieces to know:
+
+- `operations/links.py` - `LinkStore` (links + the incident AOI), plus
+  `normalise_aoi`/`point_in_polygon`, hand-rolled so an AOI test needs no
+  geometry dependency. `incidents_covering()` is the reverse lookup ("does this
+  new detection concern anyone?").
+- `situation.py` - `GET /api/situation` provider registry. A provider that
+  raises, or whose optional dependency is missing, is **named in
+  `unavailable`** rather than silently dropped: "we did not ask" and "there is
+  nothing there" are different answers when someone is deciding whether to send
+  a crew.
+- `safety.py` - the loop that makes the physics protective. Runs inside
+  `TelemetryManager._accept` **after** the transaction commits, and never
+  raises: a failed evaluation must not cost the position that triggered it, or
+  a unit vanishes off the map. Rasters are cached per job id because this is
+  called once per position per vehicle.
+- `routes/links.py` - links/AOI CRUD, `POST .../incidents/from_context`
+  (incident + period + scenario + AOI + link in one transaction), `GET
+  /api/situation`, `GET /api/operations/watch`.
+
+Two ordering constraints that will bite if disturbed:
+
+- **`links.router` must be included before `incidents.router`** in
+  `routes/__init__.py`. It declares `/api/operations/incidents/covering` where
+  incidents declares `/{incident_id}`; Starlette is first-match-wins, so the
+  other order answers a confusing 404. That package's docstring used to say
+  include order was purely cosmetic - it no longer is.
+- **`HAZARD_FEATURE_TYPES` contains only AREA types.** `hazard` is a *point*
+  and has no interior; warning on it would mean inventing a safety radius
+  nobody entered. `structure_protection_area` is excluded too - it marks
+  something worth defending, not somewhere dangerous to stand.
+
+`CONTROL_LINE_BUILT` similarly excludes `proposed`/`planned`: feeding a planned
+line into the propagation model as a barrier would produce a forecast that
+flatters the plan.
+
 ## Project layout
 
 See `README.md`'s "Project layout" section for the full per-module table

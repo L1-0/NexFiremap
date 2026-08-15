@@ -769,6 +769,10 @@
 <script type="module" src="/static/js/app.js"></script>
 <script type="module" src="/static/js/operations.js"></script>
 <script type="module" src="/static/js/structures.js"></script>
+<!-- Joins the analytical map to the operational record (right-click actions).
+     Depends on both only through context.js's registries, so app.js and
+     operations.js still know nothing about each other. -->
+<script type="module" src="/static/js/integration.js"></script>
 <!-- Optional: adds nothing to the page (not even its control) unless the
      server reports configured CAP warning feeds via /api/config. -->
 <script type="module" src="/static/js/alerts.js"></script>

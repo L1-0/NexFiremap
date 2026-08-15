@@ -45,6 +45,7 @@ from .common import _clean_text, _id, _json_load, _validate_geometry, utcnow
 from .errors import NotFoundError, OperationsError, PackageConflict
 from .features import FeatureStore
 from .incidents import IncidentStore
+from .links import LinkStore
 from .resources import ResourceStore
 from .scenarios import ScenarioStore
 from .vocab import FEATURE_TYPES
@@ -54,12 +55,16 @@ class PackageStore(AggregateStore):
     """Export, snapshot, compare and import whole incidents."""
 
     def __init__(self, db: Database, audit: AuditLog, incidents: IncidentStore,
-                 features: FeatureStore, scenarios: ScenarioStore, resources: ResourceStore) -> None:
+                 features: FeatureStore, scenarios: ScenarioStore, resources: ResourceStore,
+                 links: LinkStore | None = None) -> None:
         super().__init__(db, audit)
         self.incidents = incidents
         self.features = features
         self.scenarios = scenarios
         self.resources = resources
+        # Optional so a PackageStore built by older code (or a test) still
+        # constructs; a bundle then simply carries no links.
+        self.links = links
 
     # ---------------------------------------- export, snapshots & comparison
     def export_bundle(self, incident_id: str) -> dict[str, Any]:
@@ -111,6 +116,11 @@ class PackageStore(AggregateStore):
                 "features": {"type": "FeatureCollection", "features": features},
                 "resources": self.resources.list_resources(incident_id), "safety_checks": safety,
                 "source_imports": source_imports, "model_runs": self.scenarios.list_model_runs(incident_id),
+                # What this incident was linked to on the analytical side.
+                # Each entry carries its own frozen snapshot, so a package
+                # opened on another machine - which has none of the source
+                # events, jobs or detections - still shows what was seen.
+                "links": self.links.list_links(incident_id) if self.links else [],
                 "tactical_warning_acknowledgements": warning_acknowledgements,
                 "audit_log": audit}
 
@@ -287,6 +297,10 @@ class PackageStore(AggregateStore):
         source_imports = bundle.get("source_imports", [])
         model_runs = bundle.get("model_runs", [])
         warning_acks = bundle.get("tactical_warning_acknowledgements", [])
+        # Absent for a package produced before links existed, which must still
+        # import cleanly - a handover from an older installation is exactly the
+        # case this format has to tolerate.
+        links = bundle.get("links", [])
         if not isinstance(incident, dict) or not _clean_text(incident.get("id"), 100) or not _clean_text(incident.get("name"), 300):
             errors.append("incident id and name are required")
         for label, value in (("operational_periods", periods), ("scenarios", scenarios),
@@ -478,6 +492,10 @@ class PackageStore(AggregateStore):
         source_imports = bundle.get("source_imports", [])
         model_runs = bundle.get("model_runs", [])
         warning_acks = bundle.get("tactical_warning_acknowledgements", [])
+        # Absent for a package produced before links existed, which must still
+        # import cleanly - a handover from an older installation is exactly the
+        # case this format has to tolerate.
+        links = bundle.get("links", [])
         incident_columns = ("id", "name", "incident_number", "status", "timezone", "center_lat", "center_lon", "notes", "created_at", "updated_at", "revision")
         period_columns = ("id", "incident_id", "name", "starts_at", "ends_at", "status", "objectives", "approved_by", "approved_at", "created_at", "updated_at", "revision")
         scenario_columns = ("id", "incident_id", "period_id", "name", "kind", "status", "description", "assumptions", "approved_by", "approved_at", "warning_acknowledged", "created_at", "updated_at", "revision")
@@ -531,6 +549,23 @@ class PackageStore(AggregateStore):
                          row.get("model_kind") or (row.get("provenance") or {}).get("model_kind") or "unknown",
                          json.dumps(row.get("provenance") or {}, separators=(",", ":")),
                          row.get("attached_by") or "imported", row.get("attached_at") or utcnow()),
+                    )
+                for row in links:
+                    # A link's *snapshot* is what survives a handover: the
+                    # receiving installation has none of the source events,
+                    # jobs or detections, and its own event ids mean something
+                    # entirely different. Importing the frozen snapshot is
+                    # therefore the only thing that carries meaning across, and
+                    # it is exactly why links are snapshots rather than
+                    # references (see links.py's module docstring).
+                    self.db.conn.execute(
+                        "INSERT OR REPLACE INTO incident_links "
+                        "(id,incident_id,kind,ref_id,snapshot_json,note,actor,created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?)",
+                        (row.get("id"), row.get("incident_id"), row.get("kind"), str(row.get("ref_id") or ""),
+                         json.dumps(row.get("snapshot") or {}, sort_keys=True, separators=(",", ":")),
+                         row.get("note") or "", row.get("actor") or "imported",
+                         row.get("created_at") or utcnow()),
                     )
                 for row in warning_acks:
                     self.db.conn.execute(

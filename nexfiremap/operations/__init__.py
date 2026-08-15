@@ -70,6 +70,7 @@ from .common import (
 from .errors import NotFoundError, OperationsError, PackageConflict, RevisionConflict
 from .features import FeatureStore
 from .incidents import IncidentStore, default_period
+from .links import LINK_KINDS, LinkStore, aoi_bbox, normalise_aoi, point_in_polygon
 from .packages import PackageStore
 from .resources import ResourceStore
 from .scenarios import ScenarioStore
@@ -104,7 +105,9 @@ __all__ = [
     "_id", "_clean_text", "_json_load", "_plain", "_feature", "_validate_geometry",
     # stores
     "OperationsStore", "AggregateStore", "AuditLog", "IncidentStore", "FeatureStore",
-    "ScenarioStore", "ResourceStore", "PackageStore",
+    "ScenarioStore", "ResourceStore", "PackageStore", "LinkStore",
+    # cross-module links between the analytical and operational halves
+    "LINK_KINDS", "aoi_bbox", "normalise_aoi", "point_in_polygon",
 ]
 
 
@@ -153,8 +156,13 @@ class OperationsStore:
         self.features = FeatureStore(db, self.audit_log, self.incidents)
         self.scenarios = ScenarioStore(db, self.audit_log, self.features)
         self.resources = ResourceStore(db, self.audit_log, self.incidents)
+        # Links join this operational record to the analytical side
+        # (events, model runs, alerts). Takes IncidentStore for the same
+        # reason FeatureStore does: a link must confirm its incident exists.
+        self.links = LinkStore(db, self.audit_log, self.incidents)
         self.packages = PackageStore(
-            db, self.audit_log, self.incidents, self.features, self.scenarios, self.resources
+            db, self.audit_log, self.incidents, self.features, self.scenarios,
+            self.resources, self.links
         )
 
     @property
@@ -229,6 +237,65 @@ class OperationsStore:
         return self.scenarios.copy_scenario(incident_id, scenario_id, target_period_id, name, actor)
 
     # -------------------------------------------------- model run provenance
+    # ------------------------------------------------- cross-module links
+
+    def add_link(self, incident_id: str, kind: str, ref_id: str,
+                 snapshot: dict[str, Any], note: str = "",
+                 actor: str = "local operator") -> dict[str, Any]:
+        """Link this incident to something the analytical side produced.
+        See `links.LinkStore.add_link` - the snapshot is mandatory."""
+        return self.links.add_link(incident_id, kind, ref_id, snapshot, note, actor)
+
+    def list_links(self, incident_id: str, kind: str | None = None) -> list[dict[str, Any]]:
+        """See `links.LinkStore.list_links`."""
+        return self.links.list_links(incident_id, kind)
+
+    def get_link(self, incident_id: str, link_id: str) -> dict[str, Any]:
+        """See `links.LinkStore.get_link`."""
+        return self.links.get_link(incident_id, link_id)
+
+    def remove_link(self, incident_id: str, link_id: str, actor: str = "local operator") -> bool:
+        """See `links.LinkStore.remove_link`."""
+        return self.links.remove_link(incident_id, link_id, actor)
+
+    def set_aoi(self, incident_id: str, geometry: dict[str, Any] | None,
+                actor: str = "local operator") -> dict[str, Any]:
+        """See `links.LinkStore.set_aoi`."""
+        return self.links.set_aoi(incident_id, geometry, actor)
+
+    def get_aoi(self, incident_id: str) -> dict[str, Any] | None:
+        """See `links.LinkStore.get_aoi`."""
+        return self.links.get_aoi(incident_id)
+
+    def incidents_covering(self, lat: float, lon: float, *, active_only: bool = True
+                           ) -> list[dict[str, Any]]:
+        """See `links.LinkStore.incidents_covering`."""
+        return self.links.incidents_covering(lat, lon, active_only=active_only)
+
+    def attach_model_run_linked(self, incident_id: str, scenario_id: str, job_id: int,
+                                actor: str = "local operator") -> dict[str, Any]:
+        """`attach_model_run`, and also record it in the unified link list.
+
+        The scenario attachment is what the *plan* needs (which run justified
+        this plan); the link is what the *incident* needs (everything analytical
+        this incident is built on, in one place, each with its own frozen
+        snapshot). Keeping both rather than replacing one with the other means
+        `incident_model_runs`' UNIQUE(scenario_id, job_id) still guarantees one
+        run per scenario, while the link list stays the single answer to "what
+        is this incident based on".
+        """
+        record = self.attach_model_run(incident_id, scenario_id, job_id, actor)
+        # A model run is re-run with new weather under the same scenario, so the
+        # snapshot has to freeze *this* run's provenance - the whole reason
+        # links are snapshots (see links.py).
+        self.links.add_link(
+            incident_id, "model_run", str(job_id),
+            {"job_id": job_id, "scenario_id": scenario_id,
+             "model_kind": record.get("model_kind"),
+             "provenance": record.get("provenance") or {}},
+            "attached to scenario", actor)
+        return record
+
     def attach_model_run(self, incident_id: str, scenario_id: str, job_id: int,
                          actor: str = "local operator") -> dict[str, Any]:
         """Link a fire-behaviour model job's provenance to a scenario.

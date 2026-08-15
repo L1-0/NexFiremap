@@ -364,6 +364,7 @@ def build_directional_behavior(
     moisture: np.ndarray,
     fuel_mult: float = 1.0,
     spread_mult: float = 1.0,
+    control_lines: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Per-cell directional fire behaviour (max spread rate/direction + elliptical
     eccentricity) from the real Rothermel kernel (`nexfiremap.rothermel`), replacing
@@ -381,6 +382,19 @@ def build_directional_behavior(
     )
     max_ros = behavior["max_ros_m_min"] * fuel_mult * spread_mult
     nonburnable = fuel_ids <= 0
+    # Completed control lines are barriers the operator built, folded into the
+    # same mask as land-cover barriers rather than modelled separately. This is
+    # the feedback edge that closes the loop: until now the model only knew what
+    # the *land* was, never what the crews had done to it, so a run made after a
+    # dozer line went in still projected fire straight through it. A line the
+    # operator drew is ground truth of a kind no land-cover raster carries.
+    #
+    # It is deliberately the same treatment as a lake or a road: floored at
+    # BARRIER_ROS_M_MIN rather than set to zero, so fire can still cross a line
+    # given enough time - which is what real control lines do, and what the
+    # solver's own comment at the barrier branch already assumes.
+    if control_lines is not None:
+        nonburnable = nonburnable | control_lines.astype(bool)
     max_ros[nonburnable] = BARRIER_ROS_M_MIN
     behavior["eccentricity"][nonburnable] = 0.0
     return {"max_ros_m_min": np.maximum(max_ros, BARRIER_ROS_M_MIN), "max_dir_deg": behavior["max_dir_deg"], "eccentricity": behavior["eccentricity"]}

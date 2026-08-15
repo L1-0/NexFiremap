@@ -136,6 +136,47 @@ export function emitMapContextMenu(detail) {
   contextMenuContributors.forEach((callback) => callback(detail));
 }
 
+// ------------------------------------------------- active incident context
+
+/* The incident the operator is currently working, published by operations.js
+   and read by anything analytical that wants to offer "…to incident ⟨name⟩".
+
+   This is the piece that lets the two halves of the application talk without
+   depending on each other: app.js knows about detections and events and
+   nothing about incidents; operations.js is the reverse. Routing the active
+   incident through here means a right-click on a fire event can offer "attach
+   to Waldbrand Nord" without either module importing the other.
+
+   Same publish/subscribe/late-subscriber shape as setSpreadAnalysis above,
+   deliberately - one idiom for shared state in this app, not three. */
+
+/** @type {?{id: string, name: string}} */
+let activeIncident = null;
+/** @type {Array<function(?object): void>} */
+const incidentSubscribers = [];
+
+/** Publishes the incident the operator is working on (or null when cleared).
+ * @param {?{id: string, name: string}} incident */
+export function setActiveIncident(incident) {
+  activeIncident = incident;
+  incidentSubscribers.forEach((callback) => callback(incident));
+}
+
+/** The active incident, or null if none is selected.
+ * @returns {?{id: string, name: string}} */
+export function getActiveIncident() {
+  return activeIncident;
+}
+
+/** Subscribes to active-incident changes, firing immediately with the current
+ * value so a late subscriber is never left waiting for a change that already
+ * happened - the property every subscribe function in this file guarantees.
+ * @param {function(?object): void} callback */
+export function onActiveIncident(callback) {
+  incidentSubscribers.push(callback);
+  callback(activeIncident);
+}
+
 // ------------------------------------------------------------ fetch helper
 
 /** Fetches JSON from the local command server and throws with the server's

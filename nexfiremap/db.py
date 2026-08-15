@@ -579,6 +579,38 @@ CREATE TABLE IF NOT EXISTS local_accounts (
     updated_at    TEXT NOT NULL
 );
 
+-- What an incident is linked to in the analytical world.
+--
+-- The two halves of this application - detections/events/models on one side,
+-- incidents/scenarios/resources on the other - had no edge between them except
+-- an operator retyping. This table is that edge.
+--
+-- `snapshot_json` is mandatory and is the entire point. Events get
+-- re-clustered, models get re-run, detections get purged on the retention
+-- window: a live foreign key would silently rewrite history underneath a plan.
+-- So a link freezes what the operator actually saw at link time (the event's
+-- bbox and detection count, the job id and its generated-at, the alert's
+-- severity) and keeps meaning that afterwards. Same discipline as
+-- `incident_snapshots` storing a whole bundle verbatim and
+-- `incident_source_imports` keeping original bytes.
+--
+-- `ref_id` is TEXT even though some referents (events, jobs) have integer ids,
+-- because others (alerts, drone assets, imports) do not - one column beats one
+-- table per referent kind. The UNIQUE constraint makes re-linking idempotent,
+-- so a repeated "attach to incident" updates rather than accumulating.
+CREATE TABLE IF NOT EXISTS incident_links (
+    id            TEXT PRIMARY KEY,
+    incident_id   TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL,
+    ref_id        TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    note          TEXT NOT NULL DEFAULT '',
+    actor         TEXT NOT NULL DEFAULT 'local operator',
+    created_at    TEXT NOT NULL,
+    UNIQUE (incident_id, kind, ref_id)
+);
+CREATE INDEX IF NOT EXISTS idx_incident_links ON incident_links (incident_id, kind, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS incident_audit_log (
     id          TEXT PRIMARY KEY,
     incident_id TEXT NOT NULL,
@@ -842,6 +874,16 @@ MIGRATIONS: tuple[MigrationStep, ...] = (
         description="detections.raw_json - retrofit onto pre-v4 databases",
         apply=_add_missing_columns("detections", (("raw_json", "TEXT"),)),
     ),
+    # v6 needs a real rung, unlike v5. v5 added only brand-new tables, which the
+    # idempotent SCHEMA script creates by itself; this adds a column to
+    # `incidents`, which already exists, and `CREATE TABLE IF NOT EXISTS` is a
+    # no-op the moment the name is taken. That asymmetry is exactly what the
+    # ladder is for.
+    MigrationStep(
+        version=6,
+        description="incidents.aoi_json - the incident's area of interest",
+        apply=_add_missing_columns("incidents", (("aoi_json", "TEXT"),)),
+    ),
 )
 
 # Bumped whenever SCHEMA or MIGRATIONS gain something an existing database
@@ -850,14 +892,18 @@ MIGRATIONS: tuple[MigrationStep, ...] = (
 # warranted and which steps are still pending. A version that needs no step
 # of its own (a purely additive SCHEMA change) simply has no entry in
 # MIGRATIONS above - the runner stamps the gap once the ladder is done.
-# v5 adds `custom_layers` (operator-added WMS/WMTS/XYZ map layers), `alerts`
+# v6 adds `incidents.aoi_json` - a column on an existing table, so it needs a
+# real rung in MIGRATIONS above (see the note there) - and `incident_links`,
+# which is another new table and does not.
+#
+# v5 added `custom_layers` (operator-added WMS/WMTS/XYZ map layers), `alerts`
 # (CAP public warnings) and the `webhooks`/`webhook_deadletter` pair
 # (dispatch/CAD ingest). All are brand-new tables, which the
 # idempotent SCHEMA script above creates on its own, so there is deliberately
 # no rung for any of them in MIGRATIONS - the runner stamps the gap once the
 # ladder is done. The version still has to move, or an existing database would never
 # trigger the pre-migration backup.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _refuse_downgrade(current: int, target: int) -> None:

@@ -14,11 +14,15 @@ is deliberately no `Depends()` indirection layer: `request.app.state` is
 already the one uniform accessor, and every handler in this package uses
 it.
 
-`ROUTERS` is the include order `create_app()` walks. Ordering is
-cosmetic, not semantic - it decides how endpoints group in the generated
-OpenAPI docs, nothing more, since no two routes in this app share a
-(path-shape, method) pair that could make Starlette's first-match-wins
-resolution depend on registration order.
+`ROUTERS` is the include order `create_app()` walks. Ordering is mostly
+cosmetic - it decides how endpoints group in the generated OpenAPI docs -
+with **one exception that is genuinely load-bearing**: `links` must be
+included before `incidents`, because it declares literal path segments
+where `incidents` declares a parameter
+(`/api/operations/incidents/covering` vs
+`/api/operations/incidents/{incident_id}`). Starlette resolves
+first-match-wins, so the wrong order routes `covering` into the incident
+lookup and answers a confusing 404. See the comment on that entry below.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from . import (
     industrial,
     jobs,
     layers,
+    links,
     map_packs,
     meta,
     offline_sources,
@@ -67,6 +72,13 @@ ROUTERS: tuple[APIRouter, ...] = (
     map_packs.router,
     transfer.router,
     field_imports.router,
+    # links MUST precede incidents. It declares literal paths that sit where
+    # incidents declares a parameter - `/api/operations/incidents/covering`
+    # against `/api/operations/incidents/{incident_id}` - and Starlette matches
+    # first-registered-wins, so the other order silently routes `covering` into
+    # the incident lookup and answers 404 "incident not found". This is the one
+    # place in the app where include order is load-bearing rather than cosmetic.
+    links.router,
     incidents.router,
     features.router,
     tactics.router,

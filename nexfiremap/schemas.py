@@ -168,6 +168,54 @@ class SafetyUpdateRequest(BaseModel):
     checks: list[dict[str, Any]]
 
 
+# ------------------------------------------------- cross-module links
+
+class IncidentLinkRequest(BaseModel):
+    """Attach an observation or analysis result to an incident.
+
+    `snapshot` is required rather than optional and is validated in
+    `LinkStore.add_link` (non-empty, size-bounded): a link without one is a
+    live reference, which is exactly what the links table exists to avoid -
+    events get re-clustered and models re-run, so a plan justified by "the
+    09:40 run" has to keep meaning that afterwards.
+    """
+
+    kind: str = Field(..., min_length=1, max_length=40)
+    ref_id: str = Field(..., min_length=1, max_length=200)
+    snapshot: dict[str, Any] = Field(...)
+    note: str = Field("", max_length=1000)
+
+
+class IncidentAoiRequest(BaseModel):
+    """Set or clear an incident's area of interest.
+
+    Either a GeoJSON Polygon or a [west,south,east,north] bbox - the two ways
+    an operator produces one (drawing a shape, dragging a rectangle). Both are
+    normalised to a Polygon on the way in so nothing downstream branches on
+    shape. Sending neither clears the AOI.
+    """
+
+    aoi: dict[str, Any] | None = None
+    bbox: list[float] | None = Field(None, min_length=4, max_length=4)
+
+
+class IncidentFromContextRequest(BaseModel):
+    """Create an incident from something the operator right-clicked.
+
+    Exactly one of `event_id`, `bbox`, or `lat`+`lon` identifies the source;
+    the route rejects a request carrying none of them.
+    """
+
+    event_id: int | None = None
+    bbox: str | None = Field(None, max_length=100, description="west,south,east,north")
+    lat: float | None = Field(None, ge=-90, le=90)
+    lon: float | None = Field(None, ge=-180, le=180)
+    radius_km: float | None = Field(None, gt=0, le=200)
+    days: int = Field(3, ge=1, le=60)
+    name: str | None = Field(None, max_length=300)
+    notes: str = Field("", max_length=10000)
+
+
 # ------------------------------------------------------------ features
 
 class TacticalFeatureCreateRequest(BaseModel):
