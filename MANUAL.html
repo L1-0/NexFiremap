@@ -174,7 +174,6 @@ output says so in its own text, and this manual repeats those statements rather 
 <tr><td>EUMETSAT Data Store</td><td>Independent MTG/FCI active-fire confirmation (optional)</td><td>Yes, free account</td></tr>
 </table>
 
-<!-- SECTION:1:INTRO -->
 <h1 id="c2">2. Installation and first start</h1>
 
 <h2 id="c2-1">2.1 Requirements</h2>
@@ -237,17 +236,1385 @@ and its buttons disable themselves in the interface with an explanation instead 
 crashing. The setup wizard's package-by-package fallback and connectivity tests exist to catch this
 before the map is ever opened.</p>
 
-<!-- SECTION:2:INSTALL -->
-<!-- SECTION:3:AUTH -->
-<!-- SECTION:4:MODULES -->
-<!-- SECTION:5:FIREMAP -->
-<!-- SECTION:6:EVENTVIEW -->
-<!-- SECTION:7:INCIDENTCOMMAND -->
-<!-- SECTION:8:INGEST -->
-<!-- SECTION:9:RETENTION -->
-<!-- SECTION:10:CONFIG -->
-<!-- SECTION:11:DEVGUIDE -->
-<!-- SECTION:12:APPENDIX -->
+<h1 id="c3">3. Signing in, accounts and roles</h1>
+
+<h2 id="c3-1">3.1 Two modes</h2>
+<p>By default NexFiremap runs with no login screen at all: it only listens on the local loopback
+address, so only the same machine can reach it, and authentication is not required. This is the mode
+described in chapter 2.</p>
+<p>Setting <code>NEXFIREMAP_LAN_MODE=true</code> switches to a fail-closed, authenticated mode intended
+for sharing the server with other devices on an incident LAN (chapter 11.6). In this mode every browser
+sees an "Incident LAN sign in" dialog before anything else loads, and every API request must belong to a
+signed-in session. There is no in-between state: the server either trusts anyone who can reach it
+(loopback default) or requires a named account for everyone (LAN mode).</p>
+
+<h2 id="c3-2">3.2 The built-in administrator account</h2>
+<p>When LAN mode is enabled, the server requires <code>NEXFIREMAP_ADMIN_PASSWORD</code> to be at least 12
+characters, or it refuses to start. On every startup it creates or updates a local account named
+<code>admin</code> with the role <code>administrator</code> and that password. This means the admin
+password is always whatever is currently set in the environment: if it is lost, an administrator stops
+the server, sets a new <code>NEXFIREMAP_ADMIN_PASSWORD</code>, and restarts. This rotates the password
+without deleting any incident data. Record any emergency password change in the incident log.</p>
+
+<h2 id="c3-3">3.3 Roles</h2>
+<p>There are six roles. A role is fixed per account; there is no per-object permission editing beyond
+role membership.</p>
+<table>
+<tr><th>Role</th><th>Can read</th><th>Can write</th></tr>
+<tr><td><code>viewer</code></td><td>Everything except public-only restrictions</td><td>Nothing</td></tr>
+<tr><td><code>field_editor</code></td><td>Everything</td><td>Tactical/observation features, field-import
+records, resources, position reports, drone/image assets (any path containing <code>/features</code>,
+<code>/field-imports</code>, <code>/resources</code>, <code>/position-reports</code> or
+<code>/assets</code>)</td></tr>
+<tr><td><code>plans</code></td><td>Everything</td><td>Periods, scenarios, features, products,
+snapshots, drone missions, mosaics, map packs (any path containing <code>/periods</code>,
+<code>/scenarios</code>, <code>/features</code>, <code>/products</code>, <code>/snapshots</code>,
+<code>/drone-missions</code>, <code>/mosaics</code> or <code>/map-packs</code>)</td></tr>
+<tr><td><code>safety</code></td><td>Everything</td><td>Safety review and plan approval only (any path
+containing <code>/safety</code> or <code>/approve</code>)</td></tr>
+<tr><td><code>administrator</code></td><td>Everything</td><td>Everything</td></tr>
+<tr><td><code>public</code></td><td>Only paths starting with <code>/api/public/</code>, plus
+<code>/api/auth/session</code> and <code>/api/config</code></td><td>Nothing</td></tr>
+</table>
+<p>The <strong>Public incident information</strong> panel is what a <code>public</code>-role account
+sees: only products explicitly generated with the public-information template (chapter 7.8) appear
+there. Nothing else in the incident workspace is reachable by that role, by server-side check, not just
+by hiding the button in the interface.</p>
+
+<h2 id="c3-4">3.4 Creating accounts</h2>
+<p>Only an administrator can create accounts, from <strong>Incident LAN accounts</strong> under the
+NexIncidentCommand module (this section is hidden from every other role). Enter a username, choose a
+role, and set an initial password of at least 12 characters. Issue each person their own named account
+with the least-privileged role that covers their job; do not share the administrator account, and do not
+let the <code>admin</code> login be a routine daily login for a field user.</p>
+
+<h2 id="c3-5">3.5 Sessions and login limits</h2>
+<p>A session lasts <code>NEXFIREMAP_SESSION_MINUTES</code> (default 60) from login, holds a session
+token and a separate CSRF token, and is checked on every request. Login attempts are rate-limited: at
+most 10 attempts per 60 seconds per client. If a device cannot sign in, an administrator creates a
+replacement named account; do not disable authentication or fall back to loopback-only mode to work
+around a lockout while the server is meant to stay on the LAN.</p>
+
+<h1 id="c4">4. The four modules and shared map controls</h1>
+
+<p>NexFiremap is one server and one page. A menu in the top left, labelled with the current module's
+name, switches between four modules without reloading the map or losing anything drawn on it: a tactical
+feature drawn while in NexIncidentCommand stays on the map while looking at NexFiremap's own satellite
+layers. Switching to NexFiremap starts with the side panel collapsed, since it is map-first; switching to
+any of the other three always opens the panel, since they are not usable without their own tools open.</p>
+
+<table>
+<tr><th>Module</th><th>Tagline shown in the menu</th><th>Covered in</th></tr>
+<tr><td>NexFiremap</td><td>Satellite fire detections, coverage, sources</td><td>chapter 5</td></tr>
+<tr><td>NexIncidentCommand</td><td>Plans, tactics, safety, resources, products</td><td>chapter 7</td></tr>
+<tr><td>NexIngest</td><td>Telemetry, drone imagery, field data, imports</td><td>chapter 8</td></tr>
+<tr><td>NexEventView</td><td>Fire event detection and behaviour analysis</td><td>chapter 6</td></tr>
+</table>
+
+<h2 id="c4-1">4.1 The incident context bar</h2>
+<p>NexIncidentCommand, NexIngest and NexEventView all share one incident context at the top of the panel:
+an active-incident selector, an operator/unit name field, and operational period and plan scenario
+selectors. Most tools in those three modules act on whichever incident, period and scenario are currently
+selected there, so pick or create an incident first (chapter 7.2).</p>
+
+<h2 id="c4-2">4.2 The map tool palette</h2>
+<p>A row of buttons floats over the map itself, independent of the module switcher and side panel:</p>
+<table>
+<tr><th>Tool</th><th>Key</th><th>What it does</th></tr>
+<tr><td>Select</td><td>V</td><td>The default, no-tool state. Ordinary map panning/clicking on existing features.</td></tr>
+<tr><td>Waypoint</td><td>W</td><td>Click once to drop a point and see a situation report for that spot (chapter 4.3). Click again to extend it into a line, and again into a closed area; each added vertex offers to save it as a tactical feature, set it as the active incident's area of interest, or create a new incident from it. Right-click removes the last vertex. Drag a vertex to move it.</td></tr>
+<tr><td>Measure</td><td>M</td><td>Click to add points along a line; shows each leg's distance and bearing, a running total, and (with 3 or more points) the straight-line distance between the first and last point. Nothing is saved.</td></tr>
+<tr><td>Sketch</td><td>S</td><td>The same tactical drawing system described in chapter 7.3, exposed as a toolbar shortcut. Needs an incident and operational period selected first; the button explains this if neither is set.</td></tr>
+<tr><td>Settings</td><td>,</td><td>Opens the Settings pane (chapter 8.6), not a map mode.</td></tr>
+</table>
+<p>Only one mode tool is active at a time; pressing Escape always returns to Select. Leaving a tool with
+unsaved points (Waypoint or an in-progress Sketch) asks for confirmation first.</p>
+
+<h2 id="c4-3">4.3 Situation reports</h2>
+<p>Right-clicking a point on the map, or dropping a single Waypoint, can show a situation report: everything
+every part of the server currently knows about that point, gathered in one place. Under the hood this
+calls a single endpoint (chapter 11.4.7) that asks every relevant part of the server in turn: nearby
+detections, which fire event (if any) the point falls inside, which incidents' areas of interest cover
+it, a modelled arrival estimate if a spread model has been run nearby, nearby structures from a prior
+scan, in-force official warnings, nearby tracked vehicles, and the next satellite overpass. A part that
+could not answer, whether because it is not configured or because it failed, is named as
+<strong>not consulted</strong> rather than silently left out, so "we did not check" and "there is nothing
+there" are never confused with each other.</p>
+<p>Right-clicking a detected fire event also offers <strong>attach event to (incident)</strong>, when an
+incident is active, and <strong>create incident from this event</strong>; right-clicking empty map space
+offers <strong>create incident here</strong> or, with an area selected, <strong>create incident for this
+area</strong>. Each of these creates the incident together with its first operational period, its first
+scenario, and, where relevant, an area of interest and a link back to what was selected, in one step
+(chapter 11.4.7).</p>
+
+<h2 id="c4-4">4.4 Basemap and overlays</h2>
+<p>The map-style button (bottom right of the map) opens a grid of basemaps: OpenStreetMap, Humanitarian
+OSM, OpenTopoMap, CyclOSM, Carto Positron (light), Carto Dark Matter, Esri World Imagery, and Esri Terrain
+(full detail to zoom 9, enlarged beyond that). A place-labels overlay can be switched on over any of them.
+An administrator can add further WMS, WMTS or plain XYZ layers from an external service (chapter 8.5), or
+an imported local MBTiles/GeoTIFF basemap (chapter 8.4); both then appear in this same picker.</p>
+
+<h2 id="c4-5">4.5 Search and coordinates</h2>
+<p>The search box in the top bar resolves place names through a server-proxied, cached, rate-limited call
+to Nominatim, or jumps straight to a typed coordinate pair with no network call at all, so that shortcut
+still works with the wide-area network down. A format selector next to it controls both how typed
+coordinates are parsed and how coordinates are displayed elsewhere in the application: WGS84 in decimal
+degrees, degrees/minutes/seconds, or degrees/decimal minutes; UTM; MGRS; British National Grid; Irish
+Grid; Swiss CH1903+/LV95; French Lambert-93; Dutch RD New; New Zealand Transverse Mercator; Sweden
+SWEREF99 TM; Australia GDA2020 MGA (zone chosen automatically); or a custom EPSG code or proj4 string.
+This is a shared, server-remembered preference for the whole installation, not a per-browser setting, so
+a room of operators sees the same coordinate format by default (chapter 10, Settings).</p>
+
+<h2 id="c4-6">4.6 Other shared controls</h2>
+<p><strong>Print this view</strong> opens a print-formatted version of the current map (and, inside
+NexIncidentCommand, the current operations record via <strong>print operations map</strong>, chapter
+7.12). The panel toggle (hamburger icon) shows or hides the side panel. The connectivity and cache pills
+at the bottom of the panel show whether the local server is reachable and how much is cached. In LAN mode,
+the identity pill and <strong>sign out</strong> button appear next to them (chapter 3).</p>
+
+<h2 id="c4-7">4.7 Official warnings</h2>
+<p>When one or more Common Alerting Protocol (CAP) feeds are configured (chapter 10.10), a small control
+in the bottom right of the map offers an <strong>Official warnings</strong> checkbox. Turning it on draws
+official public warnings (for example a national weather or civil-protection feed) as dashed, lightly
+filled polygons, styled by severity, distinct in appearance from anything NexFiremap itself analyses,
+since these are unmodified third-party warnings shown for context, not a NexFiremap output. Each warning's
+popup links to the original source document. Warnings with no mappable area (a geocode the server does
+not have a boundary for) are counted separately rather than silently dropped. This control does not
+appear at all if no feed is configured.</p>
+
+<h1 id="c5">5. NexFiremap: satellite fire detections</h1>
+
+<p>NexFiremap is the default module: raw satellite fire detections on a basemap, with the tools to
+filter, style and cache them. Switch to it from the module menu in the top left. Its panel starts
+collapsed; open it with the panel toggle button (the hamburger icon, top right) or by switching to any
+other module, which opens the panel automatically.</p>
+
+<h2 id="c5-1">5.1 Time window and history</h2>
+<p><strong>Time window</strong> offers 24h, 3d, 7d, 14d or 30d buttons. Older data is served straight
+from the local cache, so widening the window after the first load is usually instant.
+<strong>Detections per day</strong> draws a small histogram; click a bar to isolate that day, click
+<strong>clear day filter</strong> to return to the full window. <strong>Acquisition-time playback</strong>
+adds a play/pause control and a time slider that reveals detections in the order satellites actually
+recorded them, rather than all at once.</p>
+
+<h2 id="c5-2">5.2 Display</h2>
+<p><strong>Colour by</strong> chooses what the detection colour encodes: detection age, fire radiative
+power (FRP), or instrument. <strong>Render as</strong> chooses how detections draw: individual points,
+clustered markers, or a heatmap. A legend below explains the current colour scale.</p>
+
+<h2 id="c5-3">5.3 Filters</h2>
+<p><strong>Satellites</strong> lists the configured FIRMS sources (VIIRS NOAA-20, VIIRS NOAA-21, VIIRS
+Suomi-NPP, MODIS Aqua/Terra, and Landsat where available) as checkboxes. <strong>Confidence</strong>
+filters low/nominal/high. <strong>Minimum FRP</strong> is a slider in megawatts. <strong>Overpass</strong>
+restricts to daytime-only or night-time-only detections.</p>
+
+<h2 id="c5-4">5.4 Satellite coverage</h2>
+<p>Toggling <strong>show</strong> under Satellite coverage draws a grid of cells shaded by how recently a
+tracked satellite's orbit actually passed over each area, brighter meaning more recent. This is computed
+from real orbit propagation (Celestrak two-line elements, propagated with Skyfield) as a geometric
+approximation: a circle of each sensor's nominal half-swath width swept along its ground track, not the
+true bow-tie-shaped scan, and not checked against cloud cover. It answers "could a satellite have seen
+this spot", not "did it see this spot clearly". Five satellites are tracked: NOAA-20, NOAA-21, Suomi-NPP
+(all VIIRS), and Terra and Aqua (both MODIS).</p>
+
+<h2 id="c5-5">5.5 Industrial and static sources</h2>
+<p>Recurring non-wildfire heat, such as flares, kilns, refineries and power plants, is identified from
+OpenStreetMap tags plus this server's own cached detection history, never by deleting anything, only by
+labelling. Turning on <strong>show</strong> scans the current view automatically for small or medium
+areas; use <strong>rescan now</strong> to force a refresh or to check a large area on purpose. The scan
+looks for OpenStreetMap tags such as flares, kilns, refineries and power plants (excluding tags the
+classifier's own design notes call unreliable, like generic industrial land use or substations), scores
+each candidate against how many distinct days had a nearby detection, how tightly clustered those
+detections are, and how consistent their radiative power is, and labels each candidate one of:</p>
+<ul>
+<li><strong>persistent_industrial</strong>: strong, precision-first evidence this is a recurring
+non-wildfire heat source.</li>
+<li><strong>ambiguous</strong>: some evidence, not enough to suppress with confidence.</li>
+<li><strong>insufficient_evidence</strong>: not enough cached history yet to say either way.</li>
+<li><strong>possible_industrial_incident</strong>: a source that was previously classified persistent but
+whose nearby detections have since grown well beyond its usual footprint, downgraded so a real fire at an
+industrial site is not hidden.</li>
+</ul>
+<p>Because the server only ever retains a rolling window of history (30 days by default), this
+classification reflects that recent window, not years of behaviour. Treat "insufficient evidence" as
+genuinely undecided, not as "probably not industrial".</p>
+
+<h2 id="c5-6">5.6 EUMETSAT confirmation (optional)</h2>
+<p>This panel only appears once <code>EUMETSAT_CONSUMER_KEY</code> and <code>EUMETSAT_CONSUMER_SECRET</code>
+are set (chapter 2.3, chapter 10.10). It draws an independent geostationary active-fire signal from
+EUMETSAT's MTG/FCI instrument, about every 10 minutes, covering Europe, Africa, the Atlantic and the
+Middle East only (roughly 67.5 degrees north/south of the equator). It reports a fire-confidence
+classification and probability per pixel, not a radiative-power value the way FIRMS does, so treat it as
+a second, independently-sourced yes/no confirmation rather than a magnitude cross-check. A known
+false-positive mode is low-confidence hits over water from sun glint.</p>
+
+<h2 id="c5-7">5.7 Cache</h2>
+<p><strong>Cache this view for 30 days</strong> explicitly warms the cache for the current viewport.
+<strong>Refresh newest data</strong> re-checks the hot (most recent) days for everywhere already cached.
+The panel below shows cache size and related figures; the connectivity and cache pills at the bottom of
+the side panel summarise local server and cache health at a glance. See chapter 9.1 for how the cache
+pipeline works underneath these buttons.</p>
+
+<h1 id="c6">6. NexEventView: fire event detection and behaviour analysis</h1>
+
+<p>NexEventView groups raw detections into discrete fires and offers a progressively heavier set of
+analysis layers on top of a selected fire. Every layer here is a research-grade estimate. Each says what
+kind of information it is (Observed, Estimated, Modelled, or Uncertainty), and none is a substitute for
+a qualified fire-behaviour analyst's judgement.</p>
+
+<h2 id="c6-1">6.1 Detecting events</h2>
+<p>Click <strong>find in view</strong> to group cached detections in the current viewport into distinct
+fires. This is not a bounding box: it is a space-time graph. Two detections are linked if the distance
+between them is within the sum of their sensor footprint radii plus an assumed maximum fire growth speed
+(8 km/h by default) times the time between them, and within a maximum time gap (7 days by default).
+Connected groups of detections become one event. A known failure mode of this kind of clustering is
+chaining: many individually-plausible links, for example scattered agricultural burning across a wide
+region, can connect detections that have nothing to do with each other into one nominal event. NexFiremap
+guards against this by splitting any cluster whose real span exceeds a plausible single-fire size (100 km
+by default, chosen with reference to the 2021 Dixie Fire, one of the largest single-ignition wildfires on
+record) back into smaller pieces. If a shown event is still unusually large, the panel displays an
+explicit warning to review the raw detections before trusting any analysis layer, since it is more likely
+several unrelated fires chained together than one real fire that size.</p>
+<p>Re-running detection over an overlapping time window creates new event records rather than merging into
+previously found ones; this is a known limitation of the current version, not a bug.</p>
+
+<h2 id="c6-2">6.2 Selecting and analyzing an event</h2>
+<p>Pick an event from the list and click <strong>analyze</strong> to unlock the layer switch (a row of
+buttons: Likelihood, Arrival time, Burn scar, Modelled spread, Ensemble) and the supporting tools below
+it. Burn scar, Modelled spread and Ensemble stay disabled until their own run has completed, since each is
+a separate background job.</p>
+
+<h2 id="c6-3">6.3 Likelihood</h2>
+<p>An active-heat probability raster: each detection contributes a Gaussian-shaped patch centred on
+itself, sized to its own sensor footprint, weighted by which satellite instrument saw it, how confident
+the detection was, and how much radiative power it carried, then faded out over time (a configurable
+half-life, 6 hours by default: a detection's influence roughly halves every 6 hours as it ages).
+Detections are combined so that the result reads as "the probability at least one detection's evidence is
+still active here", not a simple sum.</p>
+<p>A distinguishing feature of this layer is that it also uses negative evidence: if a satellite's swath
+genuinely passed over part of the area and recorded no detection there, that pulls the likelihood down in
+that area, softened by how likely the sky was actually clear at the time (from historical cloud-cover
+data), since a satellite pass alone cannot tell a clear sky from a cloudy one. A cell no satellite ever
+looked at is left untouched, never treated as confirmed clear. This is referred to elsewhere in this
+manual and in the application as the tri-state observation model: observed fire, observed no-fire, and
+never observed are three different things.</p>
+
+<h2 id="c6-4">6.4 Arrival time</h2>
+<p>An inverse-distance-weighted estimate of when fire likely reached each map cell, built from every
+detection's own time and distance to that cell. The layer reports three figures per cell: a median
+estimate, and an earliest/latest spread one standard deviation either side of it. This is an honest
+spread, not a fabricated single precise timestamp, and not the literal earliest/latest detection times.</p>
+
+<h2 id="c6-5">6.5 Uncertainty envelopes and isochrones</h2>
+<p>The <strong>uncertainty envelopes / isochrones</strong> switch overlays 50, 80 and 90 percent
+probability-mass contours: the smallest region that contains that fraction of the likelihood raster's
+total mass, drawn as filled, nested bands with an area figure in square kilometres and square miles, not
+an arbitrary fixed-threshold outline. For modelled spread, the same switch instead draws isochrones,
+lines and filled bands showing how far fire is estimated to have reached by 3, 6, 12, 24 and 48 hours,
+brightest for the soonest horizon and fading for the furthest.</p>
+
+<h2 id="c6-6">6.6 Burn scar</h2>
+<p>Click <strong>check burn severity (Sentinel-2)</strong> to compare a pre-fire and post-fire satellite
+image using the normalized burn ratio (NBR) and its pre/post difference (dNBR), classified into unburned,
+low, moderate and high severity using standard published thresholds. Scenes are searched independently
+before and after the fire: Sentinel-2 first, falling back to Landsat if no sufficiently clear Sentinel-2
+scene is available within the search window. Because each side is chosen independently, it is possible
+for one to end up Sentinel-2 and the other Landsat; when that happens the result is marked
+<code>cross_sensor</code>, since no correction is applied between their slightly different infrared
+channels and severity can carry a small systematic bias in that case. This layer uses actual optical
+imagery, not thermal inference, so it is ground truth of what burned, not a live estimate of where fire
+currently is.</p>
+
+<h2 id="c6-7">6.7 Modelled spread</h2>
+<p>Click <strong>run spread model (terrain + weather)</strong> for a deterministic physics-based estimate
+of how the fire has spread and may continue to spread, using a real Rothermel (1972) surface-fire model
+with the Albini (1976) correction, Anderson's 13 standard fuel models, elevation and slope from the
+Copernicus global 30m digital elevation model, land cover from ESA WorldCover crosswalked to a fuel model,
+one weather sample for the area from Open-Meteo, and dead-fuel moisture conditioned from recent weather
+history rather than a flat assumption. Spread is solved anisotropically: fire genuinely spreads faster
+downwind and upslope and slower into the wind, using the standard Albini and Chase (1980) elliptical
+model. The result is not survey-grade: it uses one wind sample and one moisture value for the whole area
+(slope and aspect still locally bend the fire's own spread direction), one fuel model per land-cover
+class rather than a calibrated local fuel map, and does not model crown fire or spotting. These
+simplifications are stated directly in the application's own model documentation, not hidden.</p>
+
+<h2 id="c6-8">6.8 Ensemble</h2>
+<p>Click <strong>run Monte Carlo ensemble (~40 members)</strong> (the current default is 60 members) to
+run many spread-model variations at once, each sampling a different plausible wind speed and direction,
+fuel-moisture and general spread-rate uncertainty, plus a small jitter on the ignition point. Every
+member is then scored against the event's own later detections (arrival time predicted by that member
+compared with when a detection actually occurred nearby), and members that predicted better are given
+more weight. The reported result is a weighted spread of outcomes (10th/50th/90th percentile arrival
+time per cell) using those weights, not a resampled simulation: the application's own documentation is
+explicit that this is a batch weighted calibration using the same evidence-reweighting idea a full
+particle filter is built on, not a fully recursive particle filter that re-simulates between each
+observation. An effective-sample-size figure is reported alongside the result so the quality of that
+weighting is visible rather than hidden.</p>
+
+<h2 id="c6-9">6.9 Validate model</h2>
+<p>Click <strong>validate model (rolling backtest)</strong> to test how well the served likelihood model
+would have predicted this event's own history, compared against several simple, non-learned baselines
+(a static buffered footprint, a concave hull around early detections, constant-rate radial growth, and a
+wind-driven ellipse). The test works by hiding later detections, asking each model to predict them from
+only the earlier ones, then scoring precision, recall, a point-based overlap proxy, Brier score, centroid
+displacement, predicted area, and (for the served model only, since it is the one with a native time
+estimate) arrival-time error. This is the project's evidence that its estimates are not just
+plausible-looking, they are checked against what a satellite actually saw next.</p>
+
+<h2 id="c6-10">6.10 Structures at risk over time</h2>
+<p>Once a spread or ensemble run has completed, the <strong>Structures at risk over time</strong> panel
+appears. Click <strong>cache / refresh buildings for model area</strong> while online to pull OpenStreetMap
+building footprints for the area (these stay cached in SQLite for later offline runs). Move the
+<strong>highlight reached within</strong> slider (0 to 48 hours) to see which structures the modelled
+arrival surface reaches by that horizon, and a running count split into residential buildings and critical
+facilities (hospitals, clinics, fire and police stations, schools, care homes, shelters). This is scenario
+exposure timing only. It is never a label of confirmed damage or an evacuation instruction.</p>
+
+<h2 id="c6-11">6.11 3D terrain view</h2>
+<p>Click <strong>view in 3D terrain</strong> to drape whichever layer is currently on screen (likelihood,
+burn severity, modelled spread, ensemble) over real elevation, using free Terrarium-encoded elevation
+tiles over an OpenTopoMap base. This opens a second map engine (MapLibre GL JS) as a full-panel overlay;
+drag to orbit, scroll to zoom, shift-drag to tilt. Use the <strong>back to 2D map</strong> button to
+return.</p>
+
+<h1 id="c7">7. NexIncidentCommand: plans, tactics, safety, resources, products</h1>
+
+<p>NexIncidentCommand is the offline incident-command workspace: incidents, operational periods, plan
+scenarios, tactical drawing, safety review, resources, model provenance, products and handover. It works
+entirely on the local server and needs no internet connection once running. Everything you record here is
+saved to the local SQLite database and survives a restart.</p>
+
+<h2 id="c7-1">7.1 The incident hierarchy</h2>
+<p>Records nest in one fixed order: an <strong>incident</strong> contains <strong>operational
+periods</strong>; a period contains <strong>plan scenarios</strong>; a scenario (or the incident directly)
+contains <strong>tactical and observation features</strong>, the things drawn on the map. Resources
+(crews, engines, aircraft) belong to the incident as a whole, not to any one period or scenario. This is
+described in more technical terms, including exact field names, in chapter 11.4.</p>
+
+<h2 id="c7-2">7.2 Creating and selecting an incident</h2>
+<p>Click <strong>new incident</strong> to create one centred on the current map view; NexFiremap creates
+a first 12-hour operational period and a primary scenario named "Plan A" automatically. Use the
+<strong>Active incident</strong> selector to switch between incidents. Once one is selected, the
+<strong>Operator / unit</strong> field, <strong>Operational period</strong> and <strong>Plan
+scenario</strong> selectors appear; almost everything else in this module acts on whichever period and
+scenario are currently selected. Use <strong>next period</strong> to start a fresh operational period
+rather than overwriting the one before it, and <strong>new scenario</strong> to add an alternative,
+contingency or worst-case plan alongside the primary one.</p>
+<p>Under <strong>Incident, period and scenario records</strong>, edit the incident's name, identifier,
+status (active, contained, closed), timezone and notes; the period's name, status (draft, active,
+closed), start and end time, and objectives; and the scenario's name, kind (primary, contingency,
+alternative, worst case), status and description/assumptions. Editing an approved scenario's name, kind,
+description or assumptions returns it to draft and clears its approval, so it goes through safety review
+again.</p>
+
+<h2 id="c7-3">7.3 Tactical drawing</h2>
+<p>Choose an <strong>object type</strong> (35 in total, listed below), a <strong>status</strong>, and
+optionally a title or callsign, then click <strong>draw on map</strong>. A point object takes one click;
+a line or area takes one click per vertex, finished with <strong>finish</strong> or Enter (use <strong>undo
+vertex</strong> or Ctrl/Cmd+Z to remove the last point while sketching). Expand <strong>Operational
+record</strong> before drawing, or choose <strong>edit</strong> on an existing object, to record its
+objective, responsible unit, priority, assigned crews or vehicles, method or tactic, planned start and
+completion, required equipment, water requirement, prerequisites, hazards, escape route, safety zone,
+communications channel, and observation metadata (source, observer, confidence, observed time, accuracy,
+fire activity, intensity, and wind notes/speed/direction/gust/measurement height for wind observations).</p>
+<p>An unfinished sketch is saved in the browser after every vertex and material field change; if the page
+or session is interrupted, NexFiremap offers to restore it as explicitly unsaved. Saving or deliberately
+cancelling removes the stored draft.</p>
+
+<h3 id="c7-3-1">Point objects</h3>
+<p>anchor point, lookout, safety zone (point), trigger/decision point, hazard, staging area, command post,
+drop point, water source, restricted water source, helibase, helispot, dip site, weather station,
+communications repeater, road closure, resource position report, critical value at risk, spot fire,
+smoke report, wind observation.</p>
+
+<h3 id="c7-3-2">Line objects</h3>
+<p>fire perimeter line, active fire edge, inactive/cold edge, control/tactical line, escape route,
+division/sector boundary, branch boundary, spread arrow, estimated arrival-time line, road restriction.</p>
+
+<h3 id="c7-3-3">Area objects</h3>
+<p>confirmed fire perimeter, forecast perimeter (scenario), evacuation area, structure protection area,
+safety zone area, observed burn area, forecast uncertainty area.</p>
+
+<h3 id="c7-3-4">Status values</h3>
+<p>One shared set applies to every object type: unconfirmed, observed, confirmed, proposed, planned,
+under construction, completed, held, breached, abandoned, patrol, mop up, inactive, active. Deleting an
+object sets its status to inactive rather than removing the record, so it stays resolvable from audit
+history and exported packages.</p>
+
+<h2 id="c7-4">7.4 Safety review</h2>
+<p>A fixed nine-item checklist applies to every period (optionally split per scenario): hazards, lookouts,
+communications, escape routes, safety zones, medical, alternative access, withdrawal triggers, weather
+update. Tick each item and add details as it is reviewed. Approving a scenario without every item ticked
+requires the approver to explicitly acknowledge the outstanding warnings; the fact that something was
+outstanding at approval time is recorded, though no free-text reason is required at this step. Warnings
+here support command review. They are not an automated declaration that a plan is safe.</p>
+<p>A related but separate mechanism, <strong>tactical assessment</strong> (chapter 7.6), does require a
+named operator and a written reason to acknowledge each individual deterministic warning it raises.</p>
+
+<h2 id="c7-5">7.5 Resources</h2>
+<p>Record crews, engines and aircraft against the incident: callsign, unit type, status (available,
+assigned, working, returning, unavailable), crew size, water capacity, capabilities, current assignment,
+and radio/contact channel. Resources are shared across every period and scenario in the incident.</p>
+
+<h2 id="c7-6">7.6 Tactical assessment and calculators</h2>
+<p>Click <strong>measure and screen plan</strong> to run a deterministic geometry and logic scan over the
+selected period/scenario's features: line lengths and areas measured on a real geodesic model, invalid or
+missing links between related objects (for example an escape route with no linked safety zone), resources
+assigned to more than one object at once or to an unknown resource, and any escape route whose line
+actually crosses a forecast perimeter or uncertainty area. Each warning has a stable identity, so a prior
+acknowledgement continues to apply to "the same issue" for as long as the underlying condition is
+unchanged; acknowledging one requires a named operator and a written reason, and stays in the audit and
+handover record. This does not declare a tactic safe, it only screens for specific, explainable
+geometry and assignment problems.</p>
+<p>Use <strong>copy plan to period</strong> to duplicate a scenario into a different operational period
+without changing the source. The <strong>calculate transparently</strong> tool runs one of four
+planning-aid calculators, each returning its formula and inputs alongside the result so nothing is a black
+box:</p>
+<table>
+<tr><th>Calculator</th><th>Inputs</th><th>Formula</th></tr>
+<tr><td>production time</td><td>length (m), rate (m/hour), resource count</td><td>hours = length / (rate x resource count)</td></tr>
+<tr><td>hose lay</td><td>distance (m), section length (m), reserve percent</td><td>sections = ceil(distance x (1 + reserve/100) / section length)</td></tr>
+<tr><td>water duration</td><td>capacity (L), flow rate (L/min)</td><td>minutes = capacity / flow rate</td></tr>
+<tr><td>travel time</td><td>distance (km), speed (km/h)</td><td>minutes = distance / speed x 60</td></tr>
+</table>
+<p>Every calculator result carries the same reminder: it is a planning aid only, and rates and assumptions
+should be validated against local doctrine and conditions.</p>
+
+<h2 id="c7-7">7.7 Scenario model provenance and freshness</h2>
+<p>After a spread or ensemble run (chapter 6.7, 6.8) completes, enter its job id and click <strong>attach
+to selected scenario</strong> to link that model run to the plan. This keeps the plan, its snapshot and
+any classified product tied to exactly the model inputs, reference and validity times, and stated
+limitations of that specific run, and keeps staleness warnings visible even as newer runs are produced
+elsewhere in the incident.</p>
+
+<h2 id="c7-8">7.8 Classified portable products</h2>
+<p>Generate an immutable, hashed export from the current workspace or, preferably, from a named snapshot.
+Choose a <strong>template</strong>, a <strong>classification</strong>, and a <strong>format</strong>:</p>
+<table>
+<tr><th>Templates</th><td>strategic, field, IAP, briefing, transport, air operations, evacuation,
+progression, public information, handover, plus ICS 201/202/204 and a German Lagekarte form</td></tr>
+<tr><th>Classifications</th><td>draft, operational, public</td></tr>
+<tr><th>Formats</th><td>PDF, georeferenced PDF, GeoJSON, JSON, CSV, GPX, KML, KMZ, GeoTIFF, raster
+GeoPackage, vector GeoPackage</td></tr>
+</table>
+<p>The public classification and the public-information template always go together: choosing one requires
+the other. A public-information product keeps only confirmed fire perimeter, observed burn area, active
+and inactive fire edge, and smoke report features, each stripped down to id, type, title, status, observed
+time and confidence; everything else, including tactics, resources, hazards, safety records and audit
+history, is structurally absent, not merely hidden. Every product is hashed (SHA-256) and recorded in the
+audit trail, and rendering is deterministic, so producing the same product twice from the same snapshot
+yields an identical file. Only the public-information template can be shown under <strong>Public incident
+information</strong> to a public account (chapter 3.3).</p>
+
+<h2 id="c7-9">7.9 Disconnected package conflicts</h2>
+<p>When an imported incident package cannot be applied automatically because it conflicts with local
+changes, it is staged here rather than rejected outright. Each conflicting record is shown with a choice
+between the local and the incoming version; every conflict must be resolved, one at a time, by a named
+operator before the resolution can be applied. Both versions remain preserved in the package until a
+choice is made, and the applied result is written with a revision number guaranteed to be newer than
+either input, so a later unrelated edit can never appear to predate an already-applied resolution.</p>
+
+<h2 id="c7-10">7.10 Recovery and snapshot comparison</h2>
+<p>See chapter 9 for backups and recovery. <strong>Compare snapshots</strong> shows exactly what changed,
+added, removed, or updated, entity by entity, between two immutable snapshots, or between a snapshot and
+the current live workspace.</p>
+
+<h2 id="c7-11">7.11 Incident LAN accounts</h2>
+<p>Visible to administrators only. See chapter 3.4.</p>
+
+<h2 id="c7-12">7.12 Outputs</h2>
+<p><strong>create snapshot</strong> freezes the current incident state under a name and classification.
+<strong>export handover</strong> downloads the full versioned workspace, including audit history, as a
+JSON/GeoJSON package. <strong>print operations map</strong> opens a print-formatted view of the current
+map. <strong>verified backup</strong> triggers an immediate database backup (chapter 9.2).
+<strong>import handover</strong> always previews a package first (chapter 7.9) and never overwrites an
+existing incident automatically.</p>
+
+<h1 id="c8">8. NexIngest: telemetry, drone imagery, field data, imports</h1>
+
+<p>NexIngest brings outside data into an incident: live vehicle positions, wind observations, drone
+imagery, imported map data, field observations, and manually recorded positions. Select an incident,
+period and scenario first (chapter 4.1); most of this module writes into whichever incident is currently
+active.</p>
+
+<h2 id="c8-1">8.1 Live vehicle telemetry</h2>
+<p>Automatic GPS positions are a separate, unconfirmed feed, distinct from the manual position reports and
+drawn tactical features described elsewhere. Click <strong>refresh positions</strong> to pull the latest
+known position per vehicle; tick <strong>show last two hours of tracks</strong> to draw recent history. A
+gray position is stale (older than the configured staleness threshold, chapter 10.6); a red position or a
+broken track line carries a quality warning, such as an implausible jump in speed or a report that arrived
+out of order. Estimated movement between two real reports is only ever a display estimate, clearly marked
+as such, and is never written as an observation in its own right.</p>
+<p>An administrator sets up each vehicle's feed under <strong>Position feeds</strong>: creating one mints a
+one-time token that must be transferred to the vehicle's gateway through a secure channel, since it cannot
+be recovered afterward, only rotated. A feed sends positions to
+<code>POST /api/feeds/positions/&lt;source id&gt;</code> with that token; see chapter 11.7 for the exact
+formats accepted (native JSON, or CoT/TAK, NMEA, or MAVLink without any translation step).</p>
+
+<h2 id="c8-2">8.2 Temporal wind situation</h2>
+<p>Set a <strong>situation time</strong>, a look-back window and an arrow-grid density, then click
+<strong>show wind for current view</strong>. Arrows point downwind (the direction air is moving toward,
+not the meteorological "from" direction wind observations are recorded in) and are coloured cyan under 5
+m/s, amber 5 to 10 m/s, red at 10 m/s or above. Dashed rings mark actual measured points; everything else
+is a labelled estimate, interpolated in space from nearby observations and blended with whatever weather
+was already attached to a model run for the same area and time, weighted more heavily toward real
+observations the closer they are in space and time. This never makes a live network request: it is built
+entirely from wind observations already recorded (chapter 7.3, object type "wind observation") and
+weather already attached to a completed model run, so it works fully offline. It is not a terrain-resolved
+wind model.</p>
+
+<h2 id="c8-3">8.3 Drone imagery desk</h2>
+<p>Create a mission (name, aircraft, operator), then upload images against it. Every original image is
+retained as evidence with a SHA-256 hash, whether or not it is ever georeferenced. To place an image on
+the map, affirm it as <strong>nadir</strong> (looking straight down) or <strong>orthorectified</strong>,
+and supply its four corners in order, top-left, top-right, bottom-right, bottom-left, as WGS84 coordinates.
+This is an operator-affirmed label, not something the software determines on its own; the placement itself
+is a straightforward four-corner warp of the image onto those corners, not photogrammetric bundle
+adjustment. <strong>suggest corners</strong> (where offered) proposes a footprint automatically from the
+image's own flight metadata (gimbal angle, altitude, focal length) when that metadata is present and the
+camera was reasonably close to looking straight down; it refuses to guess, rather than propose something
+wrong, whenever the image includes sky, has no usable altitude or focal length, or the metadata camera
+model is not one of the few verified against published specifications. A suggestion still requires the
+operator's own confirmation before it is used. Select a set of georeferenced frames and click
+<strong>mosaic selected georeferenced frames</strong> for a deterministic visual composite (overlaps
+resolved by a fixed rule, not colour- or seam-matched), explicitly not survey-grade orthomosaic output.</p>
+
+<h2 id="c8-4">8.4 Offline AOI coverage and local map imports</h2>
+<p><strong>Offline AOI coverage</strong> checks every tile at every whole zoom level in a chosen range
+against what is already on disk for the current view, and reports missing or modified files; only a
+result marked ready for offline use, with every zoom level complete, means the area is actually prepared.
+This never bulk-downloads from a public tile provider on its own, since most of their usage policies do
+not permit that. For deliberate all-zoom offline coverage, use <strong>Import local MBTiles / geospatial
+raster</strong> to validate and add an administrator-supplied MBTiles file, GeoTIFF, or raster GeoPackage,
+recording its source, attribution, licence, acquisition date and any limitations; it then appears
+alongside the built-in basemaps. Once such a source is an imported elevation model, <strong>derive slope,
+aspect and contours</strong> computes a terrain package entirely offline from it.</p>
+
+<h2 id="c8-5">8.5 Import field observations</h2>
+<p>GeoJSON, GPX, KML, KMZ, vector GeoPackage and CSV files are parsed locally, previewed against the
+current map view, and only applied after review. If any imported feature falls outside the current view,
+applying the import requires an explicit acknowledgement; if any imported feature would be a confirmed
+perimeter or a confirmed status, applying it requires a written confirmation reason. An optional field
+mapping (JSON) tells the importer which of the source file's own column or tag names correspond to
+NexFiremap's fields, for example <code>{"latitude":"lat","longitude":"lon","title":"name","observed_at":
+"time"}</code>. The original uploaded file, its hash, and the import report all remain attached to the
+incident's handover record. <strong>Observed progression comparison</strong> shows which observations were
+present at the start of a chosen interval and which were added during it, useful for briefing on what has
+changed.</p>
+
+<h2 id="c8-6">8.6 GPS / radio position report</h2>
+<p>For a position received by voice or a device with no automatic feed, record it directly: pick a
+resource if it is already listed, a callsign, the report's source (radio, GPS, or manual), an optional
+accuracy, and the coordinates. This creates an auditable, time-stamped observation and, if a listed
+resource was chosen, also updates that resource's current position on the map.</p>
+
+<h2 id="c8-7">8.7 Standards interoperability</h2>
+<p>External systems can feed NexFiremap directly, without an operator retyping anything, through a small
+set of adapters. Every adapter only ever translates bytes from an external format into one of three
+things an existing part of the server already accepts: a position report, a map overlay feature, or an
+alert. No adapter writes to the database, opens a network connection, or reads a setting on its own; that
+is what keeps every new format's data subject to the same token checks, rate limits, replay protection and
+provenance recording as anything else, rather than opening a second way to write.</p>
+<table>
+<tr><th>Format</th><th>Carries</th><th>Feeds into</th></tr>
+<tr><td>Cursor-on-Target (CoT) / TAK</td><td>Positions and map markers/shapes</td><td>Position feed, or tactical features if explicitly enabled</td></tr>
+<tr><td>NMEA 0183 (GPS)</td><td>Positions (RMC/GGA sentences)</td><td>Position feed (a callsign must be supplied alongside it, since NMEA carries none)</td></tr>
+<tr><td>MAVLink</td><td>Drone/UAV positions</td><td>Position feed (a callsign must likewise be supplied)</td></tr>
+<tr><td>Common Alerting Protocol (CAP)</td><td>Official public warnings</td><td>The official-warnings layer (chapter 4.7)</td></tr>
+<tr><td>Shapefile</td><td>Map overlay geometry and attributes</td><td>Field observation import (chapter 8.5)</td></tr>
+<tr><td>Mapped CAD JSON (webhook)</td><td>Positions, in a dispatch system's own JSON shape</td><td>Position feed, via an administrator-defined field mapping</td></tr>
+</table>
+<p>Positions can also arrive live over a small TCP/UDP listener speaking CoT and, optionally, MAVLink,
+intended strictly for a closed incident LAN: it has no authentication of its own beyond an address
+allowlist and a rate limit, disabled by default, and should never be exposed beyond a physically
+controlled network (chapter 10.9). An MQTT broker can be bridged in the same spirit, for LoRaWAN gateways
+or fleet-tracking boxes that already publish over MQTT (chapter 10.9). A mapped CAD JSON feed is set up by
+an administrator under webhooks, matching a dispatch system's own field names to NexFiremap's, and
+delivering to a per-webhook token URL. Developer-level detail on every one of these, including exact wire
+formats and how to set up a matching mapping, is in chapter 11.7.</p>
+
+<h1 id="c9">9. Data retention, backup and recovery</h1>
+
+<h2 id="c9-1">9.1 How the fire detection cache works</h2>
+<p>The FIRMS area API only answers a few days at a time per request. NexFiremap divides the world into a
+coverage grid (10 degree cells by default) and, for every combination of data source, cell and day,
+remembers whether it has already been fetched. When the viewport, time range or filters change, the
+server works out which combinations are still missing and queues only those; anything already cached is
+served straight from SQLite with no network call. Missing days are grouped into the largest chunks FIRMS
+will accept per request, stepping the chunk size down automatically if the API rejects a range. The most
+recent two days are treated as still filling in and are re-checked periodically (every 30 to 45 minutes
+depending on configuration, chapter 10.2), since satellites keep adding detections to them; anything older
+is treated as final and is never re-fetched once cached. A background job purges anything older than the
+retention window (30 days by default) once an hour. Zooming out far enough that a viewport would need many
+grid cells switches to a single whole-world request instead of one per cell.</p>
+<p>In practice this means the first look at a region can take a few seconds to fetch, after which
+revisiting it is instant, and only the last day or two keep costing API calls.</p>
+
+<h2 id="c9-2">9.2 How the basemap tile cache works</h2>
+<p>Every tile request is proxied through the server, saved to disk, and served from there on repeat
+visits, so panning back over an area already viewed costs no repeat download from NASA, FIRMS, or the
+tile provider. Concurrent requests for the same tile are combined into a single upstream fetch. Tiles are
+trusted for 30 days by default before being re-fetched, and the cache is capped at a configurable size (1
+GB by default), evicting the oldest tiles first once exceeded. Tiles referenced by a complete offline AOI
+manifest (chapter 8.4) are pinned against both this age limit and this size eviction, so preparing an area
+for offline use is not undone by ordinary cache housekeeping later.</p>
+
+<h2 id="c9-3">9.3 Backups</h2>
+<p>NexFiremap can back up its own database on a schedule (every 15 minutes by default) and on demand
+(<strong>verified backup</strong>, chapter 7.12). A backup is taken through SQLite's own safe online-backup
+mechanism, which works correctly even while the server keeps writing, then checked for internal
+consistency before being kept; a backup that fails that check is not kept. The most recent backups are
+retained (24 by default); older ones are pruned automatically. Backup management, including listing,
+verifying and downloading backups, is restricted to administrators.</p>
+
+<h2 id="c9-4">9.4 Recovery</h2>
+<p><strong>Create recovery copy</strong> materializes a separate, freshly verified database file from a
+chosen backup, checked for consistency both as the stored backup and again as the freshly made copy.
+Recovery never touches or replaces the database the server is currently running against; it always
+produces a new, separate file for download and further use elsewhere. Preserve the original failed
+database and its associated files for investigation rather than discarding them, and test a restored copy
+before relying on it. A drone imagery folder and any imported offline map sources are stored outside the
+database and are not included in a database backup; back those up separately (chapter 10.6).</p>
+
+<h2 id="c9-5">9.5 Snapshots</h2>
+<p>A snapshot (chapter 7.10, <strong>create snapshot</strong>) freezes the full incident state, including
+every period, scenario, feature, resource, safety record, and the immutable results of anything since
+attached, under a name and a classification. Unlike a database backup, a snapshot is a versioned business
+record inside the database itself, meant for briefing and handover, not disaster recovery; take both where
+either matters. Comparing two snapshots, or a snapshot against the current live workspace, shows exactly
+what was added, removed, or changed, entity by entity.</p>
+
+<h2 id="c9-6">9.6 Job output retention</h2>
+<p>Background analysis jobs (event detection, likelihood, burn scar, propagation, ensemble, validation,
+structure scans, orbit coverage) write their results, including any large rasters, to files kept for a
+configurable period (14 days by default) before being pruned; the most recent 200 job records are always
+kept regardless of age. A model run's outputs referenced from an attached scenario (chapter 7.7) should be
+preserved by keeping that scenario's snapshot rather than relying on job retention alone, since job files
+are not part of a snapshot or handover package.</p>
+
+<h1 id="c10">10. Configuration reference</h1>
+
+<p>All settings are environment variables, normally set in a local <code>.env</code> file next to
+<code>run.py</code> (copied from <code>.env.example</code>). An administrator can also override a subset
+of these at runtime from <strong>Settings</strong> (chapter 8.2) without editing the file; changes to
+some settings only take effect after a restart, noted below. Every numeric setting is clamped to a
+sane range by the server at startup regardless of what is written in <code>.env</code>.</p>
+
+<h2 id="c10-1">10.1 Core server and FIRMS</h2>
+<table class="fieldtable">
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td>FIRMS_MAP_KEY</td><td>(empty)</td><td>NASA FIRMS API key. Without it, fire-data fetching is disabled but the rest of the server still runs.</td></tr>
+<tr><td>NEXFIREMAP_HOST</td><td>127.0.0.1</td><td>Bind address. Loopback by default; change only as part of enabling LAN mode (chapter 11.6).</td></tr>
+<tr><td>NEXFIREMAP_PORT</td><td>8000</td><td>Bind port (1-65535).</td></tr>
+<tr><td>NEXFIREMAP_DB</td><td>data/nexfiremap.sqlite3</td><td>SQLite database file path.</td></tr>
+<tr><td>NEXFIREMAP_CONTACT</td><td>(empty)</td><td>Contact string appended to the tile and Nominatim User-Agent header, per OpenStreetMap's tile usage policy.</td></tr>
+</table>
+
+<h2 id="c10-2">10.2 Fire detection cache</h2>
+<table class="fieldtable">
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td>NEXFIREMAP_CACHE_DAYS</td><td>30 (1-60)</td><td>Days of detection history retained before hourly purge.</td></tr>
+<tr><td>NEXFIREMAP_SOURCES</td><td>VIIRS_NOAA20_NRT, VIIRS_NOAA21_NRT, VIIRS_SNPP_NRT, MODIS_NRT</td><td>Comma-separated FIRMS sources to poll.</td></tr>
+<tr><td>NEXFIREMAP_MAX_DAY_RANGE</td><td>5 (1-10)</td><td>Days requested per FIRMS call. Stepped down automatically if FIRMS rejects a range.</td></tr>
+<tr><td>NEXFIREMAP_HOT_DAYS</td><td>2 (1-10)</td><td>How many of the most recent days are treated as still filling in and re-checked often.</td></tr>
+<tr><td>NEXFIREMAP_HOT_TTL_MINUTES</td><td>45 (1-1440)</td><td>How long a "hot" day's cache entry is trusted before it is re-fetched. If this variable is absent from both <code>.env</code> and the environment entirely, the server falls back to 20 minutes instead of 45; the shipped <code>.env.example</code> sets 45 explicitly.</td></tr>
+<tr><td>NEXFIREMAP_REFRESH_MINUTES</td><td>30 (1-1440)</td><td>Interval of the background loop that re-checks already-cached regions. Same absent-variable fallback note as above (falls back to 15 if truly unset).</td></tr>
+<tr><td>NEXFIREMAP_CELL_SIZE_DEG</td><td>10.0 (0.5-45.0)</td><td>Coverage-grid cell size in degrees.</td></tr>
+<tr><td>NEXFIREMAP_MAX_CELLS</td><td>64 (1-2048)</td><td>Above this many grid cells in one viewport, the server fetches the whole world in one request instead of per cell.</td></tr>
+<tr><td>NEXFIREMAP_MAX_CONCURRENT_FETCHES</td><td>3 (1-8)</td><td>Parallel FIRMS fetch workers.</td></tr>
+<tr><td>NEXFIREMAP_TIMEOUT_S</td><td>90.0 (5-600)</td><td>Per-FIRMS-request HTTP timeout, seconds.</td></tr>
+<tr><td>NEXFIREMAP_STARTUP_BBOX</td><td>(none)</td><td>Optional <code>west,south,east,north</code> bbox to pre-cache on startup.</td></tr>
+<tr><td>NEXFIREMAP_STARTUP_DAYS</td><td>0</td><td>Days of history to pre-cache for <code>STARTUP_BBOX</code>.</td></tr>
+</table>
+
+<h2 id="c10-3">10.3 Basemap tile cache</h2>
+<table class="fieldtable">
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td>NEXFIREMAP_TILE_DIR</td><td>data/tiles</td><td>Tile cache directory.</td></tr>
+<tr><td>NEXFIREMAP_TILE_CACHE_DAYS</td><td>30 (1-365)</td><td>Tile TTL before re-fetch.</td></tr>
+<tr><td>NEXFIREMAP_TILE_CACHE_MAX_MB</td><td>1024 (16-1000000)</td><td>Tile cache size budget; oldest unpinned tiles are evicted first once exceeded.</td></tr>
+<tr><td>NEXFIREMAP_TILE_MAX_CONCURRENT</td><td>8 (1-32)</td><td>Concurrent upstream tile fetches.</td></tr>
+</table>
+
+<h2 id="c10-4">10.4 Background jobs</h2>
+<table class="fieldtable">
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td>NEXFIREMAP_JOB_DIR</td><td>data/jobs</td><td>Directory holding job output files (rasters, GeoJSON).</td></tr>
+<tr><td>NEXFIREMAP_JOB_WORKERS</td><td>0 (0-64)</td><td>Worker processes. 0 means automatic: CPU count minus one, minimum one.</td></tr>
+<tr><td>NEXFIREMAP_JOB_RETENTION_DAYS</td><td>14 (1-365)</td><td>Finished job rows and files older than this are pruned hourly. At least the 200 most recent are always kept regardless of age.</td></tr>
+<tr><td>NEXFIREMAP_JOB_TIMEOUT_S</td><td>1800 (30-86400)</td><td>Per-job execution timeout before it is abandoned and the worker pool replaced.</td></tr>
+<tr><td>NEXFIREMAP_JOB_QUEUE_MAX</td><td>200 (10-100000)</td><td>Maximum jobs simultaneously queued or running.</td></tr>
+</table>
+
+<h2 id="c10-5">10.5 Backups</h2>
+<table class="fieldtable">
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td>NEXFIREMAP_BACKUP_DIR</td><td>data/backups</td><td>Verified SQLite backup output directory.</td></tr>
+<tr><td>NEXFIREMAP_BACKUP_INTERVAL_MINUTES</td><td>15 (0-1440)</td><td>Scheduled backup interval. 0 disables the schedule; manual backups still work.</td></tr>
+<tr><td>NEXFIREMAP_BACKUP_KEEP</td><td>24 (2-1000)</td><td>Verified backups retained.</td></tr>
+</table>
+
+<h2 id="c10-6">10.6 Field observations, telemetry, drone, symbology</h2>
+<table class="fieldtable">
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td>NEXFIREMAP_OBSERVATION_STALE_HOURS</td><td>6 (1-720)</td><td>Display-only staleness label for field observations.</td></tr>
+<tr><td>NEXFIREMAP_POSITION_STALE_SECONDS</td><td>300 (10-86400)</td><td>Age at which an automatic vehicle position is labelled stale (display only, nothing is discarded).</td></tr>
+<tr><td>NEXFIREMAP_POSITION_MAX_SPEED_KMH</td><td>180.0 (10-1000)</td><td>Implied-speed threshold above which a position is flagged implausible and a track splits.</td></tr>
+<tr><td>NEXFIREMAP_TELEMETRY_MAX_BATCH</td><td>1000 (1-10000)</td><td>Maximum position reports per single ingest call.</td></tr>
+<tr><td>NEXFIREMAP_TELEMETRY_REQUESTS_PER_MINUTE</td><td>120 (1-10000)</td><td>Per-source ingest rate limit.</td></tr>
+<tr><td>NEXFIREMAP_DRONE_DIR</td><td>data/drone</td><td>Drone evidence storage root.</td></tr>
+<tr><td>NEXFIREMAP_DRONE_MAX_UPLOAD_MB</td><td>200 (1-4096)</td><td>Maximum drone image upload size.</td></tr>
+<tr><td>NEXFIREMAP_DRONE_MAX_PIXELS</td><td>200000000</td><td>Maximum decoded pixel count for an uploaded image.</td></tr>
+<tr><td>NEXFIREMAP_DRONE_MOSAIC_MAX_PIXELS</td><td>100000000</td><td>Maximum output pixel count for a drone mosaic.</td></tr>
+<tr><td>NEXFIREMAP_SYMBOLOGY_PROFILE</td><td>simplified_multinational</td><td>Tactical symbol set used when rendering tactical features.</td></tr>
+</table>
+
+<h2 id="c10-7">10.7 Incident LAN security</h2>
+<p>These are not documented in the shipped <code>.env.example</code>; an administrator sets them directly
+when preparing a shared deployment (chapter 11.6).</p>
+<table class="fieldtable">
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td>NEXFIREMAP_LAN_MODE</td><td>false</td><td>Switches from trusted-loopback to fail-closed authenticated mode.</td></tr>
+<tr><td>NEXFIREMAP_ADMIN_PASSWORD</td><td>(empty)</td><td>Required, at least 12 characters, when LAN mode is on.</td></tr>
+<tr><td>NEXFIREMAP_SESSION_MINUTES</td><td>30 (5-720)</td><td>Session idle expiry in LAN mode.</td></tr>
+<tr><td>NEXFIREMAP_TLS_CERT_FILE</td><td>(none)</td><td>PEM certificate path for direct HTTPS termination.</td></tr>
+<tr><td>NEXFIREMAP_TLS_KEY_FILE</td><td>(none)</td><td>PEM private key path, paired with the certificate above.</td></tr>
+</table>
+
+<h2 id="c10-8">10.8 Federation (OIDC / LDAP)</h2>
+<p>Optional. Undocumented in <code>.env.example</code>; used only if an installation wants to authenticate
+against an existing identity provider instead of, or in addition to, local accounts.</p>
+<table class="fieldtable">
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td>NEXFIREMAP_OIDC_ISSUER</td><td>(empty)</td><td>OIDC issuer URL. Empty disables OIDC login.</td></tr>
+<tr><td>NEXFIREMAP_OIDC_CLIENT_ID</td><td>(empty)</td><td>OIDC client id.</td></tr>
+<tr><td>NEXFIREMAP_OIDC_CLIENT_SECRET</td><td>(empty)</td><td>OIDC client secret.</td></tr>
+<tr><td>NEXFIREMAP_OIDC_REDIRECT_URI</td><td>http://127.0.0.1:8000/auth/oidc/callback</td><td>Callback URL registered with the identity provider.</td></tr>
+<tr><td>NEXFIREMAP_OIDC_SCOPES</td><td>openid profile email</td><td>Requested OIDC scopes.</td></tr>
+<tr><td>NEXFIREMAP_OIDC_USERNAME_CLAIM</td><td>preferred_username</td><td>Claim used as the local username.</td></tr>
+<tr><td>NEXFIREMAP_OIDC_ROLE_CLAIM</td><td>groups</td><td>Claim used to derive a role.</td></tr>
+<tr><td>NEXFIREMAP_OIDC_ROLE_MAP</td><td>(empty)</td><td>Mapping from claim values to NexFiremap roles.</td></tr>
+<tr><td>NEXFIREMAP_OIDC_DEFAULT_ROLE</td><td>viewer</td><td>Role assigned if no mapping matches.</td></tr>
+<tr><td>NEXFIREMAP_LDAP_HOST</td><td>(empty)</td><td>LDAP server host. Empty disables LDAP login.</td></tr>
+<tr><td>NEXFIREMAP_LDAP_PORT</td><td>636</td><td>LDAP server port.</td></tr>
+<tr><td>NEXFIREMAP_LDAP_USE_TLS</td><td>true</td><td>Use LDAPS/StartTLS.</td></tr>
+<tr><td>NEXFIREMAP_LDAP_USER_DN_TEMPLATE</td><td>(empty)</td><td>Bind DN template, e.g. <code>uid={username},ou=people,dc=example,dc=org</code>.</td></tr>
+<tr><td>NEXFIREMAP_LDAP_ROLE_MAP</td><td>(empty)</td><td>Mapping from LDAP group/attribute to NexFiremap roles.</td></tr>
+<tr><td>NEXFIREMAP_LDAP_DEFAULT_ROLE</td><td>viewer</td><td>Role assigned if no mapping matches.</td></tr>
+</table>
+
+<h2 id="c10-9">10.9 CoT/TAK gateway and MQTT bridge</h2>
+<p>Optional standards-interoperability listeners (chapter 11.5). Undocumented in
+<code>.env.example</code>.</p>
+<table class="fieldtable">
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td>NEXFIREMAP_COT_ENABLED</td><td>false</td><td>Enables the Cursor-on-Target TCP/UDP gateway.</td></tr>
+<tr><td>NEXFIREMAP_COT_HOST</td><td>127.0.0.1</td><td>Listener bind address.</td></tr>
+<tr><td>NEXFIREMAP_COT_TCP_PORT</td><td>8087</td><td>CoT TCP port.</td></tr>
+<tr><td>NEXFIREMAP_COT_UDP_PORT</td><td>6969</td><td>CoT UDP port.</td></tr>
+<tr><td>NEXFIREMAP_COT_MAVLINK_PORT</td><td>0</td><td>MAVLink listener port. 0 disables it.</td></tr>
+<tr><td>NEXFIREMAP_COT_MAVLINK_CALLSIGN</td><td>drone</td><td>Callsign attributed to MAVLink-sourced positions.</td></tr>
+<tr><td>NEXFIREMAP_COT_ALLOW</td><td>(empty)</td><td>CIDR allowlist for who may connect; empty means loopback-only behaviour.</td></tr>
+<tr><td>NEXFIREMAP_COT_PACKETS_PER_MINUTE</td><td>600</td><td>Rate limit on inbound CoT packets.</td></tr>
+<tr><td>NEXFIREMAP_COT_SOURCE_ID</td><td>(empty)</td><td>Position feed that inbound CoT position reports are credited to.</td></tr>
+<tr><td>NEXFIREMAP_COT_SOURCE_TOKEN</td><td>(empty)</td><td>Token for that feed.</td></tr>
+<tr><td>NEXFIREMAP_COT_INCIDENT_ID</td><td>(empty)</td><td>Incident that inbound markers/drawings attach to. Empty means positions only, no feature ingestion.</td></tr>
+<tr><td>NEXFIREMAP_COT_ACCEPT_FEATURES</td><td>false</td><td>Whether inbound CoT markers are written as tactical features, not just positions.</td></tr>
+<tr><td>NEXFIREMAP_MQTT_URL</td><td>(empty)</td><td>MQTT broker URL. Empty disables the bridge.</td></tr>
+<tr><td>NEXFIREMAP_MQTT_USERNAME</td><td>(empty)</td><td>Broker username.</td></tr>
+<tr><td>NEXFIREMAP_MQTT_PASSWORD</td><td>(empty)</td><td>Broker password.</td></tr>
+<tr><td>NEXFIREMAP_MQTT_CLIENT_ID</td><td>(empty)</td><td>MQTT client id.</td></tr>
+<tr><td>NEXFIREMAP_MQTT_TOPICS</td><td>(empty)</td><td>Topic-to-feed mapping, format <code>topic=source_id:format[:callsign]</code>, comma-separated.</td></tr>
+</table>
+
+<h2 id="c10-10">10.10 Alerts (CAP) and EUMETSAT</h2>
+<table class="fieldtable">
+<tr><th>Variable</th><th>Default</th><th>Meaning</th></tr>
+<tr><td>NEXFIREMAP_CAP_FEEDS</td><td>(none)</td><td>Comma-separated list of Common Alerting Protocol feeds to poll: preset names (<code>dwd</code>, <code>mowas</code>, <code>nws</code>, <code>ipaws</code>) and/or raw feed URLs.</td></tr>
+<tr><td>NEXFIREMAP_CAP_POLL_MINUTES</td><td>10 (1-1440)</td><td>How often configured CAP feeds are polled.</td></tr>
+<tr><td>EUMETSAT_CONSUMER_KEY</td><td>(empty)</td><td>EUMETSAT Data Store OAuth consumer key.</td></tr>
+<tr><td>EUMETSAT_CONSUMER_SECRET</td><td>(empty)</td><td>EUMETSAT Data Store OAuth consumer secret.</td></tr>
+</table>
+
+<p>Settings that require a restart to take effect after being changed from the Settings pane: the FIRMS
+map key, the EUMETSAT consumer key and secret, CAP feeds, cache retention days, and the cache refresh
+interval. Everything else in the editable subset (symbology profile, observation staleness, position
+staleness, tile contact string, and the per-browser coordinate-system preference) applies immediately.</p>
+
+<h1 id="c11">11. Developer guide</h1>
+
+<p>This chapter covers the HTTP API, how to authenticate against it, how the background job queue works,
+how data is structured internally, how to feed data in from an external system, and how to set up the
+server for shared use on an incident LAN. It assumes familiarity with HTTP and JSON. Every path,
+parameter and field name below was read from the current source code, not from an older description of
+it; the exact file each comes from is named so it can be re-checked directly.</p>
+
+<h2 id="c11-1">11.1 Architecture overview</h2>
+<p>NexFiremap is a single FastAPI application (<code>nexfiremap/api.py</code>) plus a vanilla-JavaScript
+frontend, backed by one SQLite database. There is no separate backend service and no build step.
+<code>api.py</code> itself is a composition root only: it wires up long-lived services in a lifespan
+function, adds one security middleware ahead of every route, and includes routers from
+<code>nexfiremap/routes/</code>. The route handlers themselves, roughly 150 of them, live one module per
+subject area under <code>nexfiremap/routes/</code> (for example <code>incidents.py</code>,
+<code>features.py</code>, <code>links.py</code>, <code>drone.py</code>, <code>backups.py</code>); request
+and response body shapes are Pydantic models centralised in <code>nexfiremap/schemas.py</code>.</p>
+<p>The offline incident-command data model lives in the <code>nexfiremap/operations/</code> package
+(incidents and periods, scenarios, features, resources, cross-module links, packages/export-import,
+audit log), not in one file. External data formats are handled by stateless adapters in
+<code>nexfiremap/ingest/</code>, which only ever translate bytes into a shape an existing manager already
+accepts (chapter 11.7). Everything computationally expensive (clustering, rasters, imagery, physics
+propagation) runs through a background job queue (<code>nexfiremap/jobs.py</code>) in separate,
+idle-priority operating-system processes, never inline on a request (chapter 11.3).</p>
+<p>One include-order rule is load-bearing, not cosmetic: in <code>nexfiremap/routes/__init__.py</code>,
+the links router must be included before the incidents router, because
+<code>/api/operations/incidents/covering</code> is a literal path that would otherwise be shadowed by
+<code>/api/operations/incidents/{incident_id}</code> under first-match-wins routing, and would answer a
+confusing 404 instead.</p>
+<p>Several modules degrade gracefully rather than block startup: an optional dependency that fails to
+import (most often <code>rasterio</code>, which has real platform-specific install friction) disables just
+that feature, reported in <code>GET /api/config</code>'s <code>features</code> object, rather than
+crashing the server. A route for a disabled feature answers 503 rather than 404, naming the missing
+dependency.</p>
+
+<h2 id="c11-2">11.2 Authentication and permissions</h2>
+<p>By default (<code>NEXFIREMAP_LAN_MODE</code> unset or false) the server trusts every request from
+whoever can reach it, since it only listens on the loopback address. Everything in this section applies
+once LAN mode is enabled (chapter 3, chapter 11.6).</p>
+
+<h3 id="c11-2-1">Sessions</h3>
+<p>Sessions are opaque bearer tokens held in server memory, not JSON Web Tokens; nothing survives a
+restart. Log in with:</p>
+<pre>curl -i -X POST http://127.0.0.1:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "&lt;your admin password&gt;"}'</pre>
+<p>On success the server sets an httponly, samesite cookie named <code>nexfiremap_session</code> (secure
+if TLS is configured) and returns a JSON body including a separate <code>csrf</code> token and an
+<code>expires_at</code> time. A script or external program calling the API must resend that cookie and
+also set header <code>X-CSRF-Token</code> to the returned <code>csrf</code> value on every request other
+than GET/HEAD/OPTIONS; a missing or wrong header is rejected with 403. All failure modes on login (unknown
+user, inactive account, wrong password) return the same generic 401, so a caller cannot use the response
+to enumerate valid usernames. Login is rate-limited to 10 attempts per 60 seconds per client. Sign out
+with <code>POST /api/auth/logout</code>.</p>
+
+<h3 id="c11-2-2">Roles</h3>
+<p>The exact role set is <code>viewer</code>, <code>field_editor</code>, <code>plans</code>,
+<code>safety</code>, <code>administrator</code>, <code>public</code>; see chapter 3.3 for what each can
+read and write in plain terms. Enforcement happens once, in the security middleware, by matching the
+request path against a fixed table of substrings per role (for example, <code>field_editor</code> may
+write to any path containing <code>/features</code>, <code>/resources</code>, <code>/field-imports</code>,
+<code>/position-reports</code> or <code>/assets</code>). Because this is a coarse substring match rather
+than a per-route table, some routes that do not obviously belong to any role's listed tokens end up
+administrator-only by elimination (for example <code>POST /api/events/detect</code> and
+<code>POST /api/operations/tactical-calculator</code>); several routes additionally check
+administrator status explicitly inside the handler on top of the generic table, most notably every backup
+and settings route, and layer, webhook, and feed administration.</p>
+
+<h3 id="c11-2-3">Machine-to-machine ingest</h3>
+<p>Three kinds of endpoint deliberately bypass the session/CSRF gate entirely and authenticate with their
+own per-resource token instead, since the caller is a device or another system, not a signed-in browser:
+position feed ingest (<code>POST /api/feeds/positions/&lt;source id&gt;</code>, header
+<code>X-Feed-Token</code> or query parameter <code>token</code>), the OsmAnd/Traccar tracker endpoint
+(same feed token, as a query parameter since the device cannot set headers), and mapped CAD webhook
+delivery (<code>POST /api/ingest/webhook/&lt;hook id&gt;</code>, header <code>X-Webhook-Token</code> or
+query parameter <code>token</code>). Each token is stored server-side only as a SHA-256 hash and shown in
+full exactly once, at creation or rotation; there is no way to retrieve a lost token, only to rotate it.</p>
+
+<h3 id="c11-2-4">Public products</h3>
+<p>The <code>public</code> account role (chapter 3.3) is unrelated to a product's own
+<code>classification</code> field. A product or snapshot with <code>classification: "public"</code>
+becomes reachable without any session at all, through <code>GET /api/public/products</code> and
+<code>GET /api/public/products/&lt;id&gt;/download</code>; the classification value itself is the access
+control for those two routes.</p>
+
+<h3 id="c11-2-5">Federated login (optional)</h3>
+<p>An installation can additionally accept OIDC or LDAP login (chapter 10.8) instead of, or alongside,
+local accounts; the local administrator account always keeps working regardless, as a break-glass path.
+A federated identity only ever mints the same kind of session described above; nothing downstream can
+tell a login was federated. OIDC login does not verify the identity token's own signature locally,
+relying instead on it having come directly from the provider's token endpoint over TLS, so the provider's
+certificate is the entire trust anchor; there is deliberately no way to disable that TLS check. LDAP
+authenticates a bind only; role comes from a configured mapping, not a group search, and an empty password
+is refused before any connection is opened, since LDAP otherwise treats that as an anonymous bind.</p>
+
+<h2 id="c11-3">11.3 Background jobs</h2>
+<p>Anything expensive runs through one job queue rather than inline on a request. Worker processes run in
+a process pool (not threads, so numerically heavy code is not limited by Python's global interpreter
+lock) and are dropped to idle operating-system priority immediately after starting, so a running job only
+spends CPU cycles nothing else on the machine wants. Job rows live in SQLite with live progress, so status
+survives a server restart.</p>
+<pre>curl -s -X POST http://127.0.0.1:8000/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"kind": "detect_events", "params": {"bbox": "11.4,48.0,11.8,48.3", "days": 14}}'
+# {"job_id": 42}
+
+curl -s http://127.0.0.1:8000/api/jobs/42
+# {"id": 42, "kind": "detect_events", "status": "running", "progress": 40, ...}
+
+curl -s http://127.0.0.1:8000/api/jobs/42/files/some_output.png -o output.png</pre>
+<p>Status moves through <code>queued</code>, <code>running</code>, and ends at <code>done</code> or
+<code>error</code>; a cancelled or server-interrupted job also ends at <code>error</code> with an
+explanatory message. <code>GET /api/jobs?status=&amp;kind=&amp;limit=</code> lists jobs, newest first.
+<code>POST /api/jobs/&lt;id&gt;/cancel</code> cancels a queued job promptly; a job already executing
+cannot be interrupted mid-step and finishes or times out instead. A job's own output files (rasters,
+GeoJSON) are fetched individually rather than inlined in the status response, since some are large.</p>
+<p>Submitting a job directly through <code>POST /api/jobs</code> bypasses whatever validation the more
+specific domain route for that job kind would otherwise apply, so several job bodies re-check their own
+bounds internally (member counts, resolution, split counts) rather than trusting a caller to have gone
+through the normal route. Prefer the domain-specific route (for example
+<code>POST /api/events/{id}/ensemble</code>) over submitting a raw job kind directly unless there is a
+specific reason not to.</p>
+<table>
+<tr><th>Job kind</th><th>Normally submitted via</th><th>Key parameters</th></tr>
+<tr><td>detect_events</td><td>POST /api/events/detect</td><td>bbox, days, sources, v_max_kmh, max_dt_hours, min_detections, max_span_km</td></tr>
+<tr><td>spread_topology</td><td>POST /api/detections/spread_topology</td><td>bbox, days, sources</td></tr>
+<tr><td>analyze_event</td><td>POST /api/events/{id}/analyze</td><td>event_id, tau_hours, resolution_m, reference_ts</td></tr>
+<tr><td>analyze_burn_scar</td><td>POST /api/events/{id}/burn-scar</td><td>event_id, resolution_m</td></tr>
+<tr><td>run_propagation</td><td>POST /api/events/{id}/propagate</td><td>event_id, resolution_m, reference_ts</td></tr>
+<tr><td>run_ensemble_assimilation</td><td>POST /api/events/{id}/ensemble</td><td>event_id, resolution_m, reference_ts, n_members (5-300), random_seed</td></tr>
+<tr><td>validate_event</td><td>POST /api/events/{id}/validate</td><td>event_id, n_splits (1-10), threshold</td></tr>
+<tr><td>swath_coverage</td><td>GET /api/coverage (autofetch)</td><td>day, cell_size_deg, satellites</td></tr>
+<tr><td>scan_industrial_sources</td><td>POST /api/industrial/scan</td><td>bbox, days, window_days, event_id (optional)</td></tr>
+<tr><td>scan_structures</td><td>POST /api/structures/scan</td><td>bbox</td></tr>
+<tr><td>scan_eumetsat_fires</td><td>GET /api/eumetsat/fires (autofetch)</td><td>end_ts, lookback_hours</td></tr>
+</table>
+
+<h2 id="c11-4">11.4 API reference</h2>
+<p>Every route below is prefixed with the server's origin, for example <code>http://127.0.0.1:8000</code>.
+Most write routes need a session and CSRF header once LAN mode is on (chapter 11.2); this is omitted from
+the examples below for brevity, but is required in that mode. Routes are grouped by subject area rather
+than listed in include order.</p>
+
+<h3 id="c11-4-1">System, configuration and accounts</h3>
+<table class="fieldtable">
+<tr><th>Route</th><th>Purpose</th></tr>
+<tr><td>GET /api/config</td><td>Sources, basemaps, overlays, terrain source, refresh interval, feature availability, startup bbox, shared client preferences. No session needed; also drives the login screen.</td></tr>
+<tr><td>GET /api/operations/meta</td><td>Vocabulary for the operations UI: feature types, geometry rules, safety-check keys, symbology table.</td></tr>
+<tr><td>GET /api/status</td><td>Cache, fetch queue, tile cache, job queue, MQTT and CoT gateway health, FIRMS key status.</td></tr>
+<tr><td>GET /health</td><td>Liveness probe.</td></tr>
+<tr><td>GET /api/geocode, GET /api/geocode/reverse</td><td>Nominatim place search / reverse lookup, server-proxied and rate-limited.</td></tr>
+<tr><td>POST /api/auth/login, POST /api/auth/logout, GET /api/auth/session</td><td>Session lifecycle (chapter 11.2).</td></tr>
+<tr><td>GET /auth/oidc/login, GET /auth/oidc/callback, GET /api/auth/providers</td><td>Federated login (optional, chapter 10.8).</td></tr>
+<tr><td>GET/POST /api/auth/accounts</td><td>List / create local accounts. Administrator only.</td></tr>
+<tr><td>GET /api/settings, PUT /api/settings, DELETE /api/settings/{name}</td><td>Read/update/clear runtime setting overrides. Administrator only, including the read (chapter 10, footnote).</td></tr>
+</table>
+
+<h3 id="c11-4-2">Fire data and cache</h3>
+<table class="fieldtable">
+<tr><th>Route</th><th>Purpose</th></tr>
+<tr><td>GET /api/detections?bbox=&amp;days=&amp;start=&amp;end=&amp;sources=&amp;confidence=&amp;min_frp=&amp;daynight=&amp;limit=&amp;fmt=&amp;autofetch=</td><td>Point-level fire detections; <code>fmt=geojson</code> for a FeatureCollection, otherwise a compact column/row form.</td></tr>
+<tr><td>GET /api/summary?bbox=&amp;days=&amp;sources=</td><td>Daily detection counts and total FRP, for the histogram.</td></tr>
+<tr><td>POST /api/cache/ensure {bbox, days, sources}</td><td>Explicitly warm the cache for a region.</td></tr>
+<tr><td>POST /api/cache/refresh</td><td>Re-check the hot days for everywhere already cached.</td></tr>
+<tr><td>POST /api/cache/purge</td><td>Force retention cleanup now.</td></tr>
+<tr><td>POST /api/tiles/purge</td><td>Force tile-cache cleanup now.</td></tr>
+<tr><td>POST /api/detections/spread_topology {bbox, days, sources}</td><td>Queue a nested time-band contour job over raw detections.</td></tr>
+</table>
+
+<h3 id="c11-4-3">Satellite coverage, events and analysis</h3>
+<table class="fieldtable">
+<tr><th>Route</th><th>Purpose</th></tr>
+<tr><td>GET /api/coverage?bbox=&amp;day=&amp;autofetch=</td><td>Swath coverage grid for a day (chapter 5.4).</td></tr>
+<tr><td>POST /api/events/detect {bbox, days, v_max_kmh, max_dt_hours, min_detections, max_span_km}</td><td>Cluster cached detections into events (chapter 6.1).</td></tr>
+<tr><td>GET /api/events?bbox=&amp;limit=&amp;autofetch=, GET /api/events/{id}</td><td>List / inspect events, with member detections.</td></tr>
+<tr><td>POST /api/events/{id}/analyze {tau_hours, resolution_m, reference_ts}</td><td>Likelihood, arrival time, uncertainty envelopes (chapter 6.3-6.5).</td></tr>
+<tr><td>POST /api/events/{id}/burn-scar {resolution_m}</td><td>NBR/dNBR burn severity (chapter 6.6).</td></tr>
+<tr><td>POST /api/events/{id}/propagate {resolution_m, reference_ts}</td><td>Deterministic spread model (chapter 6.7).</td></tr>
+<tr><td>POST /api/events/{id}/ensemble {resolution_m, reference_ts, n_members, random_seed}</td><td>Monte Carlo ensemble (chapter 6.8).</td></tr>
+<tr><td>POST /api/events/{id}/validate {n_splits, threshold}</td><td>Rolling-holdout backtest (chapter 6.9).</td></tr>
+<tr><td>POST /api/industrial/scan {bbox, days, window_days, event_id}, GET /api/industrial/sources?bbox=&amp;autofetch=</td><td>Industrial/static source classifier (chapter 5.5).</td></tr>
+<tr><td>GET /api/eumetsat/fires?bbox=&amp;autofetch=</td><td>Geostationary MTG/FCI fire pixels (chapter 5.6).</td></tr>
+<tr><td>POST /api/structures/scan {bbox}, GET /api/structures/exposure?job_id=&amp;autofetch=</td><td>Structure footprints and exposure timing (chapter 6.10).</td></tr>
+</table>
+
+<h3 id="c11-4-4">Incidents, periods and scenarios</h3>
+<table class="fieldtable">
+<tr><th>Route</th><th>Purpose</th></tr>
+<tr><td>GET /api/operations/incidents?include_closed=, POST /api/operations/incidents {name, incident_number, timezone, center_lat, center_lon, notes}</td><td>List / create incidents. Creating one seeds a first period and a primary scenario.</td></tr>
+<tr><td>GET /api/operations/incidents/{id}</td><td>The full incident workspace.</td></tr>
+<tr><td>PATCH /api/operations/incidents/{id} {expected_revision, ...}</td><td>Revision-checked update (chapter 11.5.2).</td></tr>
+<tr><td>POST .../periods {name, starts_at, ends_at, objectives}, PATCH .../periods/{id} {expected_revision, ...}</td><td>Operational periods.</td></tr>
+<tr><td>POST .../periods/{id}/scenarios {name, kind, description, assumptions}, PATCH .../scenarios/{id} {expected_revision, ...}</td><td>Plan scenarios (kind: primary, contingency, alternative, worst_case).</td></tr>
+<tr><td>POST .../scenarios/{id}/copy {target_period_id, name}</td><td>Duplicate a scenario into another period without touching the source.</td></tr>
+<tr><td>GET .../periods/{id}/safety?scenario_id=, PUT .../periods/{id}/safety {scenario_id, checks}</td><td>Safety checklist (chapter 7.4).</td></tr>
+<tr><td>POST .../scenarios/{id}/approve {approver, acknowledge_warnings, expected_revision}</td><td>Approve a scenario.</td></tr>
+<tr><td>GET .../model-runs?scenario_id=, POST .../scenarios/{id}/model-runs {job_id}</td><td>Attach a completed analysis job (chapter 7.7).</td></tr>
+<tr><td>GET /api/operations/incidents/{id}/export</td><td>Full incident bundle as a downloadable file.</td></tr>
+</table>
+
+<h3 id="c11-4-5">Cross-module links, area of interest and situation</h3>
+<table class="fieldtable">
+<tr><th>Route</th><th>Purpose</th></tr>
+<tr><td>GET .../links?kind=, POST .../links {kind, ref_id, snapshot, note}</td><td>List / attach an immutable-snapshot link (chapter 11.5.3).</td></tr>
+<tr><td>DELETE .../links/{link_id}</td><td>Remove a link (a genuine hard delete, unlike a feature).</td></tr>
+<tr><td>GET .../aoi, PUT .../aoi {aoi} or {bbox}</td><td>Read / set an incident's area of interest.</td></tr>
+<tr><td>GET /api/operations/incidents/covering?lat=&amp;lon=&amp;active_only=</td><td>Which incidents' areas of interest cover a point (chapter 11.5.3).</td></tr>
+<tr><td>POST /api/operations/incidents/from_context {event_id | bbox | lat+lon+radius_km, ...}</td><td>Create incident+period+scenario+AOI+link in one call (chapter 4.3).</td></tr>
+<tr><td>GET /api/situation?lat=&amp;lon=&amp;radius_km=</td><td>Everything every part of the server knows about one point (chapter 4.3).</td></tr>
+<tr><td>GET /api/operations/watch?since_ts=</td><td>New detections landing inside an active incident's area of interest since a given time.</td></tr>
+</table>
+
+<h3 id="c11-4-6">Tactical features, tactics and resources</h3>
+<table class="fieldtable">
+<tr><th>Route</th><th>Purpose</th></tr>
+<tr><td>GET .../features?period_id=&amp;scenario_id=&amp;include_deleted=</td><td>Tactical/observation features as GeoJSON.</td></tr>
+<tr><td>POST .../features {feature_type, status, geometry, properties, ...}</td><td>Create a feature.</td></tr>
+<tr><td>PATCH .../features/{id} {expected_revision, ...}, DELETE .../features/{id}?expected_revision=</td><td>Update / soft-delete a feature.</td></tr>
+<tr><td>GET .../progression?from_time=&amp;to_time=</td><td>Time-sliced observed-feature replay (chapter 8.5).</td></tr>
+<tr><td>GET .../tactical-assessment?period_id=&amp;scenario_id=</td><td>Deterministic warning scan (chapter 7.6).</td></tr>
+<tr><td>POST /api/operations/tactical-calculator {kind, inputs}</td><td>A single calculator call, no incident touched.</td></tr>
+<tr><td>POST .../tactical-warning-acknowledgements {period_id, scenario_id, warning_id, reason}</td><td>Acknowledge a specific warning.</td></tr>
+<tr><td>GET .../resources, POST .../resources {callsign, unit_type, ...}, PATCH .../resources/{id} {expected_revision, ...}</td><td>Roster.</td></tr>
+<tr><td>POST .../position-reports {callsign, latitude, longitude, observed_at, report_source, ...}</td><td>Manual dispatcher-entered position (chapter 8.6).</td></tr>
+</table>
+
+<h3 id="c11-4-7">Telemetry, drone, wind and CoT</h3>
+<p>See chapter 11.7 for exact ingest wire formats.</p>
+<table class="fieldtable">
+<tr><th>Route</th><th>Purpose</th></tr>
+<tr><td>GET .../position-feeds, POST .../position-feeds {name, provider, device_kind}, PATCH .../position-feeds/{id}, POST .../position-feeds/{id}/rotate-token</td><td>Administer feed sources and their tokens. Administrator only.</td></tr>
+<tr><td>POST /api/feeds/positions/{source_id}</td><td>Ingest positions. Feed-token authenticated, not session-based.</td></tr>
+<tr><td>GET/POST /api/feeds/positions/{source_id}/osmand</td><td>OsmAnd/Traccar tracker protocol.</td></tr>
+<tr><td>GET .../vehicle-positions/latest, GET .../vehicle-tracks?gap_seconds=, GET .../vehicle-positions/interpolate?at=&amp;source_id=&amp;callsign=</td><td>Read back positions and tracks.</td></tr>
+<tr><td>GET .../cot?include_positions=&amp;include_features=&amp;stale_seconds=</td><td>The incident rendered as outbound Cursor-on-Target XML, for a TAK client to poll.</td></tr>
+<tr><td>GET /api/feeds/cot/status</td><td>CoT/MAVLink gateway listener status.</td></tr>
+<tr><td>GET .../wind-field?bbox=&amp;at=&amp;window_hours=&amp;grid=</td><td>Interpolated wind field (chapter 8.2).</td></tr>
+<tr><td>GET .../drone-missions, POST .../drone-missions {name, aircraft, operator}</td><td>Drone missions.</td></tr>
+<tr><td>GET .../drone-missions/{id}/assets, POST .../drone-missions/{id}/assets?filename=&amp;...</td><td>List / upload image assets (raw bytes body, not JSON).</td></tr>
+<tr><td>POST .../drone-missions/{id}/suggest-georeference</td><td>Propose footprint corners from EXIF/flight metadata (raw image body); writes nothing; 422 if the image carries no usable geometry.</td></tr>
+<tr><td>GET .../drone-missions/{id}/assets/{asset_id}/{rendition}</td><td>Download an asset or rendition.</td></tr>
+<tr><td>GET .../drone-missions/{id}/mosaics, POST .../drone-missions/{id}/mosaics {name, asset_ids}</td><td>Mosaics.</td></tr>
+<tr><td>GET .../sensor-files-manifest</td><td>Handover checklist of every external drone/offline-source file with its hash.</td></tr>
+</table>
+
+<h3 id="c11-4-8">Snapshots, products, recovery and transfer</h3>
+<table class="fieldtable">
+<tr><th>Route</th><th>Purpose</th></tr>
+<tr><td>GET .../snapshots, POST .../snapshots {name, period_id, classification}</td><td>Immutable snapshots (chapter 9.5).</td></tr>
+<tr><td>GET .../snapshots/{left}/compare?right_snapshot_id=</td><td>Diff two snapshots, or a snapshot against current state.</td></tr>
+<tr><td>GET .../products, POST .../products {format, classification, product_type, snapshot_id, title}, GET .../products/{id}/download</td><td>Classified portable products (chapter 7.8).</td></tr>
+<tr><td>GET /api/public/products, GET /api/public/products/{id}/download</td><td>Public-classification products, no session required.</td></tr>
+<tr><td>GET/POST /api/operations/backups, POST .../backups/{name}/verify, GET .../backups/{name}/download</td><td>Backups (chapter 9.3). Administrator only.</td></tr>
+<tr><td>GET/POST /api/operations/recoveries, GET .../recoveries/{name}/download</td><td>Recovery databases (chapter 9.4). Administrator only.</td></tr>
+<tr><td>GET/POST /api/operations/map-packs, GET .../map-packs/{id}, POST .../map-packs/{id}/verify, DELETE .../map-packs/{id}</td><td>Offline AOI tile manifests (chapter 8.4).</td></tr>
+<tr><td>GET/POST /api/operations/offline-sources, POST .../offline-sources/{id}/terrain-package</td><td>Imported MBTiles/GeoTIFF/GeoPackage sources (chapter 8.4). Administrator only.</td></tr>
+<tr><td>GET .../field-imports, POST .../field-imports/preview, POST .../field-imports/apply, GET .../field-imports/{id}/original</td><td>Field observation import (chapter 8.5).</td></tr>
+<tr><td>POST /api/operations/import/preview, POST /api/operations/import/apply</td><td>Whole-incident package import between servers. Administrator only.</td></tr>
+<tr><td>POST /api/operations/merge/stage {bundle}, GET .../incidents/{id}/merge-packages, POST /api/operations/merge/{id}/resolve {choices}</td><td>Disconnected package conflict resolution (chapter 7.9). Administrator only.</td></tr>
+</table>
+
+<h3 id="c11-4-9">Layers, tiles, webhooks and alerts</h3>
+<table class="fieldtable">
+<tr><th>Route</th><th>Purpose</th></tr>
+<tr><td>GET /api/layers?include_inactive=, POST /api/layers/probe {endpoint, kind}, POST /api/layers {name, kind, ...}, PATCH /api/layers/{id}, DELETE /api/layers/{id}</td><td>Custom WMS/WMTS/XYZ layers (chapter 4.4). Administrator only.</td></tr>
+<tr><td>GET /tiles/{layer_id}/{z}/{x}/{y}.{ext}</td><td>Tile proxy/cache for a built-in, offline, or custom layer.</td></tr>
+<tr><td>GET /offline-tiles/{source_id}/{z}/{x}/{y}</td><td>Tiles from an imported offline source.</td></tr>
+<tr><td>GET /api/webhooks?incident_id=, POST /api/webhooks {name, incident_id, source_id, mapping}, PATCH /api/webhooks/{id}, POST /api/webhooks/{id}/rotate-token, GET /api/webhooks/{id}/failures, DELETE /api/webhooks/{id}</td><td>Mapped CAD webhook administration (chapter 11.7.6). Administrator only.</td></tr>
+<tr><td>POST /api/ingest/webhook/{hook_id}</td><td>Delivery endpoint for the CAD system itself. Webhook-token authenticated.</td></tr>
+<tr><td>GET /api/alerts?bbox=&amp;severity=&amp;include_expired=, GET /api/alerts/status, GET /api/alerts/{identifier}/original, POST /api/alerts/refresh</td><td>Official warnings (chapter 4.7). Refresh is administrator only.</td></tr>
+</table>
+
+<h2 id="c11-5">11.5 Data formations: how records are structured</h2>
+<p>"Formation" here means the shape data is organised into, and the rules that keep that shape trustworthy
+across time, re-runs and multiple installations. There are two formations to understand: the incident
+hierarchy itself, and how analytical results cross into it.</p>
+
+<h3 id="c11-5-1">The incident hierarchy</h3>
+<p>Records nest in one fixed order. An incident (table <code>incidents</code>) has a name, an optional
+incident number, a status (<code>active</code>, <code>contained</code>, <code>closed</code>), a timezone,
+optional centre coordinates, notes, and a revision number. It contains operational periods (each with a
+name, start and end time, status <code>draft</code>/<code>active</code>/<code>closed</code>, and
+objectives), which contain plan scenarios (each with a name, kind
+<code>primary</code>/<code>contingency</code>/<code>alternative</code>/<code>worst_case</code>, status
+<code>draft</code>/<code>approved</code>/<code>retired</code>, description and assumptions). A tactical or
+observation feature belongs to a period and, usually, a scenario, or can attach directly to the incident
+with both left empty. Resources (crews, engines, aircraft) belong only to the incident, not to any one
+period or scenario. A feature is never hard-deleted: removing one sets its status to
+<code>inactive</code> and stamps a deletion time, so every id referenced elsewhere, including in an
+already-exported package, keeps resolving.</p>
+
+<h3 id="c11-5-2">Revision control</h3>
+<p>Every mutable record (incident, period, scenario, resource, feature) carries an integer
+<code>revision</code>, starting at 1. Updating one requires sending back the <code>expected_revision</code>
+the caller last read. The server checks the current revision before writing and again as part of the
+write itself (<code>UPDATE ... WHERE id = ? AND revision = ?</code>), so a second writer racing in
+between cannot silently overwrite the first. A stale revision, or a write that loses the race, is
+rejected with HTTP 409 and a body shaped <code>{"detail": "record changed since it was loaded", "code":
+"revision_conflict", "current": &lt;the current record&gt;}</code>; reload the current record and retry
+against its revision rather than resending blind. Scenario approval treats <code>expected_revision</code>
+as optional, since approval is often triggered from a checklist view that is not tracking the scenario's
+own revision number.</p>
+
+<h3 id="c11-5-3">Cross-module links: immutable snapshots, not live references</h3>
+<p>Fire events, model runs, alerts, drone assets, field imports, raw-detection windows and structures are
+all things that change identity over time: an event's clustering can be re-run and its numeric id is not
+stable across runs; a model run's arrival surface changes if the model is re-run with new weather;
+detections themselves are purged on the retention window. Because of this, anything from the analytical
+side of the application that gets attached to an incident is attached as a frozen snapshot, never as a
+live reference that could later point at something different or gone. <code>POST
+/api/operations/incidents/{id}/links</code> requires a non-empty <code>snapshot</code> object and refuses
+an empty one outright; the snapshot is capped at 256 KiB and is stamped with the time it was taken.
+Attaching the same <code>(kind, ref_id)</code> pair twice refreshes the existing link's snapshot rather
+than creating a duplicate. A link kind is one of <code>event</code>, <code>model_run</code>,
+<code>alert</code>, <code>drone_asset</code>, <code>import</code>, <code>detection_window</code>, or
+<code>structure</code>. Removing a link is a genuine, permanent delete, unlike a feature's soft delete,
+since a link is a statement about the incident's own record rather than a shared entity another record
+might still reference; its full content is preserved in the audit log regardless.</p>
+<p>An incident's area of interest is a normal GeoJSON polygon (or a bounding box, which the server
+converts to one), stored on the incident itself and used by two things: the reverse lookup
+<code>GET /api/operations/incidents/covering?lat=&amp;lon=</code>, which only ever matches incidents that
+actually have an area of interest drawn, never by distance from a centre point, and the per-position
+safety check that runs after every accepted vehicle position (chapter 11.7.2).</p>
+
+<h2 id="c11-6">11.6 Setting up routing for a shared incident LAN</h2>
+<p>This section is for an authorised incident-system administrator preparing NexFiremap for more than one
+device. NexFiremap is not certified by the software itself; local command, security and GIS leads remain
+responsible for accepting a deployment and its data.</p>
+<ol>
+<li>Use a dedicated, patched command laptop and a trusted, incident-only local network.</li>
+<li>Set <code>NEXFIREMAP_LAN_MODE=true</code>, a unique admin password of at least 12 characters in
+<code>NEXFIREMAP_ADMIN_PASSWORD</code>, and a short <code>NEXFIREMAP_SESSION_MINUTES</code>.</li>
+<li>Configure both <code>NEXFIREMAP_TLS_CERT_FILE</code> and <code>NEXFIREMAP_TLS_KEY_FILE</code>. The
+certificate must name the address field devices will actually use. Install and verify its issuing
+certificate authority on every device before the briefing; never teach anyone to click through a
+certificate warning. If TLS is instead terminated at a separate, hardened reverse proxy, bind NexFiremap
+only to that proxy's own private interface.</li>
+<li>Start with an explicit non-loopback address, for example
+<pre>python run.py --host 192.168.50.10</pre>
+Startup should show the LAN warning and an <code>https://</code> URL.</li>
+<li>Sign in as <code>admin</code>, open Incident LAN accounts (chapter 3.4), and issue one named account
+per person with the least-privileged role that covers their job. Do not share the administrator
+account.</li>
+<li>Import and verify the area's map pack, create a verified backup, disconnect the wide-area network,
+reload two field devices, and confirm the map, incident data, drawing, products, sign-out and sign-in all
+still work. Every selected zoom level in the offline coverage check must read complete.</li>
+<li>For each approved vehicle gateway, create a position feed and transfer its one-time token through a
+protected provisioning process, never a shared briefing document or a browser bookmark; test rotating and
+revoking a token before relying on it.</li>
+<li>Confirm the drone desk's classification, retention and privacy procedure, and test a real nadir frame
+with known ground control before relying on suggested corners in the field.</li>
+</ol>
+<p>During operations: keep the command server on protected power and watch the local-server pill; treat
+every stale observation and model warning as unresolved until a named operator updates or explicitly
+reviews it; create a snapshot at every operational-period change and before any handover; use the
+public-information template for anything released publicly, since every other product class contains
+command records; download verified backups to separate media, since a backup left only on the command
+laptop is not a recovery copy; and remember that the drone folder and any imported offline map sources
+live outside the database and are not covered by a database backup.</p>
+<p>If someone cannot sign in, an administrator creates a replacement named account rather than disabling
+authentication or exposing the loopback-only mode to the network. If the administrator credential itself
+is lost, stop the server, set a new <code>NEXFIREMAP_ADMIN_PASSWORD</code>, and restart: the local
+<code>admin</code> password is rotated at startup without touching any incident data. Full detail,
+including database failure recovery and handover procedure, is in
+<a href="INCIDENT_LAN_RUNBOOK.md">INCIDENT_LAN_RUNBOOK.md</a> in this repository.</p>
+
+<h2 id="c11-7">11.7 Feeding data in: standards interoperability</h2>
+<p>Chapter 8.7 describes this from an operator's point of view. This section is the wire-format detail
+needed to actually connect an external system. Every adapter lives in <code>nexfiremap/ingest/</code>,
+takes raw bytes plus a small amount of context, and returns a list of dicts already shaped to match
+either <code>TelemetryManager.ingest</code> (a position report), <code>FieldImportManager.prepare</code>
+(an overlay feature), or <code>AlertManager</code> (an alert). No adapter opens a network connection,
+touches the database, or reads a setting; it only parses. This is a deliberate architectural rule, not an
+accident: it means a new external format is always a new parser, never a new way to write to the
+database.</p>
+
+<h3 id="c11-7-1">Cursor-on-Target (CoT) / TAK</h3>
+<p>XML <code>&lt;event&gt;</code> elements, CoT 2.0. <code>a-*</code> types (atoms, positions) become
+position reports; <code>b-*</code> types (bits: markers and shapes) become overlay features when
+<code>NEXFIREMAP_COT_ACCEPT_FEATURES=true</code>. Speed is read as m/s; altitude as metres above the
+WGS84 ellipsoid; CoT's "unknown" sentinel value on circular/linear error and altitude is treated as not
+present; a report at exactly 0,0 (no GPS lock) is skipped rather than stored as a real position. Post to
+<code>POST /api/feeds/positions/&lt;source id&gt;</code> with
+<code>Content-Type: application/xml</code> (or <code>application/cot+xml</code>) and header
+<code>X-Feed-Token</code>. NexFiremap can also stream this continuously to a listening TCP/UDP gateway
+(chapter 11.7.7), and can render an incident back out as CoT for a TAK client to poll, at
+<code>GET /api/operations/incidents/{id}/cot</code>.</p>
+
+<h3 id="c11-7-2">NMEA 0183</h3>
+<p>Only <code>RMC</code> and <code>GGA</code> sentences are read; anything else is ignored. Coordinates
+are the raw <code>ddmm.mmmm</code> NMEA format, converted server-side. A checksum, if present, is
+validated; GGA carries no date, so date comes from an RMC sentence in the same payload, or from the
+server's own clock if none is present. Because NMEA carries no identity of its own, the request must
+supply a callsign: <code>POST /api/feeds/positions/&lt;source id&gt;?callsign=Brush%2012</code> with
+<code>Content-Type: text/plain</code> and the raw sentences as the body.</p>
+
+<h3 id="c11-7-3">MAVLink</h3>
+<p>Only message id 33 (<code>GLOBAL_POSITION_INT</code>) is decoded from raw MAVLink v1/v2 binary frames;
+there is no CRC or v2 signature verification, which is exactly why this path is expected to run only over
+the CoT gateway's own address-allowlisted, LAN-only listener (chapter 11.7.7), never exposed directly.
+Because a MAVLink frame carries only a boot-relative timestamp, the newest frame in a batch is anchored to
+the moment of receipt and earlier frames in the same batch are back-dated by their relative offset. A
+callsign must be supplied, the same as NMEA. <code>Content-Type: application/x-mavlink</code>.</p>
+
+<h3 id="c11-7-4">Common Alerting Protocol (CAP)</h3>
+<p>OASIS CAP 1.2 XML. Only alerts with <code>status="Actual"</code> are treated as live; exercise, system,
+draft and test messages are skipped. A circle area is approximated as a 64-sided polygon; multiple areas
+combine into one multi-polygon. This adapter is not reachable through a public route: NexFiremap polls
+configured feeds itself (<code>NEXFIREMAP_CAP_FEEDS</code>, chapter 10.10) rather than accepting a pushed
+CAP document.</p>
+
+<h3 id="c11-7-5">Shapefile</h3>
+<p>A ZIP bundle containing <code>.shp</code>, <code>.dbf</code> and, ideally, <code>.prj</code>, used
+through the ordinary field-observation import (chapter 8.5, <code>POST .../field-imports/preview</code>
+with <code>format: "shp"</code>). Only WGS84, ETRS89, Web Mercator and WGS84 UTM projections are
+recognised from a <code>.prj</code> file; anything else is refused by name rather than guessed, since a
+wrong guess on a projected coordinate system could place features a country away with no visible sign of
+the error. A bundle with no <code>.prj</code> file requires the caller to explicitly assume WGS84.</p>
+
+<h3 id="c11-7-6">Mapped CAD JSON (webhook)</h3>
+<p>For a dispatch or computer-aided-dispatch system that already emits its own JSON shape. An
+administrator registers a webhook against a specific position feed and writes a field mapping from the
+vendor's own JSON paths to NexFiremap's position fields:</p>
+<pre>curl -s -X POST http://127.0.0.1:8000/api/webhooks \
+  -H "Content-Type: application/json" -H "X-CSRF-Token: $CSRF" -b "nexfiremap_session=$TOKEN" \
+  -d '{
+    "name": "CAD feed",
+    "incident_id": "INC1",
+    "source_id": "cad-1",
+    "mapping": {
+      "callsign": "$.unit.name",
+      "latitude": "$.location.lat",
+      "longitude": "$.location.lon",
+      "observed_at": "$.timestamp"
+    }
+  }'</pre>
+<p>The mapping accepts only a dotted/indexed path (<code>$.a.b[0].c</code>), a literal string, or a
+literal with interpolated paths; there is no arithmetic, no conditional logic, and nothing resembling code
+evaluation, since a mapping language that could execute anything would turn every hook URL that ever leaks
+into a way to run code on the server. Mapping targets are restricted to the position fields themselves, so
+a mapping cannot inject arbitrary properties. If a payload arrives that the current mapping cannot
+translate, it is kept (not discarded) as a dead letter, retrievable with candidate field paths suggested
+automatically, via <code>GET /api/webhooks/{hook_id}/failures</code>, so the mapping can be corrected from
+what the vendor is actually sending rather than from documentation. The CAD system itself delivers to
+<code>POST /api/ingest/webhook/{hook_id}</code> with header <code>X-Webhook-Token</code>. Do not map
+<code>external_id</code> to something like a dispatch number that stays the same across a vehicle's whole
+call: NexFiremap treats a repeated <code>external_id</code> with different content as an error, so a
+moving vehicle would stop updating after its first position. Leave it unmapped unless the source system
+truly issues a unique id per message.</p>
+
+<h3 id="c11-7-7">Live CoT/MAVLink gateway and MQTT bridge</h3>
+<p>For a source that streams continuously rather than making individual HTTP calls, NexFiremap can run a
+small TCP/UDP listener speaking CoT and, optionally, MAVLink (settings in chapter 10.9), or bridge to an
+MQTT broker (settings also in chapter 10.9, topic format
+<code>topic=source_id:format[:callsign]</code>, formats <code>json</code>, <code>cot</code>,
+<code>nmea</code>, <code>mavlink</code>). Both are disabled by default and both are explicitly intended
+for a closed, physically controlled incident LAN only: the CoT/MAVLink listener has no authentication of
+its own beyond a source-address allowlist and a rate limit, and MQTT connects only over TLS, with no
+setting to relax that. Neither should ever be exposed to a network that is not fully trusted.</p>
+
+<h2 id="c11-8">11.8 Testing</h2>
+<p>There is no pytest runner or shared configuration; each file under <code>tests/</code> is a standalone
+script with its own <code>main()</code>, printing failures and returning a process exit code of 0 on
+success. Run one directly:</p>
+<pre>python tests\test_core.py</pre>
+<p>Or run every test file and stop at the first failure (PowerShell):</p>
+<pre>foreach ($f in Get-ChildItem tests\test_*.py) { python $f.FullName; if ($LASTEXITCODE -ne 0) { break } }</pre>
+<p>Most tests need no network access and no FIRMS key; HTTP is stubbed with <code>httpx</code>'s mock
+transport. The imagery and terrain modules' STAC/DEM/weather-fetching code paths use
+<code>pystac_client</code>/<code>rasterio</code>, which have their own HTTP transport and so bypass that
+mock; those specific code paths were verified live against real data sources instead, as noted in the test
+files' own comments.</p>
+
+<h2 id="c11-9">11.9 Project layout</h2>
+<p>A guide to where things live, for anyone reading the source alongside this manual. This reflects the
+package layout as of this manual's writing; the project's own <code>CLAUDE.md</code> notes that
+<code>api.py</code>, <code>nexfiremap/routes/</code>, <code>nexfiremap/operations/</code> and
+<code>nexfiremap/static/</code> in particular may be mid-edit by another contributor at any time, so check
+<code>git status</code> before assuming the working tree matches exactly what is described here.</p>
+<table class="fieldtable">
+<tr><th>Path</th><th>Contents</th></tr>
+<tr><td>nexfiremap/api.py</td><td>Composition root: app, lifespan, security middleware, exception handling.</td></tr>
+<tr><td>nexfiremap/routes/</td><td>One route module per subject area; the actual HTTP handlers.</td></tr>
+<tr><td>nexfiremap/schemas.py</td><td>Centralised request/response body models.</td></tr>
+<tr><td>nexfiremap/operations/</td><td>Incidents, periods, scenarios, features, resources, cross-module links, packages/export-import, audit log.</td></tr>
+<tr><td>nexfiremap/ingest/</td><td>Stateless external-format adapters: CoT, CAP, NMEA, MAVLink, Shapefile, mapped-CAD webhook.</td></tr>
+<tr><td>nexfiremap/cache.py, firms.py</td><td>Fire-detection coverage grid, fetch queue, retention; the FIRMS client itself.</td></tr>
+<tr><td>nexfiremap/tiles.py, basemaps.py</td><td>Basemap tile cache/proxy; basemap and terrain-DEM definitions.</td></tr>
+<tr><td>nexfiremap/jobs.py</td><td>Background job queue (separate idle-priority processes).</td></tr>
+<tr><td>nexfiremap/orbits.py, events.py, likelihood.py, imagery.py, rothermel.py, moisture.py, terrain.py, validation.py, industrial.py, eumetsat.py</td><td>The fire-event analysis pipeline (chapter 6).</td></tr>
+<tr><td>nexfiremap/tactics.py, products.py, provenance.py, merge.py, backups.py, map_packs.py, offline_sources.py, field_import.py, structures.py</td><td>Incident-command support modules (chapter 7, 8, 9).</td></tr>
+<tr><td>nexfiremap/telemetry.py, drone.py, wind.py, photogrammetry.py, safety.py, situation.py</td><td>Vehicle telemetry, drone imagery, wind, footprint suggestion, the post-position safety loop, the situation-report provider registry.</td></tr>
+<tr><td>nexfiremap/alerts.py, cot_gateway.py, mqtt.py, webhooks.py, layers.py, federation.py</td><td>Optional external-system integrations (chapter 10.8-10.10, 11.7).</td></tr>
+<tr><td>nexfiremap/security.py</td><td>Local accounts, sessions, CSRF, role policy.</td></tr>
+<tr><td>nexfiremap/settings_store.py, symbology.py</td><td>Runtime setting overrides; the tactical symbol table.</td></tr>
+<tr><td>nexfiremap/db.py, config.py</td><td>SQLite schema/queries; environment-variable settings.</td></tr>
+<tr><td>nexfiremap/static/</td><td>The frontend: index.html, css/app.css, and js/ (app.js, operations.js, tools.js, settings.js, alerts.js, context.js, integration.js, structures.js, coords.js), plus vendor/ (Leaflet, MapLibre GL JS and their plugins, vendored, no CDN calls).</td></tr>
+<tr><td>scripts/</td><td>vendor_assets.py (re-download vendored frontend libraries), setup_wizard.py (install/first-run wizard).</td></tr>
+<tr><td>tests/</td><td>One standalone script per area, see chapter 11.8.</td></tr>
+</table>
+
+<h1 id="c12">12. Glossary and appendix</h1>
+
+<h2 id="c12-1">12.1 Glossary</h2>
+<table class="fieldtable">
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td>AOI</td><td>Area of interest: the polygon or bounding box an incident is scoped to (chapter 11.5.3).</td></tr>
+<tr><td>Anderson 13</td><td>A standard set of 13 fuel models (grass, brush, timber litter, slash and so on) used by the Rothermel spread equation, from Hal Anderson's 1982 reference (GTR-INT-122).</td></tr>
+<tr><td>CAP</td><td>Common Alerting Protocol, the standard format official public warnings are published in.</td></tr>
+<tr><td>CoT</td><td>Cursor-on-Target, the position/marker XML format used by TAK (Team Awareness Kit) systems.</td></tr>
+<tr><td>CSRF token</td><td>A second token, separate from the session cookie, that a caller must echo back to prove a request came from a page that actually holds the session, not from a third-party site exploiting a signed-in browser.</td></tr>
+<tr><td>dNBR</td><td>Differenced Normalized Burn Ratio: the pre-fire NBR minus the post-fire NBR, used to classify burn severity.</td></tr>
+<tr><td>Ensemble</td><td>Many spread-model runs sampling different plausible weather/fuel assumptions at once, then weighted by how well each matched what actually happened (chapter 6.8).</td></tr>
+<tr><td>Fast marching</td><td>A shortest-path style method for solving how far something (here, fire) has spread by a given time, used instead of a continuous partial-differential-equation solve for lower implementation risk.</td></tr>
+<tr><td>FRP</td><td>Fire Radiative Power, in megawatts: how much heat energy a detection's pixel is radiating, reported by the satellite sensor.</td></tr>
+<tr><td>GeoJSON</td><td>A JSON format for geographic features (points, lines, polygons plus properties); NexFiremap's API returns it for most spatial data.</td></tr>
+<tr><td>Isochrone</td><td>A line or band showing where fire is estimated to have reached by a given elapsed time.</td></tr>
+<tr><td>MAVLink</td><td>A binary telemetry protocol common to drones and other unmanned vehicles.</td></tr>
+<tr><td>MBTiles</td><td>A single-file SQLite-based format for a set of map tiles, commonly used to distribute an offline basemap.</td></tr>
+<tr><td>NBR</td><td>Normalized Burn Ratio, a satellite-imagery index computed from near-infrared and shortwave-infrared bands, sensitive to vegetation and burn condition.</td></tr>
+<tr><td>Probability-mass envelope</td><td>A contour drawn so that the area inside it holds a stated fraction (50/80/90 percent) of a raster's total likelihood, not a contour at a fixed density value (chapter 6.5).</td></tr>
+<tr><td>Provenance</td><td>The recorded origin, timing, and stated limitations of a model result or a file, kept attached to it wherever it is used.</td></tr>
+<tr><td>Revision conflict</td><td>The error returned when an edit was based on a record that has since changed (chapter 11.5.2).</td></tr>
+<tr><td>Rothermel model</td><td>The standard 1972 (Albini 1976-corrected) equation set for surface-fire spread rate, the physics core of NexFiremap's modelled-spread layer.</td></tr>
+<tr><td>Snapshot</td><td>An immutable, named freeze of an incident's full state at a moment in time (chapter 9.5), distinct from a database backup (chapter 9.3).</td></tr>
+<tr><td>Symbology profile</td><td>Which set of map symbols and colours tactical features are drawn with (a NexFiremap default, a German DV 102 profile, or a US ICS/NFPA profile), configurable per installation.</td></tr>
+<tr><td>Tri-state observation model</td><td>Treating "a satellite confirmed fire here", "a satellite passed and confirmed no fire here", and "no satellite ever looked here" as three distinct kinds of evidence, rather than collapsing the second and third into "unknown" (chapter 6.3).</td></tr>
+<tr><td>WMS / WMTS</td><td>Web Map Service / Web Map Tile Service: standard protocols for serving map imagery from a GIS server, which NexFiremap can add as a custom layer (chapter 4.4).</td></tr>
+</table>
+
+<h2 id="c12-2">12.2 Data sources and licensing</h2>
+<p>Fire detections come from <a href="https://firms.modaps.eosdis.nasa.gov/">NASA FIRMS</a>; near-real-time
+products are provisional and may later be revised. Orbital elements come from
+<a href="https://celestrak.org">Celestrak</a>. Sentinel-2, Landsat, the Copernicus digital elevation model
+and ESA WorldCover all come through the
+<a href="https://planetarycomputer.microsoft.com">Microsoft Planetary Computer</a>. Weather and
+historical cloud cover come from <a href="https://open-meteo.com">Open-Meteo</a>. Industrial-source
+candidates and building footprints come from the
+<a href="https://overpass-api.de/">OpenStreetMap Overpass API</a>. Elevation tiles for the 3D view come
+from <a href="https://registry.opendata.aws/terrain-tiles/">AWS Open Data terrain tiles</a>. Independent
+geostationary fire confirmation, where configured, comes from the
+<a href="https://data.eumetsat.int">EUMETSAT Data Store</a>. Place search is proxied to
+<a href="https://nominatim.org">Nominatim</a> under its own usage policy. Basemap tiles are
+&copy; OpenStreetMap contributors and the respective tile providers listed in the basemap picker;
+attribution is preserved in the map's own attribution control.</p>
+<p>OpenStreetMap data is licensed under the Open Database License (ODbL); the attribution already shown on
+the map covers displaying it. Redistributing the cached tiles or data themselves as a separate dataset,
+rather than running this server, would need to satisfy ODbL's share-alike terms on its own. NASA FIRMS
+data carries its own use policy (credit NASA/FIRMS, do not imply endorsement); this only matters if cached
+fire data itself is redistributed, not the code that fetches it. Copernicus/ESA sources and Open-Meteo are
+openly licensed for reuse with attribution, already credited above. None of this affects the licensing of
+NexFiremap's own code, which is MIT-licensed; it matters only when redistributing the data this project
+caches, separately from the software itself.</p>
+
+<h2 id="c12-3">12.3 Troubleshooting</h2>
+<table class="fieldtable">
+<tr><th>Symptom</th><th>Likely cause and fix</th></tr>
+<tr><td>Banner: add your NASA FIRMS map key</td><td>No FIRMS_MAP_KEY is set. The map, basemaps and every other module still work; only satellite detections are unavailable until a key is added and the server restarted (chapter 2.3).</td></tr>
+<tr><td>An analysis button is disabled with an explanation</td><td>That feature's optional dependency (most often rasterio) failed to install. Check GET /api/config's features field, or re-run the setup wizard's connectivity/dependency check.</td></tr>
+<tr><td>local server pill shows disconnected</td><td>The browser cannot currently reach the server. Cached reads keep working from what was already loaded; nothing is written or queued while disconnected, so reconnect before making further changes.</td></tr>
+<tr><td>Saving a record fails with a conflict message</td><td>Someone else, or another open tab, changed the same record first (chapter 11.5.2). Reload it and reapply the change.</td></tr>
+<tr><td>Settings pane says administrator only</td><td>Expected for any non-administrator account; sign in as an administrator to view or change shared settings (chapter 10, footnote).</td></tr>
+<tr><td>Sketch tool says select an incident and operational period first</td><td>Choose or create an incident and, if needed, a period from the incident context bar (chapter 4.1) before drawing.</td></tr>
+<tr><td>EUMETSAT confirmation panel is missing</td><td>No EUMETSAT_CONSUMER_KEY/SECRET is configured; this panel only appears once both are set (chapter 5.6).</td></tr>
+<tr><td>Official warnings control is missing</td><td>No CAP feed is configured (NEXFIREMAP_CAP_FEEDS); the control does not appear at all until one is (chapter 4.7).</td></tr>
+</table>
+
+<h2 id="c12-4">12.4 A note on scope</h2>
+<p>This manual describes what is implemented and runnable in this repository at the time of writing.
+Some further items are tracked as open in the project's own completion ledger
+(<code>END_TO_END_TODO.md</code>), mostly external gates such as hardware drills and brigade field
+exercises rather than missing code. Where the source code itself states a simplification or a limitation,
+this manual has tried to state it too, in the same place, rather than only in a single caveats section, so
+that reading any one part of this manual gives an honest picture of what that part actually does.</p>
 
 <footer>
 <p>NexFiremap is licensed under MIT. Fire detection data: NASA FIRMS. Basemaps: OpenStreetMap
