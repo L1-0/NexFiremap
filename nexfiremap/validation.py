@@ -622,7 +622,14 @@ def run_validation(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         )
 
         per_model: dict[str, list[dict[str, Any]]] = {name: [] for name in MODEL_NAMES}
+        # Two counters for the two clear-pass lists (see the split below).
+        # `clear_pass_total` is how many passes the *model* was allowed to treat
+        # as evidence of absence; `clear_pass_negatives` is how many became
+        # negative ground truth. The second is the smaller whenever an overpass
+        # actually saw the fire, and the gap between them is exactly the
+        # contamination this used to have.
         clear_pass_total = 0
+        clear_pass_negatives = 0
 
         for i, split in enumerate(splits):
             train, target_ts = split["train"], split["target_ts"]
@@ -639,12 +646,37 @@ def run_validation(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
             try:
                 from .orbits import aoi_clear_passes  # noqa: PLC0415 - optional feature, lazy on purpose
 
+                # Two clear-pass lists, because the same computation is being
+                # asked for two opposite things and only one of them may look
+                # at the holdout.
+                #
+                # `clear` is a **model input** - it suppresses kernel_density
+                # below exactly as analyze_event does when serving. It must see
+                # training detections only, or the backtest leaks the future
+                # into the prediction.
                 det_times_train = [d["ts"] for d in train]
                 clear = aoi_clear_passes(
                     conn, bbox, det_times_train, split["split_ts"], target_ts + HORIZON_S
                 )
                 clear_pass_total += len(clear)
-                negative_points = [(event["centroid_lat"], event["centroid_lon"])] * len(clear)
+
+                # `clear_truth` is **ground truth** - the negative points every
+                # model is scored against. It must see *every* detection in the
+                # window, holdout included, because ground truth is what
+                # actually happened rather than what the model was allowed to
+                # know. Computed from train-only times, the very overpass that
+                # produced the held-out detections counted as a "confirmed clear
+                # pass", and a negative point was then placed at the event
+                # centroid - the one place the fire certainly was. Every model
+                # was penalised in precision and Brier for correctly predicting
+                # fire there, so the headline figures an operator reads were
+                # scored against partly false negatives.
+                det_times_truth = det_times_train + [d["ts"] for d in split["holdout"]]
+                clear_truth = aoi_clear_passes(
+                    conn, bbox, det_times_truth, split["split_ts"], target_ts + HORIZON_S
+                )
+                clear_pass_negatives += len(clear_truth)
+                negative_points = [(event["centroid_lat"], event["centroid_lon"])] * len(clear_truth)
             except ImportError:
                 pass
             except Exception:  # noqa: BLE001 - orbit propagation, degrade rather than fail the job
@@ -743,7 +775,12 @@ def run_validation(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
             "event_id": event_id,
             "split_count": len(splits),
             "threshold": threshold,
-            "clear_pass_negatives_used": clear_pass_total,
+            # The count of negatives actually scored against, which is the
+            # holdout-aware list - not the model-input one. Reporting the
+            # latter here would overstate how much negative evidence the
+            # metrics rest on, by exactly the passes that saw the fire.
+            "clear_pass_negatives_used": clear_pass_negatives,
+            "clear_passes_available_to_model": clear_pass_total,
             "wind_ellipse_available": "wind_ellipse" in summary,
             "summary": summary,
             "splits": per_model,
@@ -753,7 +790,12 @@ def run_validation(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         return {
             "event_id": event_id,
             "split_count": len(splits),
-            "clear_pass_negatives_used": clear_pass_total,
+            # The count of negatives actually scored against, which is the
+            # holdout-aware list - not the model-input one. Reporting the
+            # latter here would overstate how much negative evidence the
+            # metrics rest on, by exactly the passes that saw the fire.
+            "clear_pass_negatives_used": clear_pass_negatives,
+            "clear_passes_available_to_model": clear_pass_total,
             "summary": summary,
             "files": {"validation": "validation.json"},
         }

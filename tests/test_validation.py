@@ -353,10 +353,33 @@ def test_run_validation_job() -> None:
             "wind_ellipse" in result["summary"],
             str(list(result["summary"])),
         )
+        # The clear-pass machinery runs offline off the pre-seeded TLE. Asserted
+        # on the model-input count, because that is the one that measures
+        # "orbit propagation found passes at all". The negatives count is
+        # legitimately allowed to be zero - and is, for this fixture, because
+        # every pass in the window coincided with a held-out detection. That is
+        # the finding rather than a defect: before the fix, all of those counted
+        # as confirmed-clear negative ground truth, placed at the event
+        # centroid, so this event's metrics were scored entirely against passes
+        # that had in fact seen the fire.
         check(
-            "clear-pass negatives were found (offline via pre-seeded TLE)",
-            result["clear_pass_negatives_used"] > 0,
-            str(result["clear_pass_negatives_used"]),
+            "clear passes were found at all (offline via pre-seeded TLE)",
+            result["clear_passes_available_to_model"] > 0,
+            str(result["clear_passes_available_to_model"]),
+        )
+        # Ground truth must be computed with the holdout visible, the model
+        # input without it. Those are opposite requirements served by one
+        # computation before: the pass that produced the held-out detections
+        # was counted as a "confirmed clear pass" and became a negative point
+        # at the event centroid, so every model was penalised for correctly
+        # predicting fire exactly where it was. The negatives can therefore
+        # only ever be a subset of what the model was allowed to treat as
+        # absence - never more.
+        check(
+            "negatives are holdout-aware, so never exceed the model's clear passes",
+            result["clear_pass_negatives_used"] <= result["clear_passes_available_to_model"],
+            f"{result['clear_pass_negatives_used']} negatives vs "
+            f"{result['clear_passes_available_to_model']} model passes",
         )
 
         for model_name, metrics in result["summary"].items():

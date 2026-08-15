@@ -2144,7 +2144,15 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
       const res = await fetch("/api/industrial/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bbox: bboxParam() }),
+        // Pass the selected event when there is one. The server's
+        // "wildfire overrides industrial" safeguard - which reclassifies a
+        // persistent source as a possible incident once detections outgrow its
+        // footprint - only runs for a named event, so omitting this left the
+        // safeguard switched off from the UI no matter what the fire did.
+        body: JSON.stringify({
+          bbox: bboxParam(),
+          ...(state.selectedEventId ? { event_id: state.selectedEventId } : {}),
+        }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));

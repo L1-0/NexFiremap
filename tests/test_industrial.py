@@ -380,6 +380,64 @@ def test_apply_wildfire_override() -> None:
         all(m["classification"] == "persistent_industrial" for m in matches2.values()),
     )
 
+    test_wildfire_override_on_real_matcher_output()
+
+
+def test_wildfire_override_on_real_matcher_output() -> None:
+    """The override must fire on state the matcher can actually produce.
+
+    The case above builds its `matches` dict by hand, including detections
+    kilometres outside the source's 0.5 km radius. `match_detections` cannot
+    return those - it only ever matches within `match_radius_km` - so that test
+    passed while the real pipeline could never reach the branch: measured over
+    the matched subset alone, the late-phase distance is bounded by the radius,
+    and the trigger asks for more than twice it. The safeguard was unreachable
+    dead code, and README advertises it.
+
+    So this drives `match_detections` for real and asserts the outcome.
+    """
+    print("\napply_wildfire_override on real match_detections output")
+    now = time.time()
+    source = {
+        "id": 7, "lat": 40.0, "lon": 10.0, "score": 0.9,
+        "classification": "persistent_industrial", "match_radius_km": 0.5,
+    }
+
+    # A fire igniting at the flare site: early detections sit on the source
+    # (so they match), later ones march away from it (so they do not).
+    early = [{"id": i, "lat": 40.0 + 0.0005 * i, "lon": 10.0, "ts": now + i * 60}
+             for i in range(3)]
+    late = [{"id": 20 + i, "lat": 40.0 + 0.02 * (i + 1), "lon": 10.0, "ts": now + 7200 + i * 60}
+            for i in range(3)]
+    detections = early + late
+
+    matches = match_detections(detections, [source])
+    # The premise: only the early, on-source detections match at all. If this
+    # ever stops holding, the test below stops testing what it claims to.
+    check("only on-source detections match", set(matches) == {d["id"] for d in early}, str(sorted(matches)))
+    for det_id, match in matches.items():
+        check(f"detection {det_id} matched inside the radius",
+              match["distance_km"] <= source["match_radius_km"], str(match))
+
+    downgraded = apply_wildfire_override(detections, matches, [source])
+    check("a fire outgrowing the source is unmasked", downgraded > 0, str(matches))
+    check("every matched detection is reclassified",
+          all(m["classification"] == "possible_industrial_incident" for m in matches.values()),
+          str(matches))
+    check("the reason names the growth",
+          all("grew from" in m.get("override_reason", "") for m in matches.values()))
+
+    # ...and a genuinely static source still must not be unmasked, or the
+    # classifier becomes useless noise during routine flaring.
+    static = [{"id": 50 + i, "lat": 40.0 + 0.0002 * i, "lon": 10.0, "ts": now + i * 600}
+              for i in range(6)]
+    static_matches = match_detections(static, [source])
+    check("a static source's detections all match", len(static_matches) == len(static))
+    check("steady flaring is not unmasked",
+          apply_wildfire_override(static, static_matches, [source]) == 0, str(static_matches))
+    check("static classifications untouched",
+          all(m["classification"] == "persistent_industrial" for m in static_matches.values()))
+
 
 def test_scan_industrial_sources_job(tmp: Path) -> None:
     print("\nscan_industrial_sources job body: end-to-end (offline, pre-seeded OSM cache)")

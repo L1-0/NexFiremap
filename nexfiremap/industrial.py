@@ -565,22 +565,35 @@ def apply_wildfire_override(
     third = max(1, len(ordered) // 3)
     early, late = ordered[:third], ordered[-third:]
 
-    by_source: dict[int, list[dict[str, Any]]] = {}
+    # Which sources this event is associated with at all. Only *matched*
+    # detections can name a source, so this is what the match map is for.
+    matched_by_source: dict[int, list[dict[str, Any]]] = {}
     for det in ordered:
         m = matches.get(det["id"])
         if m:
-            by_source.setdefault(m["source_id"], []).append(det)
+            matched_by_source.setdefault(m["source_id"], []).append(det)
 
     downgraded = 0
     sources_by_id = {s["id"]: s for s in scored_sources}
-    for source_id, members in by_source.items():
+    early_ids = {d["id"] for d in early}
+    late_ids = {d["id"] for d in late}
+    for source_id, matched_members in matched_by_source.items():
         src = sources_by_id.get(source_id)
         if src is None:
             continue
-        early_ids = {d["id"] for d in early}
-        late_ids = {d["id"] for d in late}
-        early_here = [d for d in members if d["id"] in early_ids]
-        late_here = [d for d in members if d["id"] in late_ids]
+        # Growth is measured over **every** detection in the event, not only the
+        # matched ones. This is the whole correctness of the check:
+        # `match_detections_to_sources` only ever matches a detection within
+        # `match_radius_km`, so the matched subset can never exceed that radius
+        # by construction - and the trigger below asks for more than twice it.
+        # Measuring growth on that subset made this branch unreachable, so the
+        # documented "wildfire overrides industrial" safeguard could not fire at
+        # all: a genuine fire igniting at a flare site stayed classified as
+        # persistent industrial through its critical first hours. The detections
+        # that prove a fire has outgrown the source are precisely the ones that
+        # fell *outside* the radius and therefore never matched.
+        early_here = [d for d in ordered if d["id"] in early_ids]
+        late_here = [d for d in ordered if d["id"] in late_ids]
         if not early_here or not late_here:
             continue
         max_early_dist = max(haversine_km(d["lat"], d["lon"], src["lat"], src["lon"]) for d in early_here)
@@ -589,7 +602,10 @@ def apply_wildfire_override(
         # started - the signature of a real fire passing through, not a
         # static source flickering.
         if max_late_dist > src["match_radius_km"] * 2.0 and max_late_dist > max_early_dist * 1.5:
-            for det in members:
+            # Only the *matched* detections are reclassified: those are the ones
+            # currently attributed to this source, and they are what an operator
+            # would otherwise dismiss as routine flaring.
+            for det in matched_members:
                 matches[det["id"]]["classification"] = "possible_industrial_incident"
                 matches[det["id"]]["override_reason"] = (
                     f"detections grew from {max_early_dist:.2f}km to {max_late_dist:.2f}km "

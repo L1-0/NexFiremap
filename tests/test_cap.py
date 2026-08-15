@@ -253,8 +253,84 @@ def check_storage_and_expiry() -> None:
             assert manager.prune_now() == 1, "the expired alert should be pruned"
             assert manager.query(include_expired=True)["features"], "prune must not empty the table"
             assert manager.status()["stored"] == 3
+
+            check_expiry_respects_utc_offset(manager, db)
         finally:
             db.close()
+
+
+def check_expiry_respects_utc_offset(manager, db) -> None:
+    """A warning's expiry must be judged as an instant, whatever offset it used.
+
+    Expiry is filtered and pruned with a **SQL string comparison**, which is
+    only chronological because `ingest.iso_timestamp` normalises every
+    timestamp to UTC `Z` before it is stored. That normalisation is therefore
+    load-bearing for whether an evacuation warning appears on the map, and
+    nothing else in this file tests it - every other fixture here already
+    expires in `Z`, so all of them would pass just as well without it.
+
+    Written from the wrong end on purpose: it feeds the publisher's *local*
+    offsets and asserts the outcome, so it fails if the normalisation is ever
+    dropped, moved, or bypassed - regardless of how expiry comes to be
+    compared. A `-06:00` warning with two hours left must stay visible (its raw
+    text sorts *before* a UTC now), and a `+02:00` warning that expired an hour
+    ago must not (its raw text sorts *after* it).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+
+    def alert(identifier: str, expires: datetime, offset_hours: int) -> str:
+        stamped = expires.astimezone(timezone(timedelta(hours=offset_hours)))
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+  <identifier>{identifier}</identifier><sender>test</sender>
+  <sent>{now.isoformat(timespec='seconds')}</sent>
+  <status>Actual</status><msgType>Alert</msgType><scope>Public</scope>
+  <info><category>Fire</category><event>Offset test</event>
+    <urgency>Immediate</urgency><severity>Extreme</severity><certainty>Observed</certainty>
+    <expires>{stamped.isoformat(timespec='seconds')}</expires>
+    <headline>{identifier}</headline>
+    <area><areaDesc>Test</areaDesc>
+      <polygon>48.0,11.0 48.0,11.1 48.1,11.1 48.0,11.0</polygon></area>
+  </info>
+</alert>"""
+
+    # Live for another two hours, published in a negative offset. The text of
+    # this timestamp sorts *before* a UTC "now" string.
+    live = alert("offset-live", now + timedelta(hours=2), -6)
+    # Expired an hour ago, published in a positive offset - its text sorts
+    # *after* a UTC "now" string.
+    dead = alert("offset-dead", now - timedelta(hours=1), +2)
+
+    manager._store(cap.parse(live.encode()), "offset-feed", live)
+    manager._store(cap.parse(dead.encode()), "offset-feed", dead)
+
+    # The documents really do carry the trap: as raw text, the live one sorts
+    # before "now" and the expired one sorts after it. Asserted on the source
+    # documents so this stays true even though storage normalises them - it is
+    # what makes the outcome assertions below meaningful rather than incidental.
+    now_text = now.isoformat(timespec="seconds")
+    live_raw = live.split("<expires>")[1].split("</expires>")[0]
+    dead_raw = dead.split("<expires>")[1].split("</expires>")[0]
+    assert live_raw < now_text, "fixture no longer exercises the negative-offset trap"
+    assert dead_raw >= now_text, "fixture no longer exercises the positive-offset trap"
+
+    # Storage must have normalised both to UTC - that is what makes the SQL
+    # string comparison chronological rather than alphabetical.
+    for identifier in ("offset-live", "offset-dead"):
+        stored = db.conn.execute(
+            "SELECT expires FROM alerts WHERE identifier=?", (identifier,)).fetchone()[0]
+        assert stored.endswith("Z"), f"{identifier} kept a local offset in storage: {stored}"
+
+    shown = {f["id"] for f in manager.query()["features"]}
+    assert "offset-live" in shown, "a warning still in force was hidden by its UTC offset"
+    assert "offset-dead" not in shown, "an expired warning was shown because of its UTC offset"
+
+    manager.prune_now()
+    survivors = {row[0] for row in db.conn.execute("SELECT identifier FROM alerts").fetchall()}
+    assert "offset-live" in survivors, "the prune deleted a warning that was still in force"
+    assert "offset-dead" not in survivors, "the prune kept a warning that had expired"
 
 
 def check_disabled_without_feeds() -> None:
