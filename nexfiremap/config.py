@@ -83,9 +83,20 @@ CAP_PRESETS: dict[str, dict[str, str]] = {
         "label": "DWD severe weather (Germany)",
         "url": "https://opendata.dwd.de/weather/alerts/cap/COMMUNEUNION_DWD_STAT/Z_CAP_C_EDZW_LATEST_PVW_STATUS_PREMIUMDWD_COMMUNEUNION_DE.zip",
     },
+    # MoWaS/NINA publishes CAP *as JSON*, not as CAP XML: mapData.json is an
+    # index of ids, and each warning at /api31/warnings/{id}.json carries the
+    # CAP fields (identifier, sender, info[]) in JSON form - confirmed live.
+    # This poller reads CAP XML, so the feed cannot be made to work by changing
+    # the URL; it needs a MoWaS JSON adapter under `ingest/`, which is the
+    # package's own rule for a new representation ("a new standard is a new
+    # parser, never a new write path"). Left listed, with the reason stated,
+    # rather than quietly removed - an operator who was told this preset exists
+    # deserves to find out why it does nothing, and `_poll_feed` now reports
+    # "feed serves JSON, not CAP XML" instead of a generic parse failure.
     "mowas": {
-        "label": "MoWaS / NINA civil protection (Germany)",
+        "label": "MoWaS / NINA civil protection (Germany) - needs a JSON adapter, not yet supported",
         "url": "https://warnung.bund.de/api31/mowas/mapData.json",
+        "unsupported": "MoWaS publishes CAP as JSON; this poller reads CAP XML.",
     },
     "nws": {
         "label": "NWS active alerts (United States)",

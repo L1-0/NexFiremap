@@ -333,6 +333,71 @@ def check_expiry_respects_utc_offset(manager, db) -> None:
     assert "offset-dead" not in survivors, "the prune kept a warning that had expired"
 
 
+def check_zip_archive_feed() -> None:
+    """A ZIP archive of CAP documents must ingest, and must stay bounded.
+
+    The bundled DWD preset points at exactly such an archive (confirmed live:
+    application/zip, 55 warnings inside). Before this the archive reached
+    `cap.parse`, failed, yielded no links, and the feed reported "unrecognised
+    feed format" on every cycle - so `NEXFIREMAP_CAP_FEEDS=dwd`, the one-word
+    configuration the README advertises, produced zero warnings silently.
+
+    The bounds matter as much as the parsing: this is attacker-influenced data
+    from a public endpoint, and a poller that expands whatever it is handed is
+    one zip bomb away from taking the incident server down.
+    """
+    import io
+    import zipfile
+
+    from nexfiremap.alerts import MAX_ARCHIVE_MEMBER_BYTES, _looks_like_zip
+
+    assert _looks_like_zip(b"PK\x03\x04rest"), "a local file header is a zip"
+    assert not _looks_like_zip(b"<?xml version="), "XML must not be taken for an archive"
+
+    def archive(members: dict[str, bytes]) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, data in members.items():
+                zf.writestr(name, data)
+        return buffer.getvalue()
+
+    with tempfile.TemporaryDirectory() as temp:
+        db = Database(Path(temp) / "zip.sqlite3")
+        try:
+            settings = dataclasses.replace(load_settings(), db_path=Path(temp) / "zip.sqlite3",
+                                           cap_feeds=["https://example.org/cap.zip"])
+            manager = AlertManager(settings, db)
+
+            payload = archive({
+                "warn_1.xml": BILINGUAL.encode(),
+                "warn_2.xml": MULTI_AREA.encode(),
+                # Not XML, and not a CAP document - neither may abort the run.
+                "readme.txt": b"ignored",
+                "broken.xml": b"<alert>truncated",
+            })
+            stored = manager._store_archive(payload, "zip-feed")
+            assert stored == 2, f"expected both valid members, stored {stored}"
+            identifiers = {row[0] for row in db.conn.execute(
+                "SELECT identifier FROM alerts").fetchall()}
+            assert "mow.DE-BY-M-W094" in identifiers and "multi-1" in identifiers, identifiers
+
+            # One oversized member is skipped, and the good one beside it still
+            # lands - a warning that failed must not cost the ones that worked.
+            oversized = archive({
+                "huge.xml": b"<alert>" + b"x" * (MAX_ARCHIVE_MEMBER_BYTES + 1024),
+                "fine.xml": GEOCODE_ONLY.encode(),
+            })
+            before = db.conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+            manager._store_archive(oversized, "zip-feed")
+            after = db.conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+            assert after == before + 1, "the oversized member was not skipped cleanly"
+
+            # A corrupt archive is a bad feed, not a crash.
+            assert manager._store_archive(b"PK\x03\x04 not really a zip", "zip-feed") == 0
+        finally:
+            db.close()
+
+
 def check_disabled_without_feeds() -> None:
     """With no feeds configured nothing is polled, nothing is started, and the
     frontend feature flag reports it off - an install that never wanted CAP
@@ -388,6 +453,7 @@ def main() -> None:
     check_malformed()
     check_feed_links()
     check_storage_and_expiry()
+    check_zip_archive_feed()
     check_disabled_without_feeds()
     check_http_surface()
     print("CAP alert checks passed.")

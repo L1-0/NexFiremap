@@ -52,6 +52,11 @@ MAX_LINKED_DOCUMENTS = 60
 #: size budget and the job queue's depth limit.
 MAX_STORED_ALERTS = 5_000
 
+#: Ceiling on one decompressed CAP document from a ZIP feed. A single warning
+#: is a few kilobytes; anything approaching this is a malformed or hostile
+#: archive rather than a large warning, and the poller must not expand it.
+MAX_ARCHIVE_MEMBER_BYTES = 4 * 1024 * 1024
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -73,6 +78,16 @@ def _epoch(value: str | None) -> float | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.timestamp()
+
+
+def _looks_like_zip(raw: bytes) -> bool:
+    """Whether these bytes are a ZIP archive, by magic number not by filename.
+
+    "PK\\x03\\x04" is a local file header; the empty/spanned variants are
+    included so a valid-but-empty archive is recognised as an archive rather
+    than falling through to the XML parser and being reported as a broken feed.
+    """
+    return raw[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 
 
 def _bounds(geometry: dict[str, Any] | None) -> tuple[float | None, ...]:
@@ -148,7 +163,20 @@ class AlertManager:
             return
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self.settings.request_timeout_s),
-            headers={"User-Agent": self.settings.tile_user_agent},
+            headers={
+                "User-Agent": self.settings.tile_user_agent,
+                # Ask for what this poller can actually read. Some publishers
+                # content-negotiate and default to something else: the bundled
+                # NWS preset (api.weather.gov/alerts/active) returns
+                # application/geo+json with no Accept header - confirmed live -
+                # which is not CAP, so the feed reported "unrecognised format"
+                # every cycle. With this it answers application/atom+xml, an
+                # index the existing `feed_links` path already follows. Servers
+                # that ignore Accept are unaffected; q-values keep XML
+                # preferred without refusing anything.
+                "Accept": "application/cap+xml, application/atom+xml, "
+                          "application/rss+xml;q=0.9, application/xml;q=0.8, */*;q=0.1",
+            },
             follow_redirects=True,
             # Untrusted: `_poll_feed` follows links taken out of the feed
             # *document*, so a spoofed or compromised upstream can name any
@@ -234,6 +262,18 @@ class AlertManager:
             return 0, f"HTTP {response.status_code}"
 
         raw = response.content
+
+        # A ZIP archive of CAP documents is a real publishing style, not an
+        # error: the bundled DWD preset points at exactly one
+        # (Z_CAP_C_EDZW_LATEST_..._DE.zip, confirmed live as application/zip).
+        # Without this the archive reached `cap.parse`, failed, produced no
+        # links, and the feed reported "unrecognised feed format" on every
+        # cycle - so the one-word configuration the README advertises
+        # (NEXFIREMAP_CAP_FEEDS=dwd) yielded zero warnings, visible only in a
+        # status field nobody watches.
+        if _looks_like_zip(raw):
+            return await asyncio.to_thread(self._store_archive, raw, url), None
+
         try:
             records = cap.parse(raw)
             return await asyncio.to_thread(self._store, records, url, raw.decode("utf-8", "replace")), None
@@ -243,6 +283,14 @@ class AlertManager:
         links = [link for link in cap.feed_links(raw) if link != url][:MAX_LINKED_DOCUMENTS]
         if not links:
             log.warning("CAP feed %s is neither a CAP document nor a link index", url)
+            # Name the shape actually received. "unrecognised feed format"
+            # against a JSON body is a dead end for whoever has to fix it; CAP
+            # published as JSON (MoWaS/NINA does this) needs a parser, not a
+            # different URL, and the status line should say so.
+            kind = (response.headers.get("content-type") or "").split(";")[0].strip()
+            if kind in {"application/json", "application/geo+json"} or raw[:1] in (b"{", b"["):
+                return 0, ("feed serves JSON, not CAP XML - this endpoint needs a JSON "
+                           "adapter, not a different URL")
             return 0, "unrecognised feed format"
 
         stored = 0
@@ -261,6 +309,51 @@ class AlertManager:
         return stored, None
 
     # ------------------------------------------------------------ writes
+
+    def _store_archive(self, raw: bytes, url: str) -> int:
+        """Store every CAP document inside a ZIP archive of them.
+
+        Bounded on three axes, because this is attacker-influenced data from a
+        public endpoint: the number of members read, each member's *declared*
+        size before it is decompressed, and the decompressed bytes actually
+        taken. A public authority's archive is not the threat model that
+        motivates this, but a poller that expands whatever it is handed is a
+        zip-bomb away from taking the incident server down - the same reasoning
+        `field_import`'s KMZ reader already applies.
+
+        One unreadable member never abandons the rest: a warning that failed to
+        parse must not cost the twenty that would have parsed beside it.
+        """
+        import io
+        import zipfile
+
+        stored = 0
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                members = [item for item in archive.infolist()
+                           if not item.is_dir() and item.filename.lower().endswith(".xml")]
+                for item in members[:MAX_LINKED_DOCUMENTS]:
+                    if item.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+                        log.warning("CAP archive member %s declares %d bytes, skipped",
+                                    item.filename, item.file_size)
+                        continue
+                    try:
+                        with archive.open(item) as handle:
+                            document = handle.read(MAX_ARCHIVE_MEMBER_BYTES + 1)
+                        if len(document) > MAX_ARCHIVE_MEMBER_BYTES:
+                            log.warning("CAP archive member %s exceeded its declared size, skipped",
+                                        item.filename)
+                            continue
+                        records = cap.parse(document)
+                    except (IngestError, zipfile.BadZipFile, OSError) as exc:
+                        log.debug("CAP archive member %s skipped: %s", item.filename, exc)
+                        continue
+                    stored += self._store(records, url, document.decode("utf-8", "replace"))
+        except zipfile.BadZipFile as exc:
+            log.warning("CAP feed %s is not a readable ZIP archive: %s", url, exc)
+            return 0
+        log.info("CAP archive %s: stored %d alert(s)", url, stored)
+        return stored
 
     def _store(self, records: list[dict[str, Any]], feed_id: str, raw_xml: str) -> int:
         """Upsert alert records, keyed on the publisher's own identifier.

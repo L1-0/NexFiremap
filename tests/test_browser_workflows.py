@@ -97,7 +97,22 @@ class CDP:
         if result.get("exceptionDetails"): raise RuntimeError(json.dumps(result["exceptionDetails"]))
         return result.get("result", {}).get("value")
 
-    def wait(self, expression: str, timeout: float = 20) -> None:
+    def wait(self, expression: str, timeout: float = 60) -> None:
+        """Poll a JS expression in the page until it is truthy.
+
+        The budget is deliberately generous, for the same reason `wait_url`'s
+        is: most of these conditions are satisfied by a round trip through the
+        server (save a feature, re-read the workspace, re-render the list), and
+        this file is about whether the *workflow* works, not how fast it is.
+
+        Sized from observation rather than taste. At 20s this passed reliably
+        when run alone and failed in four consecutive full-suite runs - not on a
+        port clash (the port is chosen free) but because a machine that has just
+        executed forty-odd other test files, several of them CPU-bound analysis
+        jobs, serves that round trip slower. A test that fails only under load
+        is worse than a slow one: it trains the reader to dismiss a red result,
+        which is exactly how a genuine regression gets waved through.
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
