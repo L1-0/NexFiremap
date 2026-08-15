@@ -233,6 +233,21 @@ def test_isochrone_contours() -> None:
         check("contour is a LineString with >=3 points", feat["geometry"]["type"] == "LineString" and len(feat["geometry"]["coordinates"]) >= 3)
         break
 
+    # Each ring now also produces a closed-Polygon "fill" twin alongside the
+    # original LineString (see the fix for the spread-over-time color
+    # encoding) - same count, same hour values, geometry actually closed.
+    lines = [f for f in contours if f["geometry"]["type"] == "LineString"]
+    fills = [f for f in contours if f["properties"].get("kind") == "fill"]
+    check("every line ring has a matching fill polygon", len(fills) == len(lines), f"{len(fills)} vs {len(lines)}")
+    check(
+        "fill polygons carry the same hour values as their line twins",
+        {f["properties"]["hours"] for f in fills} == {f["properties"]["hours"] for f in lines},
+    )
+    for feat in fills:
+        ring = feat["geometry"]["coordinates"][0]
+        check("fill polygon geometry is actually closed", ring[0] == ring[-1], str(ring[:2]) + " ... " + str(ring[-2:]))
+        break
+
     empty = isochrone_contours(np.full((5, 5), np.nan), {"bbox": bbox, "nx": 5, "ny": 5})
     check("all-NaN raster produces no contours", empty == [])
 

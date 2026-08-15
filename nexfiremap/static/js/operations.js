@@ -502,12 +502,57 @@ import { whenMap, setPrintView, onMapContextMenu } from "./context.js";
   // cancelDraw() first, so entering one path always cleanly exits the
   // other rather than letting both be active at once.
 
+  /** Injects the vendored tactical sprite sheet into the document once.
+   *
+   * `<use href="...">` cannot reference an external file - Chrome dropped
+   * cross-document SVG references years ago on security grounds - so the sheet
+   * has to live in this document for the markers to resolve. Fetched rather
+   * than inlined into index.html so the sprites stay one vendored asset
+   * (`static/vendor/symbols/tactical.svg`) rather than being duplicated into
+   * the page template.
+   *
+   * A failure here is non-fatal on purpose: `pointMarker` falls back to the
+   * initials it always drew, so a missing sprite sheet degrades the map's
+   * appearance and never its function.
+   * @returns {Promise<void>} */
+  async function loadSprites() {
+    const url = state.meta?.symbology?.sprite_url;
+    if (!url || document.getElementById("nf-symbol-sprites")) return;
+    try {
+      const response = await fetch(url);
+      if (!response.ok) return;
+      const holder = document.createElement("div");
+      holder.id = "nf-symbol-sprites";
+      holder.hidden = true;
+      holder.innerHTML = await response.text();
+      document.body.appendChild(holder);
+    } catch {
+      /* offline or missing: markers fall back to initials */
+    }
+  }
+
   function pointMarker(feature, latlng) {
     const p = feature.properties;
-    const label = (TYPE_LABELS[p.feature_type] || p.feature_type).split(/\s+/).map((x) => x[0]).join("").slice(0, 2).toUpperCase();
+    // The *glyph* comes from the server, which resolves it for this install's
+    // configured symbology profile (DV 102 / ICS / neutral - see
+    // symbology.py). The frontend keeps no second copy of that table, so
+    // switching profile is a server setting rather than a code change on both
+    // sides.
+    //
+    // The *colour* deliberately does not: featureColour() below encodes this
+    // feature's current status (breached, completed, proposed...), which is
+    // what an operator needs to see first and is a property of the feature
+    // right now rather than of its symbol category. The symbology table's own
+    // `color` is used for the product legends instead, where there is no live
+    // status to convey.
+    const symbol = state.meta?.symbology?.symbols?.[p.feature_type];
     const color = featureColour(p);
+    const sprites = document.getElementById("nf-symbol-sprites");
+    const html = symbol && sprites
+      ? `<span style="--ops-color:${color}"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#nf-sym-${symbol.glyph}"/></svg></span>`
+      : `<span style="--ops-color:${color}">${(TYPE_LABELS[p.feature_type] || p.feature_type).split(/\s+/).map((x) => x[0]).join("").slice(0, 2).toUpperCase()}</span>`;
     return L.marker(latlng, { icon: L.divIcon({
-      className: "ops-map-icon", html: `<span style="--ops-color:${color}">${label}</span>`,
+      className: "ops-map-icon", html,
       iconSize: [30, 30], iconAnchor: [15, 15],
     }) });
   }
@@ -1910,6 +1955,10 @@ import { whenMap, setPrintView, onMapContextMenu } from "./context.js";
     await ensureAuth();
     if (state.auth.role === "public") { await showPublicProducts(); return; }
     state.meta = await api("/api/operations/meta");
+    // Must come after meta (it reads the sprite URL from it) and before the
+    // first renderFeatures(), or the initial markers draw as initials and only
+    // pick up their symbols on the next redraw.
+    await loadSprites();
     const config = await api("/api/config");
     config.basemaps.forEach((layer) => $("#ops-pack-layer").append(option(layer.id, layer.name)));
     config.basemaps.filter((layer) => layer.source_kind === "raster").forEach((layer) => $("#ops-terrain-source").append(option(layer.source_id, layer.name)));

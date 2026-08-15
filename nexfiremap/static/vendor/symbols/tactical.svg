@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none">
+<!--
+  Tactical symbol sprite sheet.
+
+  Hand-authored rather than downloaded, which is why it is not in
+  scripts/vendor_assets.py's hash-pinned download list: there is no canonical
+  machine-readable DV 102 or NFPA 170 symbol set to vendor. These are simple
+  geometric glyphs conveying the *category* of a feature (command, water,
+  hazard, air, safety), not facsimiles of either standard's artwork - which is
+  also why every rendered map states which profile it is drawn in and carries
+  a legend (see symbology.profile_authority and further_plan.md's guidance:
+  state the standard, always legend it, never rely on colour alone).
+
+  Each symbol is a <symbol> with a 24x24 viewBox, referenced from
+  operations.js via <use href="#nf-sym-{id}">. Strokes use currentColor and
+  fills use "none" or currentColor, so a single sheet re-colours per feature
+  from symbology.py's palette rather than needing one file per colour.
+-->
+
+<!-- command and control -->
+<symbol id="nf-sym-command" viewBox="0 0 24 24">
+  <rect x="3" y="5" width="18" height="14" fill="none" stroke="currentColor" stroke-width="2"/>
+  <path d="M3 5l9 7 9-7" fill="none" stroke="currentColor" stroke-width="2"/>
+</symbol>
+<symbol id="nf-sym-staging" viewBox="0 0 24 24">
+  <rect x="3" y="5" width="18" height="14" fill="none" stroke="currentColor" stroke-width="2"/>
+  <path d="M7 12h10M12 8v8" stroke="currentColor" stroke-width="2"/>
+</symbol>
+<symbol id="nf-sym-comms" viewBox="0 0 24 24">
+  <path d="M12 14v7" stroke="currentColor" stroke-width="2"/>
+  <circle cx="12" cy="10" r="2.5" fill="currentColor"/>
+  <path d="M6.5 4.5a8 8 0 000 11M17.5 4.5a8 8 0 010 11" fill="none" stroke="currentColor" stroke-width="2"/>
+</symbol>
+
+<!-- water supply -->
+<symbol id="nf-sym-water" viewBox="0 0 24 24">
+  <path d="M12 3c4 5.5 6 8.5 6 11a6 6 0 01-12 0c0-2.5 2-5.5 6-11z"
+        fill="none" stroke="currentColor" stroke-width="2"/>
+</symbol>
+<symbol id="nf-sym-water-restricted" viewBox="0 0 24 24">
+  <path d="M12 3c4 5.5 6 8.5 6 11a6 6 0 01-12 0c0-2.5 2-5.5 6-11z"
+        fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3 2"/>
+</symbol>
+
+<!-- air operations -->
+<symbol id="nf-sym-air" viewBox="0 0 24 24">
+  <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/>
+  <path d="M9 8v8M15 8v8M9 12h6" stroke="currentColor" stroke-width="2"/>
+</symbol>
+
+<!-- safety -->
+<symbol id="nf-sym-safety" viewBox="0 0 24 24">
+  <path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z" fill="none" stroke="currentColor" stroke-width="2"/>
+</symbol>
+<symbol id="nf-sym-lookout" viewBox="0 0 24 24">
+  <path d="M2 12s4-6 10-6 10 6 10 6-4 6-10 6-10-6-10-6z" fill="none" stroke="currentColor" stroke-width="2"/>
+  <circle cx="12" cy="12" r="2.5" fill="currentColor"/>
+</symbol>
+<symbol id="nf-sym-anchor" viewBox="0 0 24 24">
+  <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/>
+  <path d="M12 2v4M12 18v4M2 12h4M18 12h4" stroke="currentColor" stroke-width="2"/>
+</symbol>
+
+<!-- hazard and restriction -->
+<symbol id="nf-sym-hazard" viewBox="0 0 24 24">
+  <path d="M12 3l10 18H2z" fill="none" stroke="currentColor" stroke-width="2"/>
+  <path d="M12 9v6" stroke="currentColor" stroke-width="2"/>
+  <circle cx="12" cy="18" r="1" fill="currentColor"/>
+</symbol>
+<symbol id="nf-sym-closure" viewBox="0 0 24 24">
+  <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/>
+  <path d="M6 12h12" stroke="currentColor" stroke-width="3"/>
+</symbol>
+<symbol id="nf-sym-protect" viewBox="0 0 24 24">
+  <path d="M4 20V10l8-6 8 6v10z" fill="none" stroke="currentColor" stroke-width="2"/>
+  <path d="M10 20v-5h4v5" fill="none" stroke="currentColor" stroke-width="2"/>
+</symbol>
+
+<!-- observed fire behaviour -->
+<symbol id="nf-sym-fire" viewBox="0 0 24 24">
+  <path d="M12 2c1 4-3 5-3 9a3 3 0 006 0c0-1.5-.5-2.5-1-3.5 3 1.5 4 4 4 6a6 6 0 11-12 0C6 8 12 7 12 2z"
+        fill="none" stroke="currentColor" stroke-width="2"/>
+</symbol>
+<symbol id="nf-sym-smoke" viewBox="0 0 24 24">
+  <path d="M6 17a4 4 0 010-8 5 5 0 019.5-1.5A3.5 3.5 0 1118 17z"
+        fill="none" stroke="currentColor" stroke-width="2"/>
+</symbol>
+<symbol id="nf-sym-wind" viewBox="0 0 24 24">
+  <path d="M3 8h11a3 3 0 10-3-3M3 13h15a3 3 0 11-3 3" fill="none" stroke="currentColor" stroke-width="2"/>
+</symbol>
+
+<!-- resources -->
+<symbol id="nf-sym-vehicle" viewBox="0 0 24 24">
+  <path d="M2 15V9h11l4 3h5v3z" fill="none" stroke="currentColor" stroke-width="2"/>
+  <circle cx="7" cy="17" r="2" fill="currentColor"/>
+  <circle cx="17" cy="17" r="2" fill="currentColor"/>
+</symbol>
+
+<!-- generic fallback: any feature type without a specific glyph -->
+<symbol id="nf-sym-generic" viewBox="0 0 24 24">
+  <circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/>
+  <circle cx="12" cy="12" r="2.5" fill="currentColor"/>
+</symbol>
+</svg>

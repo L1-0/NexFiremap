@@ -222,6 +222,42 @@ class TelemetryManager:
             raise TelemetryError("position feed is unavailable")
         if not token or not hmac.compare_digest(self._token_hash(token), str(source_row["token_hash"])):
             raise PermissionError("invalid feed token")
+        return self._accept(source_row, reports)
+
+    def ingest_authenticated(self, source_id: str, reports: list[dict[str, Any]]) -> dict[str, Any]:
+        """`ingest` for a caller that has **already authenticated by other means**.
+
+        Exists because the feed token is stored only as a SHA-256, so a
+        server-side component cannot reproduce it to call `ingest`. The
+        webhook receiver is the case that forced this: it authenticates the
+        caller against the *hook's* own credential and then has to write to
+        the feed the hook is registered against. The alternatives were worse -
+        keeping a second plaintext copy of the feed token in the webhooks
+        table (another secret at rest, another thing to rotate), or
+        duplicating the whole validation and write path.
+
+        The security contract is therefore explicit and narrow: **this method
+        performs no authentication whatsoever**. It is not reachable from any
+        route directly, and every caller must have verified a credential of its
+        own first. Everything after the token check - rate limiting, batch
+        limits, replay-safety, quality flags, the resource-position update and
+        the audit entry - is identical to `ingest`, which is the entire point
+        of sharing this path rather than writing rows separately.
+        """
+        source_row = self.db.conn.execute("SELECT * FROM position_feed_sources WHERE id=?", (source_id,)).fetchone()
+        if source_row is None or not source_row["active"]:
+            raise TelemetryError("position feed is unavailable")
+        return self._accept(source_row, reports)
+
+    def _accept(self, source_row: Any, reports: list[dict[str, Any]]) -> dict[str, Any]:
+        """Everything `ingest` does once the caller is known to be authorised.
+
+        Split out so `ingest` and `ingest_authenticated` cannot drift: the
+        difference between them is exactly one token comparison, and it should
+        be visible as exactly that rather than as two similar-looking method
+        bodies.
+        """
+        source_id = str(source_row["id"])
         now_monotonic = time.monotonic()
         with self._rate_lock:
             history = self._request_times.setdefault(source_id, deque())

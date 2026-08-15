@@ -25,6 +25,7 @@ from ..db import Database
 from ..geocode import GeocodeService
 from ..jobs import JobManager
 from ..operations import AREA_TYPES, FEATURE_TYPES, LINE_TYPES, POINT_TYPES, SAFETY_CHECKS
+from .. import symbology
 from ..tiles import TileCache, public_layer
 from . import common
 from .common import _json
@@ -75,12 +76,28 @@ async def api_config(request: Request) -> Response:
                 }
                 for key, meta in SOURCES.items()
             ],
+            # Three sources of layers, one flat list: the built-in table,
+            # imported offline MBTiles/raster packs, and operator-registered
+            # WMS/WMTS/XYZ services. The frontend's layer switcher builds
+            # itself from this and needs no idea which is which - each entry
+            # already carries a proxied `/tiles/...` or `/offline-tiles/...`
+            # URL. Custom layers are split by their own `overlay` flag, since
+            # a hydrant or cadastre layer belongs over the basemap, not
+            # instead of it.
             "basemaps": [public_layer(bm) for bm in BASEMAPS]
-            + request.app.state.offline_sources.public_layers(),
-            "overlays": [public_layer(ov) for ov in OVERLAYS],
+            + request.app.state.offline_sources.public_layers()
+            + [item for item in request.app.state.layers.public_layers() if not item["overlay"]],
+            "overlays": [public_layer(ov) for ov in OVERLAYS]
+            + [item for item in request.app.state.layers.public_layers() if item["overlay"]],
             "terrain_dem": public_layer(TERRAIN_DEM),
             "refresh_minutes": settings.refresh_interval_minutes,
-            "features": common.AVAILABLE_FEATURES,
+            # `alerts` is a *configuration* flag, not an import flag like the
+            # rest: the code is always present, but with no CAP feeds
+            # configured there is nothing to show, and the frontend should
+            # hide the layer rather than render an empty one.
+            "features": {**common.AVAILABLE_FEATURES,
+                         "alerts": request.app.state.alerts.enabled,
+                         "mqtt": request.app.state.mqtt.enabled},
             # Used by the frontend as the initial view only when the URL carries
             # no #zoom/lat/lon of its own (see app.js's initMap) - lets an
             # operator configure a sensible non-world-view default without
@@ -103,6 +120,11 @@ async def api_operations_meta(request: Request) -> Response:
         "safety_checks": [{"key": key, "label": label} for key, label in SAFETY_CHECKS],
         "schema": "nexfiremap-incident/1",
         "observation_stale_hours": settings.observation_stale_hours,
+        # The tactical symbol table, resolved for this install's configured
+        # profile. Published here so `operations.js` renders markers and
+        # legends from `symbology.py` rather than keeping a second copy that
+        # can drift out of step with the CoT type codes and the PDF legends.
+        "symbology": symbology.table(settings.symbology_profile),
     })
 
 
@@ -149,6 +171,8 @@ async def api_status(request: Request, key: bool = Query(True)) -> Response:
             "fetcher": cache.status(),
             "tiles": tile_stats,
             "jobs": job_stats,
+            "mqtt": request.app.state.mqtt.status(),
+            "cot_gateway": request.app.state.cot_gateway.status(),
             "map_key": key_payload,
             "server_time": datetime.now(timezone.utc).isoformat(),
         }

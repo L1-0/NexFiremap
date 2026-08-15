@@ -98,19 +98,21 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
 
   /** The 5-step age/FRP color ramp (index 0 = recessive, 4 = prominent). @returns {string[]} */
   const fireRamp = () => [1, 2, 3, 4, 5].map((n) => css(`--fire-${n}`));
-  /** The 5-step purple->grey time-spread ramp used by "Spread over Time". @returns {string[]} */
+  /** The 5-step charcoal->purple time-spread ramp used by "Spread over Time" (index 0 = earliest/recessive, index 4 = latest/salient). @returns {string[]} */
   const timeRamp = () => [1, 2, 3, 4, 5].map((n) => css(`--time-${n}`));
   /** The 3 categorical swatches used when colorBy === "instrument". @returns {string[]} */
   const catColors = () => [css("--cat-1"), css("--cat-2"), css("--cat-3")];
 
-  // Continuous purple->red->orange->yellow->grey interpolation across
+  // Continuous charcoal->yellow->orange->red->purple interpolation across
   // timeRamp()'s 5 stops (see app.css's --time-* comment for how/why this
-  // exact palette was chosen) - a plain per-channel sRGB lerp between the
-  // two stops `fraction` falls between, matching how the CSS
-  // `linear-gradient` legend bar interpolates so the two never visually
-  // disagree. `fraction` 0 = earliest (purple), 1 = latest (grey).
+  // exact palette was chosen, and why it runs earliest=recessive/"ash" ->
+  // latest=salient rather than the other way around) - a plain per-channel
+  // sRGB lerp between the two stops `fraction` falls between, matching how
+  // the CSS `linear-gradient` legend bar interpolates so the two never
+  // visually disagree. `fraction` 0 = earliest (charcoal), 1 = latest
+  // (purple).
   /**
-   * @param {number} fraction - 0 (earliest/purple) .. 1 (latest/grey), clamped.
+   * @param {number} fraction - 0 (earliest/charcoal, recessive) .. 1 (latest/purple, salient), clamped.
    * @param {string[]} ramp - 5-stop hex ramp, as returned by timeRamp().
    * @returns {string} an `rgb(r, g, b)` string lerped between the two stops `fraction` falls between.
    */
@@ -1222,7 +1224,10 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
   function drawDetections() {
     clearLayers();
 
-    if (state.renderMode === "topology") {
+    // Both spread renderings come from the same job result; they differ
+    // only in how drawSpreadTopology paints it (nested time bands vs one
+    // translucent affected-area fill).
+    if (state.renderMode === "topology" || state.renderMode === "extent") {
       drawSpreadTopology();
       return;
     }
@@ -1372,7 +1377,7 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
     }
   }
 
-  /** @param {object} geo - the spread_topology GeoJSON FeatureCollection (each feature carrying cutoff_ts/band_index/detection_count). Draws the layer, refreshes state.lastSpreadTopologyRange, and re-renders the legend. */
+  /** @param {object} geo - the spread_topology GeoJSON FeatureCollection (each feature carrying cutoff_ts/band_index/band_fraction/detection_count - band_fraction may be absent on results produced before it was added, see the fillColor fallback below). Draws the layer, refreshes state.lastSpreadTopologyRange, and re-renders the legend. */
   function renderSpreadTopologyLayer(geo) {
     if (spreadTopologyLayer && map.hasLayer(spreadTopologyLayer)) map.removeLayer(spreadTopologyLayer);
 
@@ -1408,9 +1413,54 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
       features: [...geo.features].sort((a, b) => b.properties.band_index - a.properties.band_index),
     };
     const ring = state.basemapTone === "dark" ? "#fcfcfb" : "#0d0d0d";
+
+    // "Extent" mode: one translucent fill of the affected area instead of the
+    // nested time bands - the plain "where is this fire" read, for briefings
+    // and public-facing views where the progression is noise rather than
+    // signal. Deliberately built from the *latest* band rather than from a
+    // convex hull of the detection points: the latest band is already the
+    // cumulative footprint, and it comes from the same density contour as
+    // every other band, so it follows the real outer wall. A convex hull
+    // would "fill valleys, lakes, unburned islands and disconnected
+    // activity" - see events.py's module docstring quoting further_plan.md
+    // section 5, which is exactly what this project refuses to draw.
+    if (state.renderMode === "extent") {
+      const latest = Math.max(...geo.features.map((f) => f.properties.band_index));
+      spreadTopologyLayer = L.geoJSON(
+        { ...geo, features: geo.features.filter((f) => f.properties.band_index === latest) },
+        {
+          style: () => ({
+            color: SPREAD_EXTENT_OUTLINE,
+            fillColor: SPREAD_EXTENT_FILL,
+            weight: 2,
+            opacity: 0.95,
+            fillOpacity: 0.45,
+          }),
+          onEachFeature: (feature, layer) => {
+            const when = new Date(feature.properties.cutoff_ts * 1000)
+              .toISOString().slice(0, 16).replace("T", " ");
+            layer.bindTooltip(
+              `affected area as of ${when} UTC · ${feature.properties.detection_count} detection(s)`);
+          },
+        }
+      ).addTo(map);
+      renderLegend();
+      return;
+    }
+
     spreadTopologyLayer = L.geoJSON(sorted, {
       style: (feature) => ({
-        fillColor: ramp[feature.properties.band_index],
+        // band_fraction (0=earliest..1=latest) interpolates continuously
+        // across the 5-stop ramp instead of snapping to one of its 5
+        // stops directly, so bands stay visually distinct even when
+        // SPREAD_TOPOLOGY_BANDS produces more of them than the ramp has
+        // stops (see events.py's spread_topology docstring). Falls back
+        // to the old fixed-LUT position for job results cached before
+        // band_fraction existed, so they still render sensibly.
+        fillColor: timeSpreadColor(
+          feature.properties.band_fraction ?? feature.properties.band_index / 4,
+          ramp
+        ),
         color: ring,
         weight: 1,
         opacity: 0.5,
@@ -2347,39 +2397,79 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
     return L.geoJSON(sorted, { pane: "analysisPane", style: styleProbabilityEnvelope });
   }
 
-  // Same fire-ramp family as the probability envelopes: soonest arrival
-  // brightest/thickest, furthest out faintest/thinnest - a glance should
-  // read "spreads this way, this fast" without hovering each line.
+  // Fallback-only now (see drawIsochrones): styles the bare LineString
+  // contours from an isochrone job result cached before fill polygons
+  // existed. Soonest arrival brightest/thickest, furthest out
+  // faintest/thinnest - a glance should read "spreads this way, this
+  // fast" without hovering each line.
+  // Affected-area fill: a solid outline over a light translucent interior,
+  // the convention public-safety crisis maps use for "this area is
+  // affected". Deliberately outside the --time-* ramp - this rendering
+  // says nothing about *when*, only *where*, so borrowing a time colour
+  // would imply a progression reading that is not being shown.
+  const SPREAD_EXTENT_OUTLINE = "#b3261e";
+  const SPREAD_EXTENT_FILL = "#f2b8b5";
+
   const ISOCHRONE_RAMP = ["#fd4f24", "#fd7924", "#fda65a", "#fdc98c", "#fde4c4"];
 
   /**
    * Builds the isochrone GeoJSON layer (modelled spread-arrival contours,
-   * one line per elapsed-hours cutoff), styled from ISOCHRONE_RAMP by sort
-   * order of `properties.hours` (soonest first = brightest/thickest/most
-   * opaque), plus a permanent "+Nh" label per contour.
+   * one ring per elapsed-hours cutoff), plus a permanent "+Nh" label per
+   * ring. Isochrone regions nest cumulatively the same way spread_topology's
+   * detection bands do (hour 3's reached-area is a superset of hour 1's -
+   * see terrain.py's isochrone_contours), so this uses the identical
+   * technique renderSpreadTopologyLayer does for visual consistency between
+   * the two "spread over time" surfaces: fill by `kind: "fill"` polygons,
+   * colored by the same reversed --time-* ramp via timeSpreadColor()
+   * (soonest arrival = recessive "not yet reached" tone, furthest out =
+   * most salient), drawn latest/largest-first so each sooner, smaller fill
+   * cleanly overwrites the larger one it's nested inside instead of
+   * blending with it. Falls back to the original bare-line ISOCHRONE_RAMP
+   * styling when `geo` predates fill polygons (no `kind: "fill"` features
+   * at all), so old cached results still render sensibly.
    * @param {object} geo - isochrone FeatureCollection (from run_propagation's `isochrones` file).
-   * @returns {L.GeoJSON} an un-added layer (callers `.addTo(map)` it themselves, storing the handle in envelopeLayer).
+   * @returns {L.FeatureGroup} an un-added layer (callers `.addTo(map)` it themselves, storing the handle in envelopeLayer).
    */
   function drawIsochrones(geo) {
-    const sortedHours = [...new Set(geo.features.map((f) => f.properties.hours))].sort((a, b) => a - b);
-    const style = (feature) => {
-      const idx = sortedHours.indexOf(feature.properties.hours);
-      return {
-        color: ISOCHRONE_RAMP[Math.min(idx, ISOCHRONE_RAMP.length - 1)],
-        weight: Math.max(1, 2.6 - idx * 0.4),
-        opacity: Math.max(0.35, 0.9 - idx * 0.14),
+    const fills = geo.features.filter((f) => f.properties.kind === "fill");
+    const group = L.featureGroup();
+    const label = (feature, layer) =>
+      layer.bindTooltip(`+${feature.properties.hours}h`, {
+        permanent: true,
+        direction: "center",
+        className: "isochrone-label",
+      });
+
+    if (fills.length) {
+      const sortedHours = [...new Set(fills.map((f) => f.properties.hours))].sort((a, b) => a - b);
+      const ramp = timeRamp();
+      const ring = state.basemapTone === "dark" ? "#fcfcfb" : "#0d0d0d";
+      const sorted = {
+        type: "FeatureCollection",
+        features: [...fills].sort((a, b) => b.properties.hours - a.properties.hours),
       };
-    };
-    return L.geoJSON(geo, {
-      pane: "analysisPane",
-      style,
-      onEachFeature: (feature, layer) =>
-        layer.bindTooltip(`+${feature.properties.hours}h`, {
-          permanent: true,
-          direction: "center",
-          className: "isochrone-label",
-        }),
-    });
+      L.geoJSON(sorted, {
+        pane: "analysisPane",
+        style: (feature) => {
+          const idx = sortedHours.indexOf(feature.properties.hours);
+          const fraction = sortedHours.length > 1 ? idx / (sortedHours.length - 1) : 0;
+          return { fillColor: timeSpreadColor(fraction, ramp), color: ring, weight: 1, opacity: 0.5, fillOpacity: 0.94 };
+        },
+        onEachFeature: label,
+      }).addTo(group);
+    } else {
+      const sortedHours = [...new Set(geo.features.map((f) => f.properties.hours))].sort((a, b) => a - b);
+      const style = (feature) => {
+        const idx = sortedHours.indexOf(feature.properties.hours);
+        return {
+          color: ISOCHRONE_RAMP[Math.min(idx, ISOCHRONE_RAMP.length - 1)],
+          weight: Math.max(1, 2.6 - idx * 0.4),
+          opacity: Math.max(0.35, 0.9 - idx * 0.14),
+        };
+      };
+      L.geoJSON(geo, { pane: "analysisPane", style, onEachFeature: label }).addTo(group);
+    }
+    return group;
   }
 
   /** @param {number|null} km2 @returns {string|null} "N km² (M mi²)" with precision scaled to magnitude, or null when km2 is unknown. */

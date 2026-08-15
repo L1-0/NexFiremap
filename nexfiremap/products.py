@@ -27,6 +27,8 @@ import io
 import json
 import math
 import re
+import sqlite3
+import struct
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
@@ -40,13 +42,29 @@ from rasterio.transform import from_bounds
 from rasterio.shutil import copy as raster_copy
 
 from .db import Database
-from .operations import OBSERVATION_TYPES, OperationsError, OperationsStore, _clean_text, _id, utcnow
+from . import symbology
+from .operations import (
+    OBSERVATION_TYPES, SAFETY_CHECKS, OperationsError, OperationsStore,
+    _clean_text, _id, utcnow,
+)
 
 
-FORMATS = {"geojson", "csv", "gpx", "kml", "json", "kmz", "pdf", "geopdf", "geotiff", "gpkg"}
+# NOTE on the two GeoPackage entries: "gpkg" produces a *raster* GeoPackage
+# (features burned into a classified raster, see _raster_product) and keeps
+# that meaning so products already stored under it stay readable.
+# "gpkg_features" is the vector one - real geometry and attributes, which is
+# what a GIS-literate agency wants at handover. Renaming either would break
+# existing stored products, so both exist and the distinction is explicit.
+FORMATS = {"geojson", "csv", "gpx", "kml", "json", "kmz", "pdf", "geopdf",
+           "geotiff", "gpkg", "gpkg_features"}
 CLASSIFICATIONS = {"draft", "operational", "public"}
 PRODUCT_TYPES = {"strategic", "field", "iap", "briefing", "transport", "air_operations",
-                 "evacuation", "progression", "public_information", "handover"}
+                 "evacuation", "progression", "public_information", "handover",
+                 # Command paperwork, laid out to match the real forms - see
+                 # FORM_LAYOUTS. Rendered only for fmt="pdf"; asking for one in
+                 # GeoJSON just gives the ordinary data export, since a form is
+                 # a page layout rather than a different set of facts.
+                 "ics201", "ics202", "ics204", "lagekarte"}
 PUBLIC_TYPES = {"confirmed_perimeter", "burn_area", "active_edge", "inactive_edge", "smoke_report"}
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -163,6 +181,132 @@ def _raster_product(bundle: dict[str, Any], driver: str) -> bytes:
         return path.read_bytes()
 
 
+def _wkb(geometry: dict[str, Any]) -> bytes:
+    """One GeoJSON geometry as little-endian Well-Known Binary.
+
+    The mirror image of `field_import._wkb_geometry`, which *reads* this same
+    encoding out of an imported GeoPackage. Hand-rolled for the same reason it
+    is there: Point/LineString/Polygon is a narrow enough surface that a
+    library dependency would be larger than the code it replaced.
+    """
+    kind = geometry.get("type")
+    coordinates = geometry.get("coordinates") or []
+    if kind == "Point":
+        return struct.pack("<BI2d", 1, 1, float(coordinates[0]), float(coordinates[1]))
+    if kind == "LineString":
+        body = struct.pack("<BII", 1, 2, len(coordinates))
+        return body + b"".join(struct.pack("<2d", float(x), float(y)) for x, y, *_ in coordinates)
+    if kind == "Polygon":
+        body = struct.pack("<BII", 1, 3, len(coordinates))
+        for ring in coordinates:
+            body += struct.pack("<I", len(ring))
+            body += b"".join(struct.pack("<2d", float(x), float(y)) for x, y, *_ in ring)
+        return body
+    raise OperationsError(f"GeoPackage export supports Point, LineString and Polygon, not {kind}")
+
+
+def _gpkg_blob(geometry: dict[str, Any]) -> bytes:
+    """WKB wrapped in the GeoPackage binary header.
+
+    Header is magic ``GP``, version 0, a flags byte, then the SRS id. The flags
+    byte is 1 here: bit 0 set means the header's own integers are
+    little-endian, and the envelope bits are left clear because no bounding-box
+    envelope is written - the spec allows omitting it, and every reader
+    computes extents from the geometry anyway.
+    """
+    return b"GP" + bytes([0, 1]) + struct.pack("<i", 4326) + _wkb(geometry)
+
+
+def _vector_gpkg_product(bundle: dict[str, Any]) -> bytes:
+    """The incident's features as a real vector GeoPackage.
+
+    Distinct from ``fmt="gpkg"``, which produces a *raster* GeoPackage via
+    rasterio (see `_raster_product`) and keeps that meaning so products already
+    stored under it stay readable. This is the format a GIS-literate agency
+    actually wants at handover: attributes intact, geometry as geometry, and
+    openable in QGIS/ArcGIS without conversion.
+
+    A GeoPackage is just SQLite with three catalog tables, which makes writing
+    one from a SQLite-native project a matter of getting the metadata right
+    rather than pulling in a GIS stack. Everything below is required by the
+    spec; a reader will reject the file if any of it is missing.
+    """
+    features = bundle.get("features", {}).get("features", [])
+    metadata = bundle.get("product_metadata", {})
+    west, south, east, north = _bounds(bundle)
+
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp) / "product.gpkg"
+        conn = sqlite3.connect(path)
+        try:
+            # The magic that makes this a GeoPackage rather than a plain
+            # database: 'GPKG' in the application_id header field, and the
+            # spec version in user_version (1.2.1).
+            conn.execute("PRAGMA application_id = 1196444487")
+            conn.execute("PRAGMA user_version = 10201")
+            conn.executescript("""
+                CREATE TABLE gpkg_spatial_ref_sys (
+                    srs_name TEXT NOT NULL, srs_id INTEGER PRIMARY KEY,
+                    organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL,
+                    definition TEXT NOT NULL, description TEXT);
+                CREATE TABLE gpkg_contents (
+                    table_name TEXT PRIMARY KEY, data_type TEXT NOT NULL,
+                    identifier TEXT UNIQUE, description TEXT DEFAULT '',
+                    last_change DATETIME NOT NULL, min_x DOUBLE, min_y DOUBLE,
+                    max_x DOUBLE, max_y DOUBLE, srs_id INTEGER);
+                CREATE TABLE gpkg_geometry_columns (
+                    table_name TEXT NOT NULL, column_name TEXT NOT NULL,
+                    geometry_type_name TEXT NOT NULL, srs_id INTEGER NOT NULL,
+                    z TINYINT NOT NULL, m TINYINT NOT NULL,
+                    PRIMARY KEY (table_name, column_name));
+                CREATE TABLE incident_features (
+                    fid INTEGER PRIMARY KEY AUTOINCREMENT,
+                    geom BLOB,
+                    feature_id TEXT, feature_type TEXT, title TEXT, status TEXT,
+                    observed_at TEXT, source TEXT, observer TEXT, confidence TEXT,
+                    properties_json TEXT);
+            """)
+            # The two "undefined" rows are mandated by the spec even when
+            # unused; 4326 is the one the data actually uses.
+            conn.executemany(
+                "INSERT INTO gpkg_spatial_ref_sys VALUES (?,?,?,?,?,?)",
+                [("Undefined cartesian SRS", -1, "NONE", -1, "undefined", None),
+                 ("Undefined geographic SRS", 0, "NONE", 0, "undefined", None),
+                 ("WGS 84 geodetic", 4326, "EPSG", 4326,
+                  'GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],'
+                  'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]', "WGS 84")])
+
+            last_change = str(metadata.get("produced_at") or "2000-01-01T00:00:00Z")
+            conn.execute(
+                "INSERT INTO gpkg_contents VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("incident_features", "features", "incident_features",
+                 str(metadata.get("title") or "NexFiremap incident features"),
+                 last_change, west, south, east, north, 4326))
+            # "GEOMETRY" rather than a specific type: one incident carries
+            # points, lines and areas in the same table, and declaring any one
+            # of them would make the file lie about the other two.
+            conn.execute("INSERT INTO gpkg_geometry_columns VALUES (?,?,?,?,?,?)",
+                         ("incident_features", "geom", "GEOMETRY", 4326, 0, 0))
+
+            for feature in features:
+                geometry = feature.get("geometry")
+                if not geometry:
+                    continue
+                properties = feature.get("properties") or {}
+                conn.execute(
+                    "INSERT INTO incident_features "
+                    "(geom,feature_id,feature_type,title,status,observed_at,source,observer,"
+                    "confidence,properties_json) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (_gpkg_blob(geometry), properties.get("id"), properties.get("feature_type"),
+                     properties.get("title"), properties.get("status"), properties.get("observed_at"),
+                     properties.get("source"), properties.get("observer"), properties.get("confidence"),
+                     json.dumps(properties, sort_keys=True, separators=(",", ":"))))
+            conn.commit()
+        finally:
+            conn.close()
+        return path.read_bytes()
+
+
 def _pdf_product(bundle: dict[str, Any]) -> bytes:
     """Render a single-page reference map (features, legend, scale bar, north
     arrow, footer) with matplotlib and export straight to PDF - no basemap
@@ -174,10 +318,35 @@ def _pdf_product(bundle: dict[str, Any]) -> bytes:
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib import pyplot as plt
+
+    metadata = bundle.get("product_metadata", {})
+    fig = plt.figure(figsize=(11.69, 8.27), dpi=120)
+    _draw_map_axes(fig, bundle)
+    output = io.BytesIO()
+    timestamp = str(metadata.get("produced_at") or "2000-01-01T00:00:00+00:00").replace("Z", "+00:00")
+    try: pdf_date = dt.datetime.fromisoformat(timestamp)
+    except ValueError: pdf_date = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)  # malformed timestamp - a fixed fallback beats failing the whole product
+    fig.savefig(output, format="pdf", metadata={"Title": str(metadata.get("title") or "NexFiremap product"),
+                "Author": "NexFiremap", "Subject": str(metadata.get("product_type") or "incident map"),
+                "CreationDate": pdf_date, "ModDate": pdf_date})
+    plt.close(fig)
+    return output.getvalue()
+
+
+def _draw_map_axes(fig: Any, bundle: dict[str, Any]) -> Any:
+    """Draw the reference map (features, legend, scale bar, north arrow,
+    footer) onto ``fig``.
+
+    Split out of `_pdf_product` so the multi-page ICS/Lagekarte forms can put
+    the identical map on their first page. That sharing is the point: an ICS
+    201's map box and a standalone map product must never drift apart, which
+    they inevitably would as two copies of this layout code.
+    """
+    from matplotlib import pyplot as plt
     from matplotlib.lines import Line2D
 
     metadata = bundle.get("product_metadata", {})
-    fig, axis = plt.subplots(figsize=(11.69, 8.27), dpi=120)
+    axis = fig.add_subplot(111)
     colors: dict[str, Any] = {}
     for feature in bundle.get("features", {}).get("features", []):
         geometry, props = feature.get("geometry") or {}, feature.get("properties") or {}
@@ -212,19 +381,230 @@ def _pdf_product(bundle: dict[str, Any]) -> bytes:
     if colors:
         axis.legend(handles=[Line2D([0], [0], color=color, lw=3, label=kind.replace("_", " ")) for kind, color in colors.items()],
                     loc="upper right", fontsize=7, title="Legend")
-    footer = (f"Classification: {metadata.get('classification', '')}   CRS: EPSG:4326 / OGC:CRS84   "
+    profile = symbology.normalise_profile(next(
+        (str((f.get("properties") or {}).get("symbology_profile", ""))
+         for f in bundle.get("features", {}).get("features", []) if f.get("properties")), ""))
+    footer = (f"Symbology: {symbology.profile_authority(profile)}\n"
+              f"Classification: {metadata.get('classification', '')}   CRS: EPSG:4326 / OGC:CRS84   "
               f"Produced: {metadata.get('produced_at', '')}\n{metadata.get('freshness_statement', '')}\n"
               "Coordinate grid shown. Scale varies with latitude; verify distances with the operational measurement tools. Page 1/1")
-    fig.text(.06, .025, footer, fontsize=7, va="bottom")
-    fig.tight_layout(rect=(.04, .1, .98, .96))
-    output = io.BytesIO()
+    fig.text(.06, .02, footer, fontsize=7, va="bottom")
+    # Bottom band widened from .10 to .14 because the footer gained a
+    # "Symbology: ..." line; without it the footer would overlap the x-axis
+    # label. (matplotlib also emits a "tight layout not applied" warning here
+    # about the *left/right* margins - that predates this change and is
+    # unrelated: rect's .04 left inset is narrower than the y-axis label needs.
+    # Harmless, since the layout falls back to the default which fits.)
+    fig.tight_layout(rect=(.04, .14, .98, .96))
+    return axis
+
+
+# The command paperwork each audience is actually audited against. A
+# department adopts a tool far faster when it emits the forms they already
+# have to file, so these are laid out to match the real documents' box
+# structure rather than being a generic "report".
+FORM_LAYOUTS: dict[str, dict[str, Any]] = {
+    "ics201": {
+        "title": "ICS 201 - Incident Briefing",
+        "authority": "ICS/NIMS Incident Briefing (US)",
+        "sections": ("situation", "objectives", "organisation", "resources", "safety"),
+    },
+    "ics202": {
+        "title": "ICS 202 - Incident Objectives",
+        "authority": "ICS/NIMS Incident Objectives (US)",
+        "sections": ("objectives", "safety", "weather"),
+    },
+    "ics204": {
+        "title": "ICS 204 - Assignment List",
+        "authority": "ICS/NIMS Assignment List (US)",
+        "sections": ("organisation", "assignments", "resources", "safety"),
+    },
+    "lagekarte": {
+        "title": "Lagekarte / Einsatzuebersicht",
+        "authority": "DV 100 Fuehrungssystem, DV 102 taktische Zeichen (DE)",
+        "sections": ("lage", "kraefte", "massnahmen", "sicherheit"),
+    },
+}
+
+#: German headings for the Lagekarte, so the DE product is not an English
+#: form with translated content - the audience reads these labels.
+_DE_HEADINGS = {
+    "lage": "Lage", "kraefte": "Eingesetzte Kraefte", "massnahmen": "Massnahmen",
+    "sicherheit": "Sicherheit / Eigenschutz",
+}
+
+
+def _form_sections(bundle: dict[str, Any], kind: str) -> list[tuple[str, list[str]]]:
+    """Assemble each form section's lines from the export bundle.
+
+    Everything here already exists in the operational record - periods,
+    features, resources, `SAFETY_CHECKS` state - so a form is a *view* of the
+    incident, never a separate thing to keep up to date. That is what stops
+    the paperwork drifting from the map, which is the usual failure of
+    bolted-on reporting.
+    """
+    incident = bundle.get("incident", {})
+    features = bundle.get("features", {}).get("features", [])
+    resources = bundle.get("resources", [])
+    periods = bundle.get("operational_periods", [])
+    safety = bundle.get("safety_checks", [])
+    german = kind == "lagekarte"
+
+    live = [f for f in features if not (f.get("properties") or {}).get("deleted_at")]
+    by_type: dict[str, int] = {}
+    for feature in live:
+        by_type[str((feature.get("properties") or {}).get("feature_type", "?"))] = \
+            by_type.get(str((feature.get("properties") or {}).get("feature_type", "?")), 0) + 1
+    by_status: dict[str, int] = {}
+    for resource in resources:
+        by_status[str(resource.get("status", "?"))] = by_status.get(str(resource.get("status", "?")), 0) + 1
+
+    current = next((p for p in periods if p.get("status") == "active"), periods[-1] if periods else {})
+    profile = _clean_text((live[0].get("properties") or {}).get("symbology_profile") if live else "", 60) \
+        or "simplified_multinational"
+
+    situation = [
+        f"Incident: {incident.get('name', '')}  ({incident.get('incident_number') or 'no number'})",
+        f"Status: {incident.get('status', 'active')}",
+        f"Operational period: {current.get('name', '-')}  {current.get('starts_at', '')} - {current.get('ends_at', '')}",
+        f"Mapped features: {len(live)}",
+    ] + [f"  {kind_name.replace('_', ' ')}: {count}" for kind_name, count in sorted(by_type.items())]
+
+    objectives = [line for line in (
+        _clean_text(current.get("objectives"), 2000) or "",
+        _clean_text(incident.get("notes"), 2000) or "",
+    ) if line] or ["No objectives recorded for this operational period."]
+
+    organisation = [
+        f"Prepared by: {bundle.get('product_metadata', {}).get('author', 'local operator')}",
+        f"Operational periods on record: {len(periods)}",
+        f"Symbology profile: {profile}",
+    ]
+
+    resource_lines = [f"Resources: {len(resources)}"] + \
+        [f"  {status}: {count}" for status, count in sorted(by_status.items())] + \
+        [f"  - {_clean_text(r.get('name'), 60)} ({r.get('kind', '?')}, {r.get('status', '?')})"
+         for r in resources[:25]]
+
+    # SAFETY_CHECKS is the fixed nine-item checklist; showing which are
+    # unticked is the whole point of putting safety on a form.
+    ticked = {row.get("check_key") for row in safety if row.get("checked")}
+    safety_lines = [
+        ("ERFUELLT" if key in ticked else "OFFEN") + f"  {label}" if german
+        else ("DONE" if key in ticked else "OPEN") + f"  {label}"
+        for key, label in SAFETY_CHECKS
+    ] or ["No safety record for this period."]
+
+    assignments = [
+        f"- {_clean_text((f.get('properties') or {}).get('title'), 60)}"
+        f"  [{(f.get('properties') or {}).get('feature_type')}]"
+        f"  {(f.get('properties') or {}).get('responsible_unit') or 'unassigned'}"
+        for f in live if (f.get("properties") or {}).get("feature_type") in
+        {"tactical_line", "division_boundary", "branch_boundary", "structure_protection_area"}
+    ] or ["No division/branch assignments recorded."]
+
+    weather = [
+        f"- {_clean_text((f.get('properties') or {}).get('title'), 60)}: "
+        f"{(f.get('properties') or {}).get('wind_speed_ms', '?')} m/s from "
+        f"{(f.get('properties') or {}).get('wind_from_deg', '?')} deg"
+        for f in live if (f.get("properties") or {}).get("feature_type") == "wind_observation"
+    ] or ["No wind observations recorded."]
+
+    available = {
+        "situation": ("Situation Summary", situation),
+        "objectives": ("Objectives", objectives),
+        "organisation": ("Organisation", organisation),
+        "resources": ("Resource Summary", resource_lines),
+        "assignments": ("Assignments", assignments),
+        "safety": ("Safety", safety_lines),
+        "weather": ("Weather", weather),
+        "lage": (_DE_HEADINGS["lage"], situation),
+        "kraefte": (_DE_HEADINGS["kraefte"], resource_lines),
+        "massnahmen": (_DE_HEADINGS["massnahmen"], objectives + assignments),
+        "sicherheit": (_DE_HEADINGS["sicherheit"], safety_lines),
+    }
+    return [available[name] for name in FORM_LAYOUTS[kind]["sections"] if name in available]
+
+
+def _form_product(bundle: dict[str, Any], kind: str) -> bytes:
+    """An ICS form or a Lagekarte as a multi-page PDF.
+
+    Page 1 is the existing reference map (`_pdf_product`), unchanged - the
+    map *is* the first box of an ICS 201 and the whole point of a Lagekarte -
+    and the following pages lay out the form's text boxes.
+
+    Determinism is preserved exactly as in `_pdf_product`: page metadata is
+    pinned to the product's own ``produced_at`` rather than wall-clock now, so
+    re-rendering the same bundle still yields byte-identical output and the
+    stored SHA-256 stays a real integrity check.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    layout = FORM_LAYOUTS[kind]
+    metadata = bundle.get("product_metadata", {})
+    incident = bundle.get("incident", {})
+    sections = _form_sections(bundle, kind)
+
     timestamp = str(metadata.get("produced_at") or "2000-01-01T00:00:00+00:00").replace("Z", "+00:00")
-    try: pdf_date = dt.datetime.fromisoformat(timestamp)
-    except ValueError: pdf_date = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)  # malformed timestamp - a fixed fallback beats failing the whole product
-    fig.savefig(output, format="pdf", metadata={"Title": str(metadata.get("title") or "NexFiremap product"),
-                "Author": "NexFiremap", "Subject": str(metadata.get("product_type") or "incident map"),
-                "CreationDate": pdf_date, "ModDate": pdf_date})
-    plt.close(fig)
+    try:
+        pdf_date = dt.datetime.fromisoformat(timestamp)
+    except ValueError:
+        pdf_date = dt.datetime(2000, 1, 1, tzinfo=dt.timezone.utc)
+
+    output = io.BytesIO()
+    with PdfPages(output) as pdf:
+        # --- page 1: the map, reusing the existing renderer verbatim -------
+        map_bytes = _pdf_product(bundle)
+        # PdfPages cannot append an existing PDF, so page 1 is re-rendered
+        # into this document rather than concatenated. Keeping `_pdf_product`
+        # as the single map renderer matters more than avoiding the second
+        # render: a form's map and a standalone map product must never drift.
+        del map_bytes
+        figure = plt.figure(figsize=(11.69, 8.27), dpi=120)
+        _draw_map_axes(figure, bundle)
+        pdf.savefig(figure)
+        plt.close(figure)
+
+        # --- following pages: the form's boxes -----------------------------
+        per_page = 2
+        for index in range(0, len(sections), per_page):
+            figure = plt.figure(figsize=(8.27, 11.69), dpi=120)
+            figure.text(.07, .955, layout["title"], fontsize=15, weight="bold")
+            figure.text(.07, .933,
+                        f"{incident.get('name', '')}  -  {metadata.get('classification', '')}  -  "
+                        f"{metadata.get('produced_at', '')}", fontsize=8)
+            top = .90
+            for heading, lines in sections[index:index + per_page]:
+                figure.text(.07, top, heading, fontsize=11, weight="bold")
+                top -= .022
+                # A form box has to be bounded: an incident with 400 features
+                # would otherwise run text off the page silently, and a
+                # truncated list that says so is honest where a clipped one is
+                # not.
+                shown = lines[:22]
+                for line in shown:
+                    figure.text(.09, top, str(line)[:110], fontsize=8, family="monospace")
+                    top -= .0155
+                if len(lines) > len(shown):
+                    figure.text(.09, top, f"... {len(lines) - len(shown)} more (see the full export)",
+                                fontsize=8, style="italic")
+                    top -= .0155
+                top -= .025
+            figure.text(.07, .04,
+                        f"{layout['authority']}   |   CRS: EPSG:4326 / OGC:CRS84   |   "
+                        f"Page {index // per_page + 2}/{(len(sections) + per_page - 1) // per_page + 1}\\n"
+                        f"{metadata.get('freshness_statement', '')}", fontsize=7, va="bottom")
+            pdf.savefig(figure)
+            plt.close(figure)
+
+        pdf.infodict().update({
+            "Title": str(metadata.get("title") or layout["title"]),
+            "Author": "NexFiremap", "Subject": layout["authority"],
+            "CreationDate": pdf_date, "ModDate": pdf_date,
+        })
     return output.getvalue()
 
 
@@ -265,8 +645,16 @@ def render(bundle: dict[str, Any], fmt: str) -> tuple[bytes, str]:
     two near-duplicate functions."""
     if fmt in {"json", "geojson"}:
         return json.dumps(bundle, sort_keys=True, indent=2, ensure_ascii=False).encode(), "application/geo+json" if fmt == "geojson" else "application/json"
-    if fmt == "pdf": return _pdf_product(bundle), "application/pdf"
+    if fmt == "pdf":
+        # The *product type* selects the page layout, not the format: an ICS
+        # 201 and a plain reference map are both PDFs of the same bundle.
+        form = str(bundle.get("product_metadata", {}).get("product_type", ""))
+        if form in FORM_LAYOUTS:
+            return _form_product(bundle, form), "application/pdf"
+        return _pdf_product(bundle), "application/pdf"
     if fmt == "geopdf": return _geopdf_product(bundle), "application/pdf"
+    if fmt == "gpkg_features":
+        return _vector_gpkg_product(bundle), "application/geopackage+sqlite3"
     if fmt in {"geotiff", "gpkg"}:
         return (_raster_product(bundle, "GTiff"), "image/tiff") if fmt == "geotiff" else (_raster_product(bundle, "GPKG"), "application/geopackage+sqlite3")
     if fmt == "kmz":
@@ -344,7 +732,7 @@ class ProductManager:
         content, media_type = render(payload, fmt)
         digest = hashlib.sha256(content).hexdigest(); product_id = _id()
         stem = SAFE_NAME.sub("-", f"{product_type}-{classification}-{product_id[:8]}").strip("-")
-        extension = "tif" if fmt == "geotiff" else "pdf" if fmt == "geopdf" else fmt
+        extension = "tif" if fmt == "geotiff" else "pdf" if fmt == "geopdf" else "gpkg" if fmt == "gpkg_features" else fmt
         filename = f"{stem}.{extension}"
         with self.db._write_lock:
             self.db.conn.execute(

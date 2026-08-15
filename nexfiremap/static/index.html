@@ -579,6 +579,11 @@
       <span>Render as</span>
       <select id="render-mode">
         <option value="topology">Spread over Time</option>
+        <!-- Same job result as "Spread over Time", drawn as one
+             translucent fill of the affected area instead of nested time
+             bands - for briefings and public-facing views where the
+             progression is noise rather than signal. -->
+        <option value="extent">Affected Area</option>
         <option value="points">Points</option>
         <option value="cluster">Clusters</option>
         <option value="heat">Heatmap</option>
@@ -764,5 +769,8 @@
 <script type="module" src="/static/js/app.js"></script>
 <script type="module" src="/static/js/operations.js"></script>
 <script type="module" src="/static/js/structures.js"></script>
+<!-- Optional: adds nothing to the page (not even its control) unless the
+     server reports configured CAP warning feeds via /api/config. -->
+<script type="module" src="/static/js/alerts.js"></script>
 </body>
 </html>

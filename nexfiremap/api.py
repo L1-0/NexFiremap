@@ -53,13 +53,30 @@ from .operations import (
 )
 from .routes import ROUTERS
 from .routes.common import AVAILABLE_FEATURES, FEATURE_ERRORS, _json
+from .alerts import AlertManager
+from .cot_gateway import CotGateway
+from .federation import FederationError, LdapProvider, OidcProvider
+from .layers import LayerError, LayerRegistry
+from .mqtt import MqttBridge
 from .tiles import TileCache
+from .webhooks import WebhookError, WebhookManager
 from .tactics import TacticsManager
 from .security import SecurityManager
 from .telemetry import TelemetryError, TelemetryManager, TelemetryRateLimit
 from .wind import WindError, WindManager
 
 log = logging.getLogger("nexfiremap.api")
+
+# Paths that must work before a client has any session at all: the SPA
+# shell, the health check (polled by process supervisors, not operators),
+# the login call itself, /api/config (read to render the login screen), and
+# the OIDC redirect pair - which run *before* a session exists by
+# definition, that being the whole point of them.
+_PRE_SESSION_PATHS = {
+    "/", "/health", "/service-worker.js", "/api/config",
+    "/api/auth/login", "/api/auth/providers",
+    "/auth/oidc/login", "/auth/oidc/callback",
+}
 
 # Re-exported for backwards compatibility: these moved to routes/common.py
 # (routers need them and importing api.py from a router would be circular),
@@ -114,9 +131,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise RuntimeError("LAN mode requires NEXFIREMAP_ADMIN_PASSWORD with at least 12 characters")
         db = Database(settings.db_path)
         cache = CacheManager(settings, db)
-        tiles = TileCache(settings)
+        # The layer registry has to exist before the tile cache, which
+        # consults it on every lookup so an operator-added WMS/WMTS/XYZ layer
+        # is proxied, cached and packaged by the same code as a built-in one.
+        layers = LayerRegistry(db, settings)
+        tiles = TileCache(settings, layers)
         jobs = JobManager(settings, db)
         backups = BackupManager(settings, db)
+        # Polls official CAP warning feeds, if any are configured. With none
+        # configured `start()` is a no-op - no HTTP client, no task.
+        alerts = AlertManager(settings, db)
         # No corresponding `await geocode.start()` below - unlike
         # cache/tiles/jobs/backups, GeocodeService has no background loop
         # to start, only an HTTP client to close on shutdown (see
@@ -129,8 +153,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.db = db
         app.state.cache = cache
         app.state.tiles = tiles
+        app.state.layers = layers
         app.state.jobs = jobs
         app.state.backups = backups
+        app.state.alerts = alerts
         app.state.geocode = geocode
         app.state.offline_sources = OfflineSourceManager(settings.tile_cache_dir)
         # map_packs bundles tiles from both the live TileCache and any
@@ -147,11 +173,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.tactics = TacticsManager(app.state.operations)
         app.state.products = ProductManager(db, app.state.operations)
         app.state.merges = MergeManager(app.state.operations)
+        # Optional CoT/TAK + MAVLink listener. Constructed after telemetry
+        # and operations because it routes everything it receives through
+        # them rather than writing rows itself; `start()` is a no-op unless
+        # explicitly enabled *and* pointed at a feed source.
+        app.state.cot_gateway = CotGateway(settings, app.state.telemetry, app.state.operations)
+        # Routes mapped CAD/dispatch payloads into an existing position feed,
+        # so it needs telemetry rather than the database alone.
+        app.state.webhooks = WebhookManager(db, app.state.telemetry)
+        # Optional MQTT subscriber. Inert unless a broker and topics are
+        # configured *and* the optional aiomqtt dependency is installed.
+        app.state.mqtt = MqttBridge(settings, db, app.state.telemetry)
         # Independent of the operations/incident managers above - only
         # needs settings and db - but must be set before `yield`, since
         # SecurityMiddleware reads app.state.security on every request
         # from here on.
         app.state.security = SecurityManager(settings, db)
+        # External identity providers. Both are inert unless configured, and
+        # neither disables local password login (see federation.py).
+        app.state.oidc = OidcProvider(settings)
+        app.state.ldap = LdapProvider(settings)
         app.state.key_status = {"checked_at": 0.0, "payload": None}
         # Only these four own a background loop/worker pool that needs
         # explicitly starting; every other manager above does its work
@@ -161,6 +202,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await tiles.start()
         await jobs.start()
         await backups.start()
+        await alerts.start()
+        await app.state.cot_gateway.start()
+        await app.state.mqtt.start()
         log.info(
             "NexFiremap ready on http://%s:%d (%d job worker%s)",
             settings.host,
@@ -176,6 +220,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # background loop gets a chance to stop cleanly and `db` gets
             # closed, rather than leaking a worker thread or an open
             # sqlite handle.
+            await app.state.mqtt.stop()
+            await app.state.cot_gateway.stop()
+            await alerts.stop()
             await backups.stop()
             await cache.stop()
             await tiles.stop()
@@ -220,14 +267,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # a session cookie - field devices posting positions have no
             # browser session to send. It's carved out of the gate below
             # rather than folded into the may_read/may_write role tables.
-            feed_ingest = request.method == "POST" and path.startswith("/api/feeds/positions/")
+            #
+            # Two shapes, kept deliberately narrow. A POST to any feed path
+            # is the normal case (JSON, CoT XML, NMEA text). The GET carve-out
+            # exists only for the OsmAnd/Traccar tracker protocol, which a
+            # large amount of cheap AVL hardware and phone software speaks and
+            # which can *only* issue a GET with query parameters - it has no
+            # way to set a header or send a body. That hardware passes its
+            # credential as `?token=`, still checked by
+            # `TelemetryManager.ingest`.
+            #
+            # The GET exemption is restricted to the exact `/osmand` suffix
+            # rather than the whole prefix on purpose: widening it to every
+            # GET under /api/feeds/ would expose any future read endpoint
+            # added there without a session, which is the kind of drift a
+            # single auth choke point exists to prevent.
+            feed_path = path.startswith("/api/feeds/positions/")
+            feed_ingest = feed_path and (
+                request.method == "POST"
+                or (request.method == "GET" and path.endswith("/osmand"))
+            )
+            # The CAD/dispatch webhook receiver, on the same principle: the
+            # sender is a machine with no browser session and authenticates
+            # with the hook's own X-Webhook-Token, checked inside
+            # WebhookManager.receive. POST only, and scoped to the receive
+            # prefix - the /api/webhooks administration routes are NOT carved
+            # out and remain session- and administrator-gated.
+            webhook_ingest = request.method == "POST" and path.startswith("/api/ingest/webhook/")
             # Everything else in this allowlist has to work before a
             # client has ever logged in: the SPA shell and its assets, the
             # health check (used by process supervisors, not a logged-in
             # operator), the login call itself, and /api/config (the
             # frontend reads it to render the login screen before any
             # session exists).
-            public_path = feed_ingest or path in {"/", "/health", "/service-worker.js", "/api/auth/login", "/api/config"} or path.startswith("/static/")
+            public_path = feed_ingest or webhook_ingest or path in _PRE_SESSION_PATHS or path.startswith("/static/")
             # security is None only in the getattr fallback above; when
             # LAN mode is off, security.enabled is False and single-user
             # loopback mode trusts every request the same way a local CLI
@@ -356,6 +429,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(OfflineSourceError)
     async def _offline_source_exception(request: Request, exc: OfflineSourceError) -> Response:
+        return _json({"detail": str(exc)}, status_code=400)
+
+    @app.exception_handler(FederationError)
+    async def _federation_exception(request: Request, exc: FederationError) -> Response:
+        # A misconfigured or unreachable identity provider is a 4xx, not a
+        # server fault - and on an incident LAN with the WAN down it is an
+        # expected state, which is why local login stays available.
+        return _json({"detail": str(exc)}, status_code=400)
+
+    @app.exception_handler(WebhookError)
+    async def _webhook_exception(request: Request, exc: WebhookError) -> Response:
+        return _json({"detail": str(exc)}, status_code=400)
+
+    @app.exception_handler(LayerError)
+    async def _layer_exception(request: Request, exc: LayerError) -> Response:
+        # Covers both an invalid layer definition and an endpoint that could
+        # not be probed. The latter is an ordinary outcome on an incident LAN
+        # with the WAN down, so it must read as "your request could not be
+        # satisfied", not as a server fault.
         return _json({"detail": str(exc)}, status_code=400)
 
     # Every route handler in the app, grouped by subject area - see

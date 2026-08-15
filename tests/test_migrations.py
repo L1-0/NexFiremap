@@ -50,39 +50,49 @@ def patched_ladder(steps, version: int):
         db_module.MIGRATIONS, db_module.SCHEMA_VERSION = saved_steps, saved_version
 
 
+# Synthetic ladder rungs, expressed relative to the real SCHEMA_VERSION
+# rather than as literals. A fresh Database is created at SCHEMA_VERSION, so a
+# rung at or below it is (correctly) skipped as already applied - hardcoding
+# "5, 6, 7" meant this whole file broke the first time the real schema reached
+# version 5. Relative rungs survive every future bump.
+_LADDER_A = SCHEMA_VERSION + 1
+_LADDER_B = SCHEMA_VERSION + 2
+_LADDER_C = SCHEMA_VERSION + 3
+
+
 # A deliberately order-dependent three-step ladder: step 6 needs the table
 # step 5 creates, and step 7 needs the column step 6 adds. If the runner ever
 # applied these out of sequence the SQL itself would fail, which is a far
 # stronger ordering check than counting calls.
-_STEP_FIVE_SQL = """
+_STEP_A_SQL = """
 CREATE TABLE ladder_note (
     id    INTEGER PRIMARY KEY,
     label TEXT NOT NULL
 );
-INSERT INTO ladder_note (id, label) VALUES (1, 'five');
+INSERT INTO ladder_note (id, label) VALUES (1, 'first');
 """
 
-_STEP_SEVEN_SQL = """
+_STEP_C_SQL = """
 -- leading comment, then two statements: exercises the statement splitter
 CREATE INDEX idx_ladder_note_label ON ladder_note (label);
-INSERT INTO ladder_note (id, label, label_upper) VALUES (3, 'seven', 'SEVEN');
+INSERT INTO ladder_note (id, label, label_upper) VALUES (3, 'third', 'THIRD');
 """
 
 
-def _step_six(conn: sqlite3.Connection) -> None:
+def _step_b(conn: sqlite3.Connection) -> None:
     """The 'real migration' shape: alter a table, then backfill it."""
     conn.execute("ALTER TABLE ladder_note ADD COLUMN label_upper TEXT")
     conn.execute("UPDATE ladder_note SET label_upper = UPPER(label)")
-    conn.execute("INSERT INTO ladder_note (id, label, label_upper) VALUES (2, 'six', 'SIX')")
+    conn.execute("INSERT INTO ladder_note (id, label, label_upper) VALUES (2, 'second', 'SECOND')")
 
 
 def _fake_ladder() -> tuple[MigrationStep, ...]:
     # Declared out of order on purpose: the runner sorts by version, so a
     # step appended in the wrong place must not apply in the wrong place.
     return (
-        MigrationStep(7, "index + row depending on step 6's column", _STEP_SEVEN_SQL),
-        MigrationStep(5, "create ladder_note", _STEP_FIVE_SQL),
-        MigrationStep(6, "add label_upper and backfill", _step_six),
+        MigrationStep(_LADDER_C, "index + row depending on the second step's column", _STEP_C_SQL),
+        MigrationStep(_LADDER_A, "create ladder_note", _STEP_A_SQL),
+        MigrationStep(_LADDER_B, "add label_upper and backfill", _step_b),
     )
 
 
@@ -258,13 +268,13 @@ def check_sequential_steps_from_scratch(root: Path) -> None:
     path = root / "ladder_full.sqlite3"
     conn = sqlite3.connect(path)
     try:
-        reached = apply_migrations(conn, _fake_ladder(), 7)
-        assert reached == 7
-        assert _user_version(conn) == 7
+        reached = apply_migrations(conn, _fake_ladder(), _LADDER_C)
+        assert reached == _LADDER_C
+        assert _user_version(conn) == _LADDER_C
         assert _ladder_rows(conn) == [
-            (1, "five", "FIVE"),
-            (2, "six", "SIX"),
-            (3, "seven", "SEVEN"),
+            (1, "first", "FIRST"),
+            (2, "second", "SECOND"),
+            (3, "third", "THIRD"),
         ]
         # The runner restores the connection's transaction handling.
         assert conn.isolation_level == ""
@@ -280,32 +290,32 @@ def check_sequential_steps_resume(root: Path) -> None:
     conn = sqlite3.connect(path)
     try:
         # As an older build would have left it: that release only knew about
-        # step 5, so the file stops there and `label_upper` (added by step 6)
-        # does not exist yet.
-        older_release = tuple(step for step in _fake_ladder() if step.version <= 5)
-        assert apply_migrations(conn, older_release, 5) == 5
-        assert _user_version(conn) == 5
-        assert conn.execute("SELECT id, label FROM ladder_note").fetchall() == [(1, "five")]
+        # the first step, so the file stops there and `label_upper` (added by
+        # the second step) does not exist yet.
+        older_release = tuple(step for step in _fake_ladder() if step.version <= _LADDER_A)
+        assert apply_migrations(conn, older_release, _LADDER_A) == _LADDER_A
+        assert _user_version(conn) == _LADDER_A
+        assert conn.execute("SELECT id, label FROM ladder_note").fetchall() == [(1, "first")]
 
-        # Now the code catches up: steps 6 and 7 run, step 5 does not
+        # Now the code catches up: the second and third steps run, the first does not
         # (re-running its CREATE TABLE would raise "table already exists").
-        assert apply_migrations(conn, _fake_ladder(), 7) == 7
+        assert apply_migrations(conn, _fake_ladder(), _LADDER_C) == _LADDER_C
         assert _ladder_rows(conn) == [
-            (1, "five", "FIVE"),
-            (2, "six", "SIX"),
-            (3, "seven", "SEVEN"),
+            (1, "first", "FIRST"),
+            (2, "second", "SECOND"),
+            (3, "third", "THIRD"),
         ]
 
         # Already current: nothing runs, nothing changes.
-        assert apply_migrations(conn, _fake_ladder(), 7) == 7
+        assert apply_migrations(conn, _fake_ladder(), _LADDER_C) == _LADDER_C
         assert len(_ladder_rows(conn)) == 3
 
         # Starting one rung down from the top applies only the last step.
-        conn.execute("PRAGMA user_version=6")
+        conn.execute(f"PRAGMA user_version={_LADDER_B}")
         conn.execute("DELETE FROM ladder_note WHERE id = 3")
         conn.execute("DROP INDEX idx_ladder_note_label")
         conn.commit()
-        assert apply_migrations(conn, _fake_ladder(), 7) == 7
+        assert apply_migrations(conn, _fake_ladder(), _LADDER_C) == _LADDER_C
         assert [row[0] for row in _ladder_rows(conn)] == [1, 2, 3]
     finally:
         conn.close()
@@ -317,7 +327,7 @@ def check_version_gap_is_stamped(root: Path) -> None:
     path = root / "ladder_gap.sqlite3"
     conn = sqlite3.connect(path)
     try:
-        reached = apply_migrations(conn, (MigrationStep(5, "create", _STEP_FIVE_SQL),), 8)
+        reached = apply_migrations(conn, (MigrationStep(5, "create", _STEP_A_SQL),), 8)
         assert reached == 8
         assert _user_version(conn) == 8
         assert _table_exists(conn, "ladder_note")
@@ -384,24 +394,24 @@ def check_failed_step_is_recoverable(root: Path) -> None:
         raise ValueError("simulated mid-migration failure")
 
     broken = (
-        MigrationStep(5, "create ladder_note", _STEP_FIVE_SQL),
-        MigrationStep(6, "explodes", exploding_step),
-        MigrationStep(7, "never reached", _STEP_SEVEN_SQL),
+        MigrationStep(_LADDER_A, "create ladder_note", _STEP_A_SQL),
+        MigrationStep(_LADDER_B, "explodes", exploding_step),
+        MigrationStep(_LADDER_C, "never reached", _STEP_C_SQL),
     )
 
-    with patched_ladder(broken, 7):
+    with patched_ladder(broken, _LADDER_C):
         try:
             Database(path)
             raise AssertionError("failing migration was not reported")
         except RuntimeError as exc:
             assert "simulated mid-migration failure" in str(exc)
-            assert "version 6" in str(exc)
+            assert f"version {_LADDER_B}" in str(exc)
 
     conn = sqlite3.connect(path)
     try:
         # Step 5 committed and is stamped; step 6 rolled back entirely and
         # its version was never stamped; step 7 never ran.
-        assert _user_version(conn) == 5, "user_version advanced past a failed step"
+        assert _user_version(conn) == _LADDER_A, "user_version advanced past a failed step"
         assert _table_exists(conn, "ladder_note")
         assert not _table_exists(conn, "half_done"), "failed step was not rolled back"
         assert conn.execute(
@@ -427,10 +437,10 @@ def check_failed_step_is_recoverable(root: Path) -> None:
     # backup's version and lands on the target.
     restored = root / "ladder_restored.sqlite3"
     shutil.copy2(backup, restored)
-    with patched_ladder(_fake_ladder(), 7):
+    with patched_ladder(_fake_ladder(), _LADDER_C):
         db = Database(restored)
         try:
-            assert _user_version(db.conn) == 7
+            assert _user_version(db.conn) == _LADDER_C
             assert db.get_meta("marker") == "before-migration"
             assert [row[0] for row in _ladder_rows(db.conn)] == [1, 2, 3]
         finally:
@@ -447,15 +457,15 @@ def check_database_startup_runs_ladder(root: Path) -> None:
     db.set_meta("marker", "kept")
     db.close()
 
-    with patched_ladder(_fake_ladder(), 7):
+    with patched_ladder(_fake_ladder(), _LADDER_C):
         db = Database(path)
         try:
-            assert _user_version(db.conn) == 7
+            assert _user_version(db.conn) == _LADDER_C
             assert db.get_meta("marker") == "kept"
             assert _ladder_rows(db.conn) == [
-                (1, "five", "FIVE"),
-                (2, "six", "SIX"),
-                (3, "seven", "SEVEN"),
+                (1, "first", "FIRST"),
+                (2, "second", "SECOND"),
+                (3, "third", "THIRD"),
             ]
         finally:
             db.close()
@@ -468,7 +478,7 @@ def check_database_startup_runs_ladder(root: Path) -> None:
         # further backup.
         db = Database(path)
         try:
-            assert _user_version(db.conn) == 7
+            assert _user_version(db.conn) == _LADDER_C
             assert len(_ladder_rows(db.conn)) == 3
         finally:
             db.close()

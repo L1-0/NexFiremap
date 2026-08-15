@@ -411,6 +411,45 @@ All settings are environment variables (or put them in `.env`). See
 | `NEXFIREMAP_DRONE_DIR` | `data/drone` | Preserved drone originals and previews |
 | `NEXFIREMAP_DRONE_MAX_UPLOAD_MB` | `200` | Per-image raw upload bound |
 
+## Emergency-services interoperability
+
+NexFiremap speaks the formats a department's existing equipment already emits,
+so connecting it usually means changing a URL rather than writing glue code.
+Every one of these is **off unless configured**, and every one of them
+normalizes into the *same* internal contracts — so a CoT position and a JSON one
+take the identical write path, with the same authentication, replay-safety and
+provenance. Adding a standard means adding a parser (`nexfiremap/ingest/`),
+never a second pipeline.
+
+| Standard | Direction | How |
+|---|---|---|
+| **Cursor on Target (TAK)** | in + out | POST CoT XML to the feed endpoint; or enable the TCP/UDP gateway. `GET /api/operations/incidents/{id}/cot` renders the incident for ATAK to poll |
+| **CAP** (MoWaS/NINA, DWD, IPAWS/NWS) | in | `NEXFIREMAP_CAP_FEEDS=dwd,mowas` — official warnings drawn beside the fire picture |
+| **WMS / WMTS / XYZ** | in | `POST /api/layers` — a Kreis/county GIS layer becomes a row, and is then cached, pinned and packed offline like any built-in basemap |
+| **NMEA 0183** | in | POST sentences as `text/plain` to the feed endpoint |
+| **OsmAnd / Traccar** | in | `GET /api/feeds/positions/{id}/osmand?lat=…&lon=…&token=…` |
+| **MAVLink v2** | in | `GLOBAL_POSITION_INT` over UDP, via the same gateway as CoT |
+| **Shapefile** | in | Zipped `.shp/.dbf/.prj`; WGS84, Web Mercator and WGS84 UTM are reprojected, anything needing a datum shift is refused by name |
+| **GeoPackage** | in + out | Import already existed; `fmt="gpkg_features"` now exports real vector features |
+| **MQTT** | in | `NEXFIREMAP_MQTT_URL` + a topic→feed table. Needs the optional `aiomqtt` |
+| **CAD / dispatch webhooks** | in | `POST /api/webhooks` with a dotted-path mapping — no vendor module needed |
+| **ICS 201/202/204, Lagekarte** | out | Multi-page PDF products laid out as the real forms |
+| **OIDC / LDAP** | — | Federated sign-in that mints the ordinary local session |
+
+Tactical symbology carries three profiles at once — `simplified_multinational`
+(default), `dv102` (German *Taktische Zeichen*) and `nfpa170_ics` (US) — selected
+with `NEXFIREMAP_SYMBOLOGY_PROFILE`. Every rendered map names the profile it was
+drawn in, per `docs/further_plan.md`'s guidance for multinational operations.
+
+Two limits worth knowing before you deploy any of it:
+
+- **The CoT/MAVLink gateway is unauthenticated by protocol design.** It is off by
+  default, binds loopback, and enforces a CIDR allowlist. See the runbook.
+- **The OIDC flow does not verify ID-token signatures locally** — it reads claims
+  from the provider's token/userinfo endpoints over TLS, so the provider's
+  certificate is the trust anchor. Local password login always remains available
+  as break-glass, because an IdP is often on the wrong side of a failed WAN link.
+
 ## API
 
 The frontend is a thin client over a small JSON API, useful on its own:

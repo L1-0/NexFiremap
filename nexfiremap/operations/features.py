@@ -43,6 +43,32 @@ from .incidents import IncidentStore
 from .vocab import FEATURE_STATUSES, FEATURE_TYPES, OBSERVATION_TYPES
 
 
+def _normalise_symbology(props: dict[str, Any]) -> dict[str, Any]:
+    """Coerce a feature's symbology hints to known values.
+
+    `symbology_profile` decides which tactical symbol set a feature is drawn
+    and legended with (DV 102, ICS/NFPA 170, or the neutral house set - see
+    `nexfiremap/symbology.py`). It lives in `properties_json` rather than its
+    own column, so this needs no migration, and the frontend has been writing
+    it since before the profiles existed.
+
+    An unknown profile is normalised to the default rather than rejected. That
+    is deliberate: incident packages are merged between installations
+    (`import_bundle`), so a package from a build that knows a profile this one
+    does not must still import - a feature that renders in a neutral style is
+    fine, a refused handover during an incident is not.
+    """
+    if not props:
+        return {}
+    result = dict(props)
+    if "symbology_profile" in result:
+        from ..symbology import normalise_profile
+        result["symbology_profile"] = normalise_profile(result["symbology_profile"])
+    if "symbol" in result:
+        result["symbol"] = _clean_text(result["symbol"], 40) or None
+    return result
+
+
 class FeatureStore(AggregateStore):
     """CRUD and time-slicing over `tactical_features`."""
 
@@ -77,7 +103,7 @@ class FeatureStore(AggregateStore):
         ).fetchone():
             raise OperationsError("scenario does not belong to incident/period")
         now, feature_id = utcnow(), _id()
-        props = data.get("properties") if isinstance(data.get("properties"), dict) else {}
+        props = _normalise_symbology(data.get("properties") if isinstance(data.get("properties"), dict) else {})
         values = {
             "id": feature_id, "incident_id": incident_id, "period_id": period_id,
             "scenario_id": scenario_id, "feature_type": feature_type,
@@ -192,7 +218,8 @@ class FeatureStore(AggregateStore):
         if "properties" in data:
             if not isinstance(data["properties"], dict):
                 raise OperationsError("properties must be an object")
-            changes["properties_json"] = json.dumps(data["properties"], separators=(",", ":"))
+            changes["properties_json"] = json.dumps(
+                _normalise_symbology(data["properties"]), separators=(",", ":"))
         if "geometry" in data:
             geometry = _validate_geometry(data["geometry"], current["feature_type"])
             changes["geometry_json"] = json.dumps(geometry, separators=(",", ":"))

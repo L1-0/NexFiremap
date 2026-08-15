@@ -591,6 +591,142 @@ CREATE TABLE IF NOT EXISTS incident_audit_log (
     payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_incident ON incident_audit_log (incident_id, changed_at DESC);
+
+-- Operator-added map layers (WMS / WMTS / plain XYZ).
+--
+-- The point of this table is that adding "our Kreis-GIS hydrant layer" or
+-- "the county orthophoto service" is a *row*, not a code change to
+-- basemaps.py. Everything downstream - the tile proxy, the disk cache
+-- layout, map packs, offline manifests, LRU pinning - keys off the layer id
+-- alone, so a layer defined here is cached and packaged by exactly the same
+-- machinery as a built-in one (see layers.LayerRegistry and tiles.TileCache).
+--
+-- `url_template` holds an XYZ/WMTS-RESTful template; `endpoint` plus
+-- `wms_layers`/`wms_styles`/`wms_version`/`wms_crs` hold what a WMS GetMap
+-- request needs. Only one of the two shapes is populated per row, decided by
+-- `kind`, and LayerRegistry validates that on write rather than leaving a
+-- half-filled row to fail later at tile-fetch time.
+--
+-- `licence`/`attribution`/`limitations` are not decoration: an offline map
+-- pack built from these tiles carries them into the field, where whoever
+-- reads the map has no other way to find out what they are allowed to do
+-- with a third party's cadastre or orthophoto.
+CREATE TABLE IF NOT EXISTS custom_layers (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    url_template TEXT NOT NULL DEFAULT '',
+    endpoint     TEXT NOT NULL DEFAULT '',
+    wms_layers   TEXT NOT NULL DEFAULT '',
+    wms_styles   TEXT NOT NULL DEFAULT '',
+    wms_version  TEXT NOT NULL DEFAULT '1.3.0',
+    wms_crs      TEXT NOT NULL DEFAULT 'EPSG:3857',
+    image_format TEXT NOT NULL DEFAULT 'image/png',
+    tile_ext     TEXT NOT NULL DEFAULT 'png',
+    transparent  INTEGER NOT NULL DEFAULT 1,
+    overlay      INTEGER NOT NULL DEFAULT 0,
+    attribution  TEXT NOT NULL DEFAULT '',
+    licence      TEXT NOT NULL DEFAULT '',
+    limitations  TEXT NOT NULL DEFAULT '',
+    min_zoom     INTEGER NOT NULL DEFAULT 0,
+    max_zoom     INTEGER NOT NULL DEFAULT 19,
+    active       INTEGER NOT NULL DEFAULT 1,
+    added_by     TEXT NOT NULL DEFAULT 'local operator',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_custom_layers_active ON custom_layers (active, name);
+
+-- Official public warnings polled from CAP feeds (MoWaS/NINA, DWD, IPAWS...).
+--
+-- Keyed on the alert's own upstream `identifier`, not a generated id, so
+-- re-polling a feed updates the row it already has instead of accumulating a
+-- duplicate every cycle - the pull-feed equivalent of the position feed's
+-- per-`external_id` replay check.
+--
+-- `raw_xml` keeps the document exactly as published. An official warning is
+-- evidence: what was broadcast, by whom, when. Storing only our parsed
+-- interpretation would make that unauditable after the fact.
+--
+-- The bbox columns are denormalised from the geometry purely so a viewport
+-- query is an indexed range scan rather than a JSON parse per row.
+CREATE TABLE IF NOT EXISTS alerts (
+    identifier   TEXT PRIMARY KEY,
+    feed_id      TEXT NOT NULL DEFAULT '',
+    sender       TEXT NOT NULL DEFAULT '',
+    sent         TEXT,
+    event        TEXT NOT NULL DEFAULT '',
+    headline     TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    severity     TEXT NOT NULL DEFAULT 'Unknown',
+    severity_rank INTEGER NOT NULL DEFAULT 4,
+    urgency      TEXT NOT NULL DEFAULT 'Unknown',
+    certainty    TEXT NOT NULL DEFAULT 'Unknown',
+    effective    TEXT,
+    expires      TEXT,
+    geometry_json TEXT,
+    properties_json TEXT NOT NULL DEFAULT '{}',
+    raw_xml      TEXT NOT NULL DEFAULT '',
+    west         REAL,
+    south        REAL,
+    east         REAL,
+    north        REAL,
+    received_at  TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_expires ON alerts (expires);
+CREATE INDEX IF NOT EXISTS idx_alerts_bbox ON alerts (west, east, south, north);
+
+-- Lookup for features that arrived over the CoT gateway, keyed by the
+-- sender's own event uid. An expression index rather than a column, because
+-- the uid lives in `properties_json` and adding a column would mean a
+-- migration plus a second place for the same fact to live. ATAK refreshes a
+-- marker every few seconds, so without this index every refresh would scan
+-- the whole feature table (see cot_gateway.CotGateway.db_lookup).
+-- Inbound webhooks from dispatch/CAD systems.
+--
+-- `mapping_json` is the operator-supplied translation from the vendor's own
+-- JSON shape into our position contract (see ingest/webhook.py). It is a
+-- table of dotted paths, never code - the endpoint is reachable by anyone who
+-- learns the URL, so an evaluated mapping language would be a remote-code
+-- surface.
+--
+-- `token_hash` uses the same SHA-256 scheme as position_feed_sources, so a
+-- leaked database still does not yield a usable credential.
+CREATE TABLE IF NOT EXISTS webhooks (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    incident_id  TEXT NOT NULL,
+    source_id    TEXT NOT NULL,
+    token_hash   TEXT NOT NULL,
+    mapping_json TEXT NOT NULL DEFAULT '{}',
+    active       INTEGER NOT NULL DEFAULT 1,
+    created_by   TEXT NOT NULL DEFAULT 'local operator',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    last_received_at TEXT,
+    accepted     INTEGER NOT NULL DEFAULT 0,
+    rejected     INTEGER NOT NULL DEFAULT 0
+);
+
+-- Payloads that arrived but could not be mapped.
+--
+-- Kept rather than dropped because that is the whole difference between a
+-- debuggable CAD integration and a support ticket: a vendor's format is
+-- usually undocumented, so the only way to fix a mapping is to look at what
+-- they actually sent. Bounded by row count (see WebhookManager.prune), since
+-- a misconfigured hook can otherwise fill a field laptop's disk.
+CREATE TABLE IF NOT EXISTS webhook_deadletter (
+    id          TEXT PRIMARY KEY,
+    hook_id     TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    error       TEXT NOT NULL DEFAULT '',
+    body        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_deadletter_hook ON webhook_deadletter (hook_id, received_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_features_cot_uid
+    ON tactical_features (incident_id, json_extract(properties_json, '$.cot_uid'));
 """
 
 DETECTION_COLUMNS = (
@@ -714,7 +850,14 @@ MIGRATIONS: tuple[MigrationStep, ...] = (
 # warranted and which steps are still pending. A version that needs no step
 # of its own (a purely additive SCHEMA change) simply has no entry in
 # MIGRATIONS above - the runner stamps the gap once the ladder is done.
-SCHEMA_VERSION = 4
+# v5 adds `custom_layers` (operator-added WMS/WMTS/XYZ map layers), `alerts`
+# (CAP public warnings) and the `webhooks`/`webhook_deadletter` pair
+# (dispatch/CAD ingest). All are brand-new tables, which the
+# idempotent SCHEMA script above creates on its own, so there is deliberately
+# no rung for any of them in MIGRATIONS - the runner stamps the gap once the
+# ladder is done. The version still has to move, or an existing database would never
+# trigger the pre-migration backup.
+SCHEMA_VERSION = 5
 
 
 def _refuse_downgrade(current: int, target: int) -> None:

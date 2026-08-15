@@ -32,3 +32,11 @@ planetary-computer>=1.0
 # _FillValue-type-mismatch bug on this specific product when tried via
 # rasterio, confirmed live - h5py sidesteps it and is otherwise unused here).
 h5py>=3.10
+
+# OPTIONAL - MQTT telemetry bridge (nexfiremap/mqtt.py). A lot of tracker and
+# sensor hardware publishes to a broker rather than POSTing anywhere, and MQTT's
+# keepalive/reconnect behaviour survives the brief outages a field link
+# produces. Imported through the same guarded pattern as the analysis
+# dependencies above: if this is missing the bridge reports itself unavailable
+# via /api/config's feature map and the server starts unchanged.
+aiomqtt>=2.0

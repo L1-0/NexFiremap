@@ -26,6 +26,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from . import (
+    alerts,
     auth,
     backups,
     cache,
@@ -40,6 +41,7 @@ from . import (
     incidents,
     industrial,
     jobs,
+    layers,
     map_packs,
     meta,
     offline_sources,
@@ -50,6 +52,7 @@ from . import (
     tactics,
     tiles,
     transfer,
+    webhooks,
 )
 
 # Roughly the order the original single-file api.py declared them, which
@@ -77,9 +80,12 @@ ROUTERS: tuple[APIRouter, ...] = (
     structures.router,
     industrial.router,
     eumetsat.router,
+    alerts.router,
     cache.router,
+    layers.router,
     tiles.router,
     jobs.router,
+    webhooks.router,
     static_files.router,
 )
 

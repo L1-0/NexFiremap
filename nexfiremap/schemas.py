@@ -352,6 +352,89 @@ class FieldImportRequest(BaseModel):
     confirmation_reason: str = Field("", max_length=1000)
 
 
+# -------------------------------------------------------- custom layers
+
+class CustomLayerProbeRequest(BaseModel):
+    endpoint: str = Field(..., min_length=1, max_length=2000)
+    kind: str = Field("wms", max_length=10)
+
+
+class CustomLayerCreateRequest(BaseModel):
+    """One operator-added WMS/WMTS/XYZ layer.
+
+    Almost everything is optional here and the real checking happens in
+    `LayerRegistry._validate`, because the required fields depend on `kind`:
+    a WMS row needs `endpoint` + `wms_layers`, a template row needs
+    `url_template`. Expressing that dependency in pydantic would either mean
+    two request models with a discriminator or validators duplicating the
+    registry's rules - and the registry has to enforce them anyway, since it
+    is also reached by `update`'s merge path.
+    """
+
+    name: str = Field(..., min_length=1, max_length=200)
+    kind: str = Field(..., min_length=1, max_length=10)
+    url_template: str = Field("", max_length=2000)
+    endpoint: str = Field("", max_length=2000)
+    wms_layers: str = Field("", max_length=500)
+    wms_styles: str = Field("", max_length=300)
+    wms_version: str = Field("1.3.0", max_length=10)
+    wms_crs: str = Field("EPSG:3857", max_length=40)
+    image_format: str = Field("image/png", max_length=60)
+    transparent: bool = True
+    overlay: bool = False
+    attribution: str = Field("", max_length=500)
+    # Not decoration: an offline map pack carries these into the field, where
+    # whoever reads the map has no other way to learn what they may do with a
+    # third party's cadastre or orthophoto.
+    licence: str = Field("", max_length=500)
+    limitations: str = Field("", max_length=1000)
+    min_zoom: int = Field(0, ge=0, le=22)
+    max_zoom: int = Field(19, ge=0, le=22)
+
+
+class CustomLayerUpdateRequest(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=200)
+    kind: str | None = Field(None, min_length=1, max_length=10)
+    url_template: str | None = Field(None, max_length=2000)
+    endpoint: str | None = Field(None, max_length=2000)
+    wms_layers: str | None = Field(None, max_length=500)
+    wms_styles: str | None = Field(None, max_length=300)
+    wms_version: str | None = Field(None, max_length=10)
+    wms_crs: str | None = Field(None, max_length=40)
+    image_format: str | None = Field(None, max_length=60)
+    transparent: bool | None = None
+    overlay: bool | None = None
+    attribution: str | None = Field(None, max_length=500)
+    licence: str | None = Field(None, max_length=500)
+    limitations: str | None = Field(None, max_length=1000)
+    min_zoom: int | None = Field(None, ge=0, le=22)
+    max_zoom: int | None = Field(None, ge=0, le=22)
+    active: bool | None = None
+
+
+# ------------------------------------------------------------- webhooks
+
+class WebhookCreateRequest(BaseModel):
+    """One inbound CAD/dispatch webhook.
+
+    `mapping` is validated by `ingest/webhook.validate_mapping` rather than by
+    pydantic: the rules are about the *expressions* (dotted paths and literal
+    templates only, never anything evaluable) and about which target fields
+    exist, neither of which a type annotation can express.
+    """
+
+    name: str = Field(..., min_length=1, max_length=200)
+    incident_id: str = Field(..., min_length=1, max_length=64)
+    source_id: str = Field(..., min_length=1, max_length=64)
+    mapping: dict[str, object] = Field(...)
+
+
+class WebhookUpdateRequest(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=200)
+    mapping: dict[str, object] | None = None
+    active: bool | None = None
+
+
 # ---------------------------------------------------------------- auth
 
 class LoginRequest(BaseModel):

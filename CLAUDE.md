@@ -73,6 +73,39 @@ transport rather than `httpx` and so bypass the mock.
   tile/MBTiles support exist specifically so the tool keeps working with the WAN down
   during an incident. Don't introduce a code path that silently requires live internet.
 
+## Standards interoperability (`nexfiremap/ingest/`)
+
+External formats (CoT/TAK, CAP, NMEA, MAVLink, Shapefile, mapped CAD JSON) are
+handled by **stateless adapters** in `nexfiremap/ingest/`. The rule the package
+enforces, stated in its own docstring: an adapter only ever *translates* bytes
+into one of a few contracts that existing managers already accept —
+
+- position report → `TelemetryManager.ingest` (`telemetry.py`)
+- overlay feature → `FieldImportManager.prepare` (`field_import.py`)
+- alert → `AlertManager` (`alerts.py`)
+
+No adapter touches the database, opens a socket, or reads a setting. That is
+what guarantees a new standard cannot bypass the token auth, rate limiting,
+replay-safety, preview-before-apply or provenance the receiving managers
+enforce. **A new standard is a new parser, never a new write path.**
+
+Stateful pieces are separate managers wired in `api.py`'s `lifespan()` next to
+`cache`/`tiles`/`jobs`: `cot_gateway.py` (TCP/UDP listener), `alerts.py` (CAP
+poller), `mqtt.py` (broker subscriber), `webhooks.py` (CAD registry),
+`layers.py` (WMS/WMTS registry), `federation.py` (OIDC/LDAP).
+
+Two things to keep in mind when editing here:
+
+- `TelemetryManager` has **two** entry points. `ingest(source_id, token, reports)`
+  checks a token; `ingest_authenticated(source_id, reports)` does not and exists
+  for server-side callers that authenticated some other way (the webhook
+  receiver, the MQTT bridge). Both funnel into `_accept`, so they cannot drift.
+  Never expose `ingest_authenticated` to a route.
+- An adapter's `MEDIA_TYPES` decides what `adapter_for_media_type` hands it on
+  the shared feed endpoint. `ingest/webhook.py` deliberately declares **none** —
+  it once claimed `application/json` and silently hijacked every native JSON
+  batch. There is a regression test for exactly that.
+
 ## Project layout
 
 See `README.md`'s "Project layout" section for the full per-module table

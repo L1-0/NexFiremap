@@ -60,6 +60,52 @@ the administrator credential is lost, stop the server, set a new strong
 at startup without deleting incident data. Record the emergency change in the
 incident log and replace any shared credential immediately.
 
+### Sign-in fallback order when an identity provider is configured
+
+If OIDC or LDAP is configured (`NEXFIREMAP_OIDC_ISSUER`, `NEXFIREMAP_LDAP_HOST`),
+sign-in is attempted in this order, and **local accounts are always tried first**:
+
+1. **Local account** - the `admin` password from `NEXFIREMAP_ADMIN_PASSWORD`, plus
+   any named local accounts.
+2. **LDAP** - only if the local check fails and a directory is configured.
+3. **OIDC** - a separate button on the login screen, not part of the password flow.
+
+This ordering is deliberate and must not be changed. An incident LAN's identity
+provider is frequently on the far side of the WAN link that has just failed,
+which is exactly when the map matters most. **Configuring OIDC or LDAP never
+disables local password login**, so the local `admin` credential remains the
+break-glass path: if the directory or the IdP is unreachable, sign in locally
+and continue. `GET /api/auth/providers` reports which methods this install
+offers.
+
+Note for security review: the OIDC flow does **not** verify ID-token signatures
+locally. It uses the authorization-code flow with PKCE and reads claims from the
+provider's token and userinfo endpoints directly over TLS, which OIDC Core
+§3.1.3.7 permits for exactly this case. The consequence is that **the provider's
+TLS certificate is the entire trust anchor** - so an `https://` issuer is
+required (loopback excepted for testing) and certificate verification is never
+relaxed.
+
+### Unauthenticated ingest surfaces
+
+Three endpoints deliberately sit outside the session gate because the senders are
+machines with no browser session. Each has its own credential, and none of them
+can read anything:
+
+| Surface | Credential | Notes |
+|---|---|---|
+| `POST /api/feeds/positions/{id}` | `X-Feed-Token` | JSON, CoT XML or NMEA, selected by `Content-Type` |
+| `GET\|POST .../{id}/osmand` | `X-Feed-Token` or `?token=` | OsmAnd/Traccar hardware cannot set headers |
+| `POST /api/ingest/webhook/{id}` | `X-Webhook-Token` or `?token=` | CAD/dispatch deliveries |
+
+The CoT/MAVLink gateway (`NEXFIREMAP_COT_ENABLED`) is different and needs care:
+**CoT over UDP carries no authentication at all**, and MAVLink v2 signing is not
+verified. It is therefore off by default, binds loopback unless
+`NEXFIREMAP_COT_HOST` says otherwise, and accepts packets only from the CIDR list
+in `NEXFIREMAP_COT_ALLOW` - which defaults to loopback and falls back to loopback
+if every entry is malformed. Do not expose that port to anything but a
+physically controlled incident LAN, and never to the internet.
+
 For database failure, stop NexFiremap and use **Create recovery database** from
 the newest verified backup on another machine. Preserve the failed database and
 its WAL/SHM files for investigation. Never overwrite the only copy. Migration

@@ -563,15 +563,18 @@ def detect_events(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
 # ---------------------------------------------------- spread-over-time contours
 
 
-# Maximum number of cumulative time bands - matches the 5-stop --time-1..5
-# LUT in app.css (validated purple->red->orange->yellow->grey ramp - see
-# that file's comment for the color-accessibility work behind it). A
-# genuine upper bound, not a fixed count: spread_topology only ever
-# produces one band per distinct satellite overpass actually present (see
-# _group_into_passes), so a sparse 2-3-pass fire returns 2-3 bands, not 5
-# padded-out duplicates - but whichever bands exist are spread across this
-# full 0-4 color range, never bunched at one end.
-SPREAD_TOPOLOGY_BANDS = 5
+# Maximum number of cumulative time bands. Raised from 5 to 10 so the
+# rendered rings are as fine-grained as the source passes allow, matching
+# a reference nested-ring fire-progression image - the app.js renderer no
+# longer snaps each band to one of --time-1..5's 5 fixed LUT stops (see
+# app.css's --time-* comment); it interpolates continuously between them
+# via each band's band_fraction, so this constant is free to be any size
+# without needing a matching number of CSS stops. A genuine upper bound,
+# not a fixed count: spread_topology only ever produces one band per
+# distinct satellite overpass actually present (see _group_into_passes),
+# so a sparse 2-3-pass fire returns 2-3 bands, not 10 padded-out
+# duplicates.
+SPREAD_TOPOLOGY_BANDS = 10
 
 # Detections from the same satellite overpass over a small AOI land within
 # a couple of minutes of each other; the next overpass (same or a
@@ -704,10 +707,18 @@ def spread_topology(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     band's chosen pass), so band i's raster is a superset of band i-1's by
     construction - the nesting is geometrically guaranteed, not just a
     drawing-order convention. Fewer than SPREAD_TOPOLOGY_BANDS distinct
-    passes means fewer bands, not padded-out duplicates - and whatever
-    bands do exist are spread across the *full* 0-4 LUT range (color_index
-    below), not bunched at the ramp's early end, so a sparse 2-3-pass fire
-    still reads across the whole purple-to-grey ramp.
+    passes means fewer bands, not padded-out duplicates.
+
+    Each feature carries both ``band_index`` (its plain 0-based slot
+    among the bands actually produced this run - a stable sort key for
+    draw order, nothing more) and ``band_fraction`` (that same slot
+    rescaled to 0..1 across whatever band count this run produced, 0 =
+    earliest, 1 = latest). The renderer colors by ``band_fraction``
+    through timeSpreadColor()'s continuous interpolation across the
+    --time-1..5 stops, not by snapping ``band_index`` onto a fixed LUT -
+    so a sparse 2-3-band fire still spans the ramp's full earliest-to-
+    latest range instead of bunching at one end, without this function
+    needing to know how many CSS stops exist on the other side.
     """
     bbox = tuple(params["bbox"])  # west, south, east, north
     start_ts = int(params["start_ts"])
@@ -737,11 +748,15 @@ def spread_topology(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
 
         features: list[dict[str, Any]] = []
         for slot, pass_idx in enumerate(selected_indices):
-            # Rescale this band's position among the n_bands actually
-            # produced onto the fixed 0..SPREAD_TOPOLOGY_BANDS-1 LUT range,
-            # so e.g. 3 bands land on indices 0/2/4 (spread across the full
-            # ramp) rather than 0/1/2 (bunched at the purple end).
-            color_index = round(slot * (SPREAD_TOPOLOGY_BANDS - 1) / max(1, n_bands - 1))
+            # band_fraction is this slot's position across whatever band
+            # count this run actually produced, 0 (earliest) .. 1 (latest)
+            # - continuous, not a LUT index, so the renderer's
+            # timeSpreadColor() can interpolate across the full ramp
+            # regardless of n_bands, and a sparse 2-3-band fire spans the
+            # whole earliest-to-latest range rather than bunching at one
+            # end. band_index is just this slot's plain position, kept as
+            # a stable draw-order sort key (see renderSpreadTopologyLayer).
+            band_fraction = slot / max(1, n_bands - 1)
             cutoff_ts = passes[pass_idx][-1]["ts"]  # latest detection in this pass
             band_rows = [r for r in rows if r["ts"] <= cutoff_ts]
             raster = _spread_density_raster(band_rows, geom)
@@ -752,7 +767,8 @@ def spread_topology(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
                         "type": "Feature",
                         "geometry": {"type": "Polygon", "coordinates": [ring]},
                         "properties": {
-                            "band_index": color_index,
+                            "band_index": slot,
+                            "band_fraction": band_fraction,
                             "cutoff_ts": int(cutoff_ts),
                             "detection_count": len(band_rows),
                         },

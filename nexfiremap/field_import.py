@@ -41,7 +41,10 @@ from .operations import (
 
 
 MAX_SOURCE_BYTES = 20 * 1024 * 1024
-SUPPORTED_FORMATS = {"geojson", "gpx", "kml", "kmz", "gpkg", "csv"}
+# "shp" is a zipped .shp/.dbf/.prj bundle - the three files are useless apart,
+# so the archive is the unit of import. Parsed by `ingest/shapefile.py`, which
+# also refuses any CRS it cannot transform exactly rather than mis-plotting it.
+SUPPORTED_FORMATS = {"geojson", "gpx", "kml", "kmz", "gpkg", "csv", "shp"}
 
 
 class FieldImportError(OperationsError):
@@ -294,6 +297,28 @@ def _parse_gpkg(raw: bytes) -> list[tuple[dict[str, Any], dict[str, Any]]]:
         finally: conn.close()
 
 
+def _parse_shapefile(raw: bytes, request: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Bridge to `ingest/shapefile.py`, translating its error type.
+
+    The adapter lives in `nexfiremap.ingest` (stateless, no database, shared
+    with the other transports) while the error a caller sees has to be a
+    `FieldImportError` like every other format's, so the two-line translation
+    happens here rather than making the adapter import this module.
+
+    ``assume_wgs84`` is passed through deliberately: a bundle with no .prj has
+    an unknown CRS, and the operator has to state the assumption rather than
+    have the importer guess - guessing wrong on a UTM export is a 5000 km
+    error, not a rounding one.
+    """
+    from .ingest import IngestError
+    from .ingest import shapefile as shapefile_adapter
+
+    try:
+        return shapefile_adapter.parse(raw, assume_wgs84=bool(request.get("assume_wgs84")))
+    except IngestError as exc:
+        raise FieldImportError(str(exc)) from exc
+
+
 class FieldImportManager:
     """Two-phase import: ``prepare`` parses and reports without writing,
     ``apply`` re-parses and commits - see module docstring for why it's
@@ -310,8 +335,13 @@ class FieldImportManager:
         actually name a GeoJSON export."""
         value = requested.lower().strip() if requested else Path(filename).suffix.lower().lstrip(".")
         if value == "json": value = "geojson"
+        # A zipped shapefile bundle is normally named ".zip"; treat that as
+        # "shp" since it is the only archive format this importer accepts
+        # besides KMZ, which has its own extension.
+        if value == "zip": value = "shp"
         if value not in SUPPORTED_FORMATS:
-            raise FieldImportError("supported field import formats are GeoJSON, GPX, KML, KMZ, GeoPackage and CSV")
+            raise FieldImportError(
+                "supported field import formats are GeoJSON, GPX, KML, KMZ, GeoPackage, CSV and zipped Shapefile")
         return value
 
     @staticmethod
@@ -394,10 +424,17 @@ class FieldImportManager:
             raise FieldImportError(f"source file must be between 1 byte and {MAX_SOURCE_BYTES} bytes")
         mapping = request.get("mapping") if isinstance(request.get("mapping"), dict) else {}
         fmt = self._format(filename, str(request.get("format") or ""))
-        try: content = self._kmz_text(raw) if fmt == "kmz" else "" if fmt == "gpkg" else raw.decode("utf-8")
+        # gpkg and shp are binary containers - there is no text form of them
+        # to decode, so the decode is skipped rather than attempted and caught.
+        binary = fmt in {"gpkg", "shp"}
+        try: content = self._kmz_text(raw) if fmt == "kmz" else "" if binary else raw.decode("utf-8")
         except UnicodeDecodeError as exc: raise FieldImportError("source text must be UTF-8") from exc
         parsed = {"geojson": _parse_geojson, "gpx": _parse_gpx, "kml": _parse_kml}.get(fmt)
-        items = _parse_csv(content, mapping) if fmt == "csv" else _parse_kml(content) if fmt == "kmz" else _parse_gpkg(raw) if fmt == "gpkg" else parsed(content)
+        items = (_parse_csv(content, mapping) if fmt == "csv"
+                 else _parse_kml(content) if fmt == "kmz"
+                 else _parse_gpkg(raw) if fmt == "gpkg"
+                 else _parse_shapefile(raw, request) if fmt == "shp"
+                 else parsed(content))
         if len(items) > 10_000: raise FieldImportError("source contains more than 10,000 features")
         bbox = request.get("aoi_bbox")
         if not isinstance(bbox, list) or len(bbox) != 4:

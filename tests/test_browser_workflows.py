@@ -38,7 +38,18 @@ def free_port() -> int:
         sock.bind(("127.0.0.1", 0)); return int(sock.getsockname()[1])
 
 
-def wait_url(url: str, timeout: float = 20) -> bytes:
+def wait_url(url: str, timeout: float = 90) -> bytes:
+    """Poll a URL until it answers.
+
+    The default is generous because the thing being waited on is a cold
+    `run.py` start, and importing the optional analysis stack (rasterio,
+    skyfield, scipy, matplotlib, h5py) dominates it - measured at 15-25s on an
+    ordinary Windows dev machine before the app serves its first request, plus
+    job-worker spawn on top. A 20s budget passed or failed essentially at
+    random depending on the filesystem cache. This test is about browser
+    workflows, not startup latency, so the wait is sized not to be the thing
+    under test.
+    """
     deadline = time.time() + timeout; last: Exception | None = None
     while time.time() < deadline:
         try:

@@ -15,7 +15,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import httpx
 
@@ -29,18 +29,32 @@ log = logging.getLogger("nexfiremap.tiles")
 _ALL_LAYERS = {layer["id"]: layer for layer in [*BASEMAPS, *OVERLAYS, TERRAIN_DEM]}
 
 
-def _tile_extensions() -> set[str]:
+def _tile_extensions(registry: Any = None) -> set[str]:
     """Every file extension a cached tile can actually be written with,
     driven by each layer's own ``tile_ext`` (basemaps.py) instead of
     hardcoded - so TTL expiry, LRU eviction, and /api/status's size stats
     all cover a future basemap added with a new format automatically,
     rather than needing a matching change here (esri-terrain's .jpg tiles
-    used to fall outside all three because this was hardcoded to "*.png")."""
-    return {meta.get("tile_ext", "png") for meta in _ALL_LAYERS.values()}
+    used to fall outside all three because this was hardcoded to "*.png").
+
+    Operator-added layers (`layers.LayerRegistry`) are folded in for exactly
+    the same reason: a custom WMS layer serving JPEG would otherwise be
+    invisible to all three - never expiring, never evicted, and never counted
+    against the cache's size budget."""
+    extensions = {meta.get("tile_ext", "png") for meta in _ALL_LAYERS.values()}
+    if registry is not None:
+        try:
+            extensions |= registry.tile_extensions()
+        except Exception:  # pragma: no cover - upkeep must not fail on a bad row
+            # Prune/stats run on a background timer; a registry read failing
+            # here should degrade to "built-in extensions only" rather than
+            # killing the loop that keeps the cache inside its budget.
+            log.warning("Could not read custom layer extensions", exc_info=True)
+    return extensions
 
 
-def _iter_tile_files(root: Path) -> Iterator[Path]:
-    for ext in _tile_extensions():
+def _iter_tile_files(root: Path, registry: Any = None) -> Iterator[Path]:
+    for ext in _tile_extensions(registry):
         yield from root.rglob(f"*.{ext}")
 
 # Served when a tile can't be fetched and nothing stale is on disk, so a
@@ -66,8 +80,12 @@ class TileCache:
     background timer to keep the cache within its configured TTL/size
     budget without blocking tile requests."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, registry: Any = None) -> None:
         self.settings = settings
+        # Optional so the many places that build a bare TileCache (tests, the
+        # map-pack tooling) keep working unchanged; `lifespan()` sets it, and
+        # with it unset the cache simply knows about the built-in layers only.
+        self.registry = registry
         self.dir = settings.tile_cache_dir
         self.dir.mkdir(parents=True, exist_ok=True)
         self._client = httpx.AsyncClient(
@@ -88,8 +106,17 @@ class TileCache:
         self._pin_cache: set[Path] = set()
 
     def layer(self, layer_id: str) -> dict | None:
-        """Layer metadata by id, or ``None`` for an unknown/removed layer."""
-        return _ALL_LAYERS.get(layer_id)
+        """Layer metadata by id, or ``None`` for an unknown/removed layer.
+
+        Built-ins are checked first so a registry row can never shadow a
+        stock basemap id and silently redirect it somewhere else. Everything
+        downstream - `path_for`, `get`, the tile route, map packs - goes
+        through this one lookup, which is what lets an operator-added WMS
+        layer be cached and packaged by the same code as OpenStreetMap."""
+        found = _ALL_LAYERS.get(layer_id)
+        if found is not None or self.registry is None:
+            return found
+        return self.registry.layer(layer_id)
 
     def path_for(self, layer_id: str, z: int, x: int, y: int) -> Path:
         """On-disk path for one tile - layer/z/x/y.ext, mirroring the usual
@@ -164,15 +191,20 @@ class TileCache:
         """Fetch one tile from upstream; ``None`` on any network/HTTP
         failure so the caller can fall back to a stale copy instead of the
         request failing outright."""
-        subdomains = meta.get("subdomains") or "a"
-        url = (
-            meta["url"]
-            .replace("{s}", subdomains[0])
-            .replace("{z}", str(z))
-            .replace("{x}", str(x))
-            .replace("{y}", str(y))
-            .replace("{r}", "")  # retina-suffix placeholder some providers use ("@2x") - always blank, standard-density only
-        )
+        if meta.get("kind") == "wms":
+            url = self._wms_url(meta, z, x, y)
+            if url is None:
+                return None
+        else:
+            subdomains = meta.get("subdomains") or "a"
+            url = (
+                meta["url"]
+                .replace("{s}", subdomains[0])
+                .replace("{z}", str(z))
+                .replace("{x}", str(x))
+                .replace("{y}", str(y))
+                .replace("{r}", "")  # retina-suffix placeholder some providers use ("@2x") - always blank, standard-density only
+            )
         async with self._sem:
             try:
                 response = await self._client.get(url)
@@ -182,7 +214,39 @@ class TileCache:
         if response.status_code != 200:
             log.warning("Tile fetch HTTP %d: %s", response.status_code, url)
             return None
+        # A misconfigured WMS answers an invalid request with its *error
+        # document* under HTTP 200 (application/vnd.ogc.se_xml). Caching that
+        # as though it were an image poisons the layer for the whole TTL and
+        # shows the user a broken-image icon with no clue why, so the
+        # content-type is checked before the bytes are allowed to be written.
+        # Only WMS needs this: an XYZ provider signals failure with a status
+        # code, which is already handled above.
+        if meta.get("kind") == "wms":
+            content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+            if not content_type.startswith("image/"):
+                log.warning("WMS returned %s instead of an image: %s", content_type or "no content-type", url)
+                return None
         return response.content
+
+    def _wms_url(self, meta: dict, z: int, x: int, y: int) -> str | None:
+        """Build the GetMap request for one tile via `LayerRegistry`.
+
+        The registry owns the URL construction (axis order, version-specific
+        CRS/SRS spelling, preserved endpoint query parameters) because it also
+        owns the stored definition; this method only bridges the tile
+        coordinates across and turns a missing/deleted row into a normal
+        fetch failure rather than an exception on the tile hot path.
+        """
+        if self.registry is None:
+            return None
+        record = self.registry.get(meta["id"])
+        if record is None or not record.get("active"):
+            return None
+        try:
+            return self.registry.getmap_url(record, z, x, y)
+        except Exception:  # pragma: no cover - defensive on the hot path
+            log.warning("Could not build a WMS request for %r", meta.get("id"), exc_info=True)
+            return None
 
     @staticmethod
     def _write(path: Path, data: bytes) -> None:
@@ -234,7 +298,7 @@ class TileCache:
         total = 0
         removed_expired = 0
         pinned_bytes = 0
-        for path in _iter_tile_files(self.dir):
+        for path in _iter_tile_files(self.dir, self.registry):
             try:
                 stat = path.stat()
             except OSError:
@@ -321,7 +385,7 @@ class TileCache:
         """Point-in-time cache size/hit-rate summary for the status endpoint."""
         total_bytes = 0
         total_files = 0
-        for path in _iter_tile_files(self.dir):
+        for path in _iter_tile_files(self.dir, self.registry):
             try:
                 total_bytes += path.stat().st_size
                 total_files += 1

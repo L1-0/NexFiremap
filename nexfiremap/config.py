@@ -7,6 +7,7 @@ key, which you have to request yourself (see README).
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +57,60 @@ DEFAULT_SOURCES = [
     "VIIRS_SNPP_NRT",
     "MODIS_NRT",
 ]
+
+
+# Named CAP (Common Alerting Protocol) warning feeds, so an operator can write
+# NEXFIREMAP_CAP_FEEDS=dwd,mowas instead of pasting URLs. Both target audiences
+# are covered; the values are the publishers' own public endpoints.
+#
+# Nothing here is enabled by default. Polling a foreign government's warning
+# service is an outbound connection an install should opt into deliberately,
+# and an install with no configured feeds creates no HTTP client and starts no
+# poll task at all (see alerts.AlertManager.start).
+CAP_PRESETS: dict[str, dict[str, str]] = {
+    "dwd": {
+        "label": "DWD severe weather (Germany)",
+        "url": "https://opendata.dwd.de/weather/alerts/cap/COMMUNEUNION_DWD_STAT/Z_CAP_C_EDZW_LATEST_PVW_STATUS_PREMIUMDWD_COMMUNEUNION_DE.zip",
+    },
+    "mowas": {
+        "label": "MoWaS / NINA civil protection (Germany)",
+        "url": "https://warnung.bund.de/api31/mowas/mapData.json",
+    },
+    "nws": {
+        "label": "NWS active alerts (United States)",
+        "url": "https://api.weather.gov/alerts/active",
+    },
+    "ipaws": {
+        "label": "IPAWS public alerts (United States)",
+        "url": "https://apps.fema.gov/IPAWSOPEN_EAS_SERVICE/rest/public/recent",
+    },
+}
+
+
+def _env_cap_feeds(name: str) -> list[str]:
+    """Resolve a comma-separated list of CAP preset names and/or raw URLs.
+
+    Accepting both means the common case is a short word and the uncommon case
+    (a Land- or county-level feed nobody can preset) is still possible without
+    a code change. An unknown entry that is not a URL is dropped with a warning
+    rather than failing startup - the same reasoning as every other `_env_*`
+    helper here: a typo in `.env` should degrade one feature, not prevent the
+    server from starting during an incident.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return []
+    feeds: list[str] = []
+    for item in (part.strip() for part in raw.split(",") if part.strip()):
+        if item.startswith(("http://", "https://")):
+            feeds.append(item)
+        elif item.lower() in CAP_PRESETS:
+            feeds.append(CAP_PRESETS[item.lower()]["url"])
+        else:
+            logging.getLogger("nexfiremap.config").warning(
+                "Unknown CAP feed %r - expected a URL or one of: %s",
+                item, ", ".join(sorted(CAP_PRESETS)))
+    return feeds
 
 
 def _load_dotenv(path: Path) -> None:
@@ -228,6 +283,84 @@ class Settings:
     tls_cert_file: Path | None = None
     tls_key_file: Path | None = None
 
+    # --- MQTT telemetry bridge (optional) ---------------------------------
+    # Subscribes to a broker for position telemetry. Needs the optional
+    # `aiomqtt` dependency; without it the bridge reports itself unavailable
+    # and the server starts unchanged (see mqtt.py). `mqtt_topics` is a
+    # comma-separated "topic=source_id:format[:callsign]" table, where format
+    # is one of json/cot/nmea/mavlink - the same adapters the HTTP feed uses.
+    mqtt_url: str = ""
+    mqtt_username: str = ""
+    mqtt_password: str = ""
+    mqtt_client_id: str = ""
+    mqtt_topics: str = ""
+
+    # --- external identity (optional) -------------------------------------
+    # OIDC and LDAP only ever mint the *existing* local session; nothing
+    # downstream knows the difference. Both are off unless configured, and
+    # neither disables local password login - an incident LAN's identity
+    # provider may be on the far side of the WAN link that just failed, so the
+    # local admin password stays as documented break-glass. See federation.py
+    # and docs/INCIDENT_LAN_RUNBOOK.md.
+    oidc_issuer: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    oidc_redirect_uri: str = "http://127.0.0.1:8000/auth/oidc/callback"
+    oidc_scopes: str = "openid profile email"
+    oidc_username_claim: str = "preferred_username"
+    oidc_role_claim: str = "groups"
+    oidc_role_map: str = ""
+    oidc_default_role: str = "viewer"
+
+    ldap_host: str = ""
+    ldap_port: int = 636
+    ldap_use_tls: bool = True
+    # e.g. "uid={username},ou=people,dc=example,dc=de"
+    ldap_user_dn_template: str = ""
+    ldap_role_map: str = ""
+    ldap_default_role: str = "viewer"
+
+    # --- CoT / TAK gateway (optional, off by default) ---------------------
+    # A streaming listener for Cursor on Target (ATAK/WinTAK/TAK Server) and
+    # MAVLink drone telemetry. OFF unless `cot_enabled` is set, and bound to
+    # loopback unless `cot_host` says otherwise, because neither protocol
+    # authenticates its sender: CoT over UDP carries no token and MAVLink v2
+    # signing is not verified. The `cot_allow` CIDR list is the actual access
+    # control, and it defaults to loopback only - a typo there narrows access
+    # rather than widening it. See cot_gateway.py's docstring and
+    # docs/INCIDENT_LAN_RUNBOOK.md.
+    cot_enabled: bool = False
+    cot_host: str = "127.0.0.1"
+    cot_tcp_port: int = 8087
+    cot_udp_port: int = 6969
+    cot_mavlink_port: int = 0  # 0 disables the MAVLink listener
+    cot_mavlink_callsign: str = "drone"
+    cot_allow: str = ""
+    cot_packets_per_minute: int = 600
+    # Which position feed inbound CoT is credited to, and its ingest token.
+    # Without both, the gateway refuses to listen at all - there would be
+    # nowhere for a position to go.
+    cot_source_id: str = ""
+    cot_source_token: str = ""
+    # Incident that inbound markers/drawings become tactical features on.
+    # Empty means positions only, which is the safer default: an unauthenticated
+    # peer should not be able to draw on an incident unless asked for.
+    cot_incident_id: str = ""
+    cot_accept_features: bool = False
+
+    # Which tactical symbol set products and the map render with. See
+    # symbology.py; the default matches what the frontend already stamps on
+    # every feature, so existing records keep their meaning.
+    symbology_profile: str = "simplified_multinational"
+
+    # --- CAP public warning feeds (optional) ------------------------------
+    # Official alerts (MoWaS/NINA, DWD, IPAWS/NWS) drawn on the same map as
+    # the fire picture. Empty by default: polling a government warning service
+    # is an outbound connection an install opts into, and with no feeds
+    # configured AlertManager creates no client and starts no task.
+    cap_feeds: list[str] = field(default_factory=list)
+    cap_poll_minutes: int = 10
+
     # --- EUMETSAT (optional European corroboration source) ----------------
     # Consumer key/secret only - see nexfiremap/eumetsat.py's module
     # docstring for why an access token isn't stored directly (it's
@@ -346,6 +479,41 @@ def load_settings() -> Settings:
         if os.environ.get("NEXFIREMAP_TLS_CERT_FILE", "").strip() else None,
         tls_key_file=Path(os.environ["NEXFIREMAP_TLS_KEY_FILE"]).expanduser()
         if os.environ.get("NEXFIREMAP_TLS_KEY_FILE", "").strip() else None,
+        mqtt_url=_env_str("NEXFIREMAP_MQTT_URL", ""),
+        mqtt_username=_env_str("NEXFIREMAP_MQTT_USERNAME", ""),
+        mqtt_password=_env_str("NEXFIREMAP_MQTT_PASSWORD", ""),
+        mqtt_client_id=_env_str("NEXFIREMAP_MQTT_CLIENT_ID", ""),
+        mqtt_topics=_env_str("NEXFIREMAP_MQTT_TOPICS", ""),
+        oidc_issuer=_env_str("NEXFIREMAP_OIDC_ISSUER", ""),
+        oidc_client_id=_env_str("NEXFIREMAP_OIDC_CLIENT_ID", ""),
+        oidc_client_secret=_env_str("NEXFIREMAP_OIDC_CLIENT_SECRET", ""),
+        oidc_redirect_uri=_env_str("NEXFIREMAP_OIDC_REDIRECT_URI", "http://127.0.0.1:8000/auth/oidc/callback"),
+        oidc_scopes=_env_str("NEXFIREMAP_OIDC_SCOPES", "openid profile email"),
+        oidc_username_claim=_env_str("NEXFIREMAP_OIDC_USERNAME_CLAIM", "preferred_username"),
+        oidc_role_claim=_env_str("NEXFIREMAP_OIDC_ROLE_CLAIM", "groups"),
+        oidc_role_map=_env_str("NEXFIREMAP_OIDC_ROLE_MAP", ""),
+        oidc_default_role=_env_str("NEXFIREMAP_OIDC_DEFAULT_ROLE", "viewer"),
+        ldap_host=_env_str("NEXFIREMAP_LDAP_HOST", ""),
+        ldap_port=_env_int("NEXFIREMAP_LDAP_PORT", 636, low=1, high=65535),
+        ldap_use_tls=_env_bool("NEXFIREMAP_LDAP_USE_TLS", True),
+        ldap_user_dn_template=_env_str("NEXFIREMAP_LDAP_USER_DN_TEMPLATE", ""),
+        ldap_role_map=_env_str("NEXFIREMAP_LDAP_ROLE_MAP", ""),
+        ldap_default_role=_env_str("NEXFIREMAP_LDAP_DEFAULT_ROLE", "viewer"),
+        cot_enabled=_env_bool("NEXFIREMAP_COT_ENABLED", False),
+        cot_host=_env_str("NEXFIREMAP_COT_HOST", "127.0.0.1"),
+        cot_tcp_port=_env_int("NEXFIREMAP_COT_TCP_PORT", 8087, low=0, high=65535),
+        cot_udp_port=_env_int("NEXFIREMAP_COT_UDP_PORT", 6969, low=0, high=65535),
+        cot_mavlink_port=_env_int("NEXFIREMAP_COT_MAVLINK_PORT", 0, low=0, high=65535),
+        cot_mavlink_callsign=_env_str("NEXFIREMAP_COT_MAVLINK_CALLSIGN", "drone"),
+        cot_allow=_env_str("NEXFIREMAP_COT_ALLOW", ""),
+        cot_packets_per_minute=_env_int("NEXFIREMAP_COT_PACKETS_PER_MINUTE", 600, low=1, high=100000),
+        cot_source_id=_env_str("NEXFIREMAP_COT_SOURCE_ID", ""),
+        cot_source_token=_env_str("NEXFIREMAP_COT_SOURCE_TOKEN", ""),
+        cot_incident_id=_env_str("NEXFIREMAP_COT_INCIDENT_ID", ""),
+        cot_accept_features=_env_bool("NEXFIREMAP_COT_ACCEPT_FEATURES", False),
+        symbology_profile=_env_str("NEXFIREMAP_SYMBOLOGY_PROFILE", "simplified_multinational"),
+        cap_feeds=_env_cap_feeds("NEXFIREMAP_CAP_FEEDS"),
+        cap_poll_minutes=_env_int("NEXFIREMAP_CAP_POLL_MINUTES", 10, low=1, high=1440),
         eumetsat_consumer_key=_env_str("EUMETSAT_CONSUMER_KEY", ""),
         eumetsat_consumer_secret=_env_str("EUMETSAT_CONSUMER_SECRET", ""),
     )

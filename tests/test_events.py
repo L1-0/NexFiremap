@@ -341,10 +341,13 @@ def test_spread_topology_job() -> None:
         check("at least one contour ring produced", len(geo["features"]) > 0, str(geo))
 
         band_indices = sorted({f["properties"]["band_index"] for f in geo["features"]})
+        check("band_index is the plain 0-based slot order, not a rescaled LUT index", band_indices == [0, 1], str(band_indices))
+
+        band_fractions = sorted({f["properties"]["band_fraction"] for f in geo["features"]})
         check(
-            "two-band case spreads across the full 0-4 ramp, not bunched at one end",
-            band_indices == [0, 4],
-            str(band_indices),
+            "two-band case's band_fraction spans the full earliest(0)-to-latest(1) range, not bunched at one end",
+            band_fractions == [0.0, 1.0],
+            str(band_fractions),
         )
 
         west, south, east, north = bbox
@@ -362,7 +365,7 @@ def test_spread_topology_job() -> None:
         counts_by_band = {f["properties"]["band_index"]: f["properties"]["detection_count"] for f in geo["features"]}
         check(
             "later band's cumulative detection_count is >= earlier band's",
-            counts_by_band[4] >= counts_by_band[0],
+            counts_by_band[1] >= counts_by_band[0],
             str(counts_by_band),
         )
 

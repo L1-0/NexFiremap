@@ -461,12 +461,29 @@ def isochrone_contours(
     hours: tuple[float, ...] = ISOCHRONE_HOURS,
     max_ros_m_min: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
-    """GeoJSON LineString contours of ``travel_time_s`` at each hour mark in
-    ``hours`` that's actually reached within the (barrier-excluded) grid -
-    marching-squares isolines, same technique as ``likelihood.
-    probability_envelopes`` but on arrival time rather than probability
-    mass. Hours beyond what the grid's own 99th-percentile travel time
-    covers are skipped rather than drawn as an empty or degenerate contour."""
+    """GeoJSON contours of ``travel_time_s`` at each hour mark in ``hours``
+    that's actually reached within the (barrier-excluded) grid - marching-
+    squares isolines, same technique as ``likelihood.probability_envelopes``
+    but on arrival time rather than probability mass. Hours beyond what the
+    grid's own 99th-percentile travel time covers are skipped rather than
+    drawn as an empty or degenerate contour.
+
+    Each level produces two features from the *same* underlying rings:
+    the original open LineString (unchanged, so every existing/cached
+    caller keeps working) and a closed Polygon (``properties.kind ==
+    "fill"``) of the "already reached by this hour" region
+    (``travel_time_s <= level``) - closed the same naive way
+    ``events._contour_band`` closes spread_topology's bands (append the
+    first point back onto the end), which is a fine approximation here
+    for the same reason it's fine there: a travel-time field's level set
+    is one boundary per connected region, same shape either way. Isochrone
+    regions nest cumulatively (hour 3's reached-area is a superset of hour
+    1's) exactly like spread_topology's bands, so the frontend paints them
+    with the identical latest-first/opaque technique for the two "spread
+    over time" surfaces to read consistently - see app.js's
+    drawIsochrones. Old cached job results predate the fill polygons and
+    simply have no ``kind: "fill"`` features; the renderer falls back to
+    its original line-only styling for those."""
     west, south, east, north = geom["bbox"]
     nx, ny = geom["nx"], geom["ny"]
     features = []
@@ -507,6 +524,14 @@ def isochrone_contours(
                     "type": "Feature",
                     "geometry": {"type": "LineString", "coordinates": coords},
                     "properties": {"hours": hrs},
+                }
+            )
+            fill_coords = coords if coords[0] == coords[-1] else [*coords, coords[0]]
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "Polygon", "coordinates": [fill_coords]},
+                    "properties": {"hours": hrs, "kind": "fill"},
                 }
             )
     return features
@@ -613,7 +638,12 @@ def run_propagation(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         "weather": {k: v for k, v in weather.items() if not k.startswith("hourly_")},
         "dead_fuel_moisture": {"1h": round(float(moisture[0]), 3), "10h": round(float(moisture[1]), 3), "100h": round(float(moisture[2]), 3)},
         "typical_max_travel_hours": typical_max_hours,
-        "isochrone_count": len(isochrones),
+        # Distinct hour levels actually drawn, not the raw feature count -
+        # isochrone_contours now emits two features (line + fill) per
+        # contour ring, and a single hour level can already split into
+        # several disjoint rings for a non-convex front, so counting
+        # features was never quite "how many hour cutoffs" either; this is.
+        "isochrone_count": len({f["properties"]["hours"] for f in isochrones}),
         "ignition_points": len(det_rows),
         "files": {
             "spread_time": "spread_time.png",
