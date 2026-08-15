@@ -20,6 +20,27 @@ import { registerTool, setTool } from "./tools.js";
   // import, a merged package from another installation).
   const escapeHtml = (value) =>
     String(value ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+  /** A timestamp rendered in the reader's local zone, *with the zone named*.
+   *
+   * This panel used bare `toLocaleString()` while the detections panel beside
+   * it labels everything "UTC" explicitly. Two columns of times, one labelled
+   * and one not, is how an operator misjudges a detection's age by exactly one
+   * UTC offset - and during an incident that error is silent, plausible, and
+   * points the wrong way half the time. Naming the zone costs one option.
+   *
+   * Note this is the *browser's* zone, not the incident's `timezone` field.
+   * That field is stored and editable but is not yet applied anywhere; showing
+   * which zone these times are actually in is the honest half of that, and it
+   * is the half that prevents the misreading.
+   * @param {string|number|Date} value - Anything Date accepts.
+   * @returns {string} e.g. "15/08/2026, 16:20:00 GMT+2", or "" if unparseable. */
+  function localTime(value) {
+    if (value === null || value === undefined || value === "") return "";
+    const when = new Date(value);
+    if (Number.isNaN(when.getTime())) return String(value);
+    return when.toLocaleString(undefined, { timeZoneName: "short" });
+  }
   const state = {
     map: null, meta: null, incidents: [], workspace: null,
     incidentId: "", periodId: "", scenarioId: "",
@@ -206,7 +227,7 @@ import { registerTool, setTool } from "./tools.js";
       const row = document.createElement("a"); row.className = "ops-resource-row";
       row.href = `/api/public/products/${product.id}/download`;
       row.innerHTML = `<strong>${escapeHtml(product.incident_name)}</strong><span>${escapeHtml(product.product_type)}</span>` +
-        `<small>${escapeHtml(product.filename)} · ${(product.size_bytes / 1024).toFixed(1)} KB · ${new Date(product.created_at).toLocaleString()}</small>`;
+        `<small>${escapeHtml(product.filename)} · ${(product.size_bytes / 1024).toFixed(1)} KB · ${localTime(product.created_at)}</small>`;
       list.append(row);
     });
     if (!products.length) list.textContent = "No public-information product has been released.";
@@ -290,7 +311,7 @@ import { registerTool, setTool } from "./tools.js";
       state.map.setView([incident.center_lat, incident.center_lon], Math.max(state.map.getZoom(), 11));
       sessionStorage.setItem(`nexfiremap.centered.${id}`, "1");
     }
-    setStatus(`${state.workspace.features.features.length} operational objects · last saved ${new Date(incident.updated_at).toLocaleString()}`);
+    setStatus(`${state.workspace.features.features.length} operational objects · last saved ${localTime(incident.updated_at)}`);
   }
 
   function rebuildScenarioSelect() {
@@ -363,7 +384,7 @@ import { registerTool, setTool } from "./tools.js";
       `<dt>Status</dt><dd>${esc(p.status)}</dd>` +
       `${p.responsible_unit ? `<dt>Responsible</dt><dd>${esc(p.responsible_unit)}</dd>` : ""}` +
       `${p.priority ? `<dt>Priority</dt><dd>${esc(p.priority)}</dd>` : ""}` +
-      `<dt>Updated</dt><dd>${esc(new Date(p.updated_at).toLocaleString())}</dd></dl>` +
+      `<dt>Updated</dt><dd>${esc(localTime(p.updated_at))}</dd></dl>` +
       `<button data-ops-edit="${esc(p.id)}">edit</button> <button data-ops-delete="${esc(p.id)}">remove</button></div>`;
   }
 
@@ -1020,11 +1041,11 @@ import { registerTool, setTool } from "./tools.js";
       const p = feature.properties;
       L.circleMarker([feature.geometry.coordinates[1], feature.geometry.coordinates[0]], {
         radius: 8, color: windColour(p.speed_ms), weight: 3, fillOpacity: 0, dashArray: "3 3",
-      }).bindTooltip(`MEASURED · ${p.title || "wind observation"} · ${p.speed_ms.toFixed(1)} m/s from ${Math.round(p.wind_from_deg)}° · ${new Date(p.observed_at).toLocaleString()}`)
+      }).bindTooltip(`MEASURED · ${p.title || "wind observation"} · ${p.speed_ms.toFixed(1)} m/s from ${Math.round(p.wind_from_deg)}° · ${localTime(p.observed_at)}`)
         .addTo(state.windObservationLayer);
     });
     const warnings = result.warnings.length ? ` · WARNING: ${result.warnings.join("; ")}` : "";
-    $("#ops-wind-status").textContent = `${result.method} · ${result.observations.features.length} retained measurement(s) · ${result.vectors.features.length} derived arrow(s) · ${new Date(result.at).toLocaleString()}${warnings}`;
+    $("#ops-wind-status").textContent = `${result.method} · ${result.observations.features.length} retained measurement(s) · ${result.vectors.features.length} derived arrow(s) · ${localTime(result.at)}${warnings}`;
   }
 
   function clearWindMap() {
@@ -1067,7 +1088,7 @@ import { registerTool, setTool } from "./tools.js";
       preview.href = `/api/operations/incidents/${state.incidentId}/drone-missions/${missionId}/assets/${asset.id}/thumbnail`;
       preview.target = "_blank"; preview.rel = "noopener";
       const detail = document.createElement("small");
-      detail.textContent = `${asset.georef_status} · ${asset.width}×${asset.height} · ${new Date(asset.captured_at || asset.created_at).toLocaleString()}`;
+      detail.textContent = `${asset.georef_status} · ${asset.width}×${asset.height} · ${localTime(asset.captured_at || asset.created_at)}`;
       row.append(choice, preview, detail); list.append(row);
     });
     if (!state.droneAssets.length) list.textContent = missionId ? "No retained frames." : "Create or select a mission.";
@@ -1237,7 +1258,7 @@ import { registerTool, setTool } from "./tools.js";
     const current = currentPeriod();
     const starts = current ? new Date(current.ends_at) : new Date();
     const ends = new Date(starts.getTime() + 12 * 3600 * 1000);
-    const name = prompt("Operational period name", `Operational period ${starts.toLocaleString()}`);
+    const name = prompt("Operational period name", `Operational period ${localTime(starts)}`);
     if (!name) return;
     const period = await api(`/api/operations/incidents/${state.incidentId}/periods`, {
       method: "POST", body: { name, starts_at: starts.toISOString(), ends_at: ends.toISOString(), objectives: "" },
@@ -1275,7 +1296,7 @@ import { registerTool, setTool } from "./tools.js";
     if (!state.incidentId) return;
     const snapshots = await api(`/api/operations/incidents/${state.incidentId}/snapshots`);
     snapshots.forEach((snapshot) => {
-      const label = `${snapshot.name} · ${new Date(snapshot.created_at).toLocaleString()}`;
+      const label = `${snapshot.name} · ${localTime(snapshot.created_at)}`;
       left.append(option(snapshot.id, label)); right.append(option(snapshot.id, label));
       product.append(option(snapshot.id, label));
     });
@@ -1309,7 +1330,7 @@ import { registerTool, setTool } from "./tools.js";
       const item = document.createElement("div"); item.className = "ops-resource-row";
       const warnings = row.provenance.warnings || [];
       item.innerHTML = `<strong>${row.model_kind}</strong><span>${row.provenance.is_stale ? "STALE" : "within validity window"}</span>` +
-        `<small>Job ${row.job_id ?? "imported"} · reference ${new Date(row.provenance.reference_at).toLocaleString()}${warnings.length ? `<br>${warnings.join("; ")}` : ""}</small>`;
+        `<small>Job ${row.job_id ?? "imported"} · reference ${localTime(row.provenance.reference_at)}${warnings.length ? `<br>${warnings.join("; ")}` : ""}</small>`;
       if (row.provenance.is_stale || warnings.length) item.classList.add("ops-stale-warning");
       list.append(item);
     });
@@ -1365,7 +1386,7 @@ import { registerTool, setTool } from "./tools.js";
   function printOperationsMap() {
     const incident = state.workspace?.incident;
     const center = state.map.getCenter();
-    const produced = `<span>Produced ${new Date().toLocaleString()} by ${escapeHtml(operator())} · OPERATIONAL</span>`;
+    const produced = `<span>Produced ${localTime()} by ${escapeHtml(operator())} · OPERATIONAL</span>`;
     const mapLine = `<span>Map centre ${center.lat.toFixed(5)}, ${center.lng.toFixed(5)} · zoom ${state.map.getZoom()}</span>`;
     const title = $("#ops-print-title");
     if (incident) {
@@ -1375,7 +1396,7 @@ import { registerTool, setTool } from "./tools.js";
         `<span>${escapeHtml(period?.name || "No operational period")}</span>` +
         `<span>${scenario ? `${escapeHtml(scenario.name)} · ${escapeHtml(scenario.kind)} · ${escapeHtml(scenario.status)}` : "Observed situation"}</span>` +
         produced + mapLine +
-        `<span>Local incident record current at ${new Date(incident.updated_at).toLocaleString()}; external layers retain their displayed source/freshness limitations.</span>`;
+        `<span>Local incident record current at ${localTime(incident.updated_at)}; external layers retain their displayed source/freshness limitations.</span>`;
     } else {
       title.innerHTML = `<strong>NexFiremap</strong>` +
         `<span>No active incident</span>` +
@@ -1401,7 +1422,7 @@ import { registerTool, setTool } from "./tools.js";
       return;
     }
     state.latestBackupName = status.latest.name;
-    const age = new Date(status.latest.created_at).toLocaleString();
+    const age = localTime(status.latest.created_at);
     el.innerHTML = `Latest verified backup ${age} · ${(status.latest.size_bytes / 1048576).toFixed(1)} MB · ` +
       `<a href="/api/operations/backups/${encodeURIComponent(status.latest.name)}/download">download</a>`;
   }
