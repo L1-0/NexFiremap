@@ -189,7 +189,19 @@ class CacheManager:
         self._background.append(asyncio.create_task(self._refresh_loop(), name="refresh"))
         self._background.append(asyncio.create_task(self._purge_loop(), name="purge"))
 
-        await asyncio.to_thread(self.purge_now)
+        # Never let retention upkeep decide whether the server comes up. The
+        # hourly `_purge_loop` already catches and logs its own failures; this
+        # startup pass did not, so any purge error propagated out of `start()`,
+        # out of the lifespan, and the process refused to boot - with the map,
+        # the incident record and every cached detection all perfectly
+        # serviceable. A failed purge means old rows linger, which is a
+        # housekeeping problem; failing to start is an outage, and it would
+        # land precisely after the downtime that grew the backlog.
+        try:
+            await asyncio.to_thread(self.purge_now)
+        except Exception:
+            log.exception("Startup purge failed; continuing without it "
+                          "(the hourly purge loop will retry)")
 
         if self.settings.startup_bbox and self.settings.startup_days:
             log.info(

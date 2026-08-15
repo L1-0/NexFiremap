@@ -262,8 +262,76 @@ def grid_geometry(
     }
 
 
+# --------------------------------------------------------- row orientation
+#
+# Two raster conventions genuinely coexist in this codebase and both are
+# defensible on their own terms:
+#
+#   ROW_ORIGIN_SOUTH - row 0 is the *south* edge. `grid_xy_m` below builds its
+#       y axis this way (y grows north from the bbox's south edge), so every
+#       analytical grid derived from it - likelihood's kernel density, arrival
+#       IDW, probability envelopes - is south-first. It is the natural choice
+#       for a metric frame where y points north.
+#
+#   ROW_ORIGIN_NORTH - row 0 is the *north* edge. `terrain.py` indexes with
+#       `row = (north - lat) / (north - south) * ny`, matching raster/GeoTIFF
+#       convention and PNG's own top-to-bottom row order.
+#
+# What is *not* defensible is leaving the choice implicit, which is how the two
+# mirroring bugs happened: terrain's isochrone contours read a north-first grid
+# with a south-first formula, and likelihood's PNGs encoded a south-first grid
+# into a format whose first row is drawn at the north edge. Each module's other
+# output was correct, so neither looked wrong on its own.
+#
+# Hence: every conversion between a row index and a latitude, and every raster
+# handed to a renderer, goes through a helper here that *names* which end row 0
+# is - with no default, so a new call site cannot silently inherit the wrong one.
+ROW_ORIGIN_NORTH = "north"
+ROW_ORIGIN_SOUTH = "south"
+
+
+def row_to_lat(bbox: tuple[float, float, float, float], row: float, ny: int,
+               *, origin: str) -> float:
+    """Latitude of a (possibly fractional) grid row.
+
+    :param bbox: (west, south, east, north).
+    :param row: Row index; fractional values are what marching-squares returns.
+    :param ny: Number of rows in the grid.
+    :param origin: ``ROW_ORIGIN_NORTH`` or ``ROW_ORIGIN_SOUTH`` - which edge row
+        0 sits on. Keyword-only and mandatory on purpose: the entire class of
+        bug this helper exists to prevent comes from guessing it.
+    """
+    _, south, _, north = bbox
+    fraction = row / ny
+    if origin == ROW_ORIGIN_NORTH:
+        return north - fraction * (north - south)
+    if origin == ROW_ORIGIN_SOUTH:
+        return south + fraction * (north - south)
+    raise ValueError(f"origin must be {ROW_ORIGIN_NORTH!r} or {ROW_ORIGIN_SOUTH!r}, not {origin!r}")
+
+
+def to_north_first(raster: np.ndarray, *, origin: str) -> np.ndarray:
+    """A raster reoriented so row 0 is north, ready for PNG encoding.
+
+    PNG stores rows top-to-bottom and Leaflet draws an image overlay's first
+    row at the northern edge of its bounds, so "north-first" is what any
+    renderer wants regardless of how the analysis chose to index. Passing an
+    already-north-first raster is a no-op, which is what makes this safe to put
+    on every render path rather than only the one known to need it.
+    """
+    if origin == ROW_ORIGIN_NORTH:
+        return raster
+    if origin == ROW_ORIGIN_SOUTH:
+        return np.flipud(raster)
+    raise ValueError(f"origin must be {ROW_ORIGIN_NORTH!r} or {ROW_ORIGIN_SOUTH!r}, not {origin!r}")
+
+
 def grid_xy_m(geom: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    """Cell-centre coordinates in a local metric frame, shape (ny, nx)."""
+    """Cell-centre coordinates in a local metric frame, shape (ny, nx).
+
+    Row 0 is the grid's **south** edge (``ROW_ORIGIN_SOUTH``): ys grows with the
+    row index and `detections_xy_m` measures y northward from the same corner.
+    """
     nx, ny = geom["nx"], geom["ny"]
     xs = (np.arange(nx) + 0.5) / nx * geom["width_m"]
     ys = (np.arange(ny) + 0.5) / ny * geom["height_m"]

@@ -10,7 +10,7 @@ import io
 import sys
 import tempfile
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -290,6 +290,65 @@ def test_purge_cascades_events() -> None:
             "SELECT COUNT(*) FROM event_members WHERE event_id = ?", (event_b,)
         ).fetchone()[0]
         check("event B's memberships are gone too", orphans == 0)
+
+        db.close()
+
+    test_purge_beyond_sql_variable_limit()
+
+
+def test_purge_beyond_sql_variable_limit() -> None:
+    """A purge larger than SQLite's host-parameter cap must still work.
+
+    SQLite allows 32766 bound parameters per statement (999 before 3.32), and
+    the purge used to bind one per expiring detection - so a single expiring day
+    of a whole-world fetch raised "too many SQL variables". Retention then
+    stopped silently, and because a purge also runs during startup the server
+    subsequently refused to boot. 40000 rows is comfortably past the modern cap.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as temp:
+        db = Database(Path(temp) / "purge.sqlite3")
+        count = 40_000
+        stamp = int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp())
+        db.upsert_detections([
+            {
+                "source": "VIIRS_NOAA20_NRT", "satellite": "N", "instrument": "VIIRS",
+                "latitude": 40.0 + (i % 200) * 0.001, "longitude": -120.0 + (i // 200) * 0.001,
+                "acq_date": "2026-06-01", "acq_time": "1200", "acq_ts": stamp,
+                "brightness": 300.0, "brightness2": 280.0, "scan": 0.4, "track": 0.4,
+                "confidence_raw": "n", "confidence_pct": None, "confidence_level": "nominal",
+                "frp": 3.0, "daynight": "D", "version": "2.0NRT",
+            }
+            for i in range(count)
+        ])
+        detection_ids = [r[0] for r in db.conn.execute("SELECT id FROM detections").fetchall()]
+        check(f"{count} detections staged", len(detection_ids) == count, str(len(detection_ids)))
+
+        cur = db.conn.execute(
+            "INSERT INTO events (bbox_west,bbox_south,bbox_east,bbox_north,centroid_lat,"
+            "centroid_lon,first_seen,last_seen,detection_count,sources_json,params_json,"
+            "created_at) VALUES (-120,40,-119.9,40.2,40.1,-119.95,0,0,?,'[]','{}',?)",
+            (count, int(time.time())),
+        )
+        event_id = int(cur.lastrowid)
+        # Every purged detection is also an event member, so the membership
+        # cleanup faces the same volume as the detection delete.
+        db.conn.executemany(
+            "INSERT INTO event_members (event_id, detection_id) VALUES (?, ?)",
+            [(event_id, det_id) for det_id in detection_ids],
+        )
+        db.conn.commit()
+
+        removed, _ = db.purge_older_than(date(2026, 7, 1))
+        check(f"purged all {count} rows past the parameter cap", removed == count, str(removed))
+        check("the emptied event was dropped", db.get_event(event_id) is None)
+        orphans = db.conn.execute("SELECT COUNT(*) FROM event_members").fetchone()[0]
+        check("no dangling memberships remain", orphans == 0, str(orphans))
+        # The temp table the purge uses must not survive it, or a second purge
+        # on the same connection would collide with the leftover.
+        again = db.purge_older_than(date(2026, 7, 1))
+        check("a second purge on the same connection is clean", again == (0, 0), str(again))
 
         db.close()
 

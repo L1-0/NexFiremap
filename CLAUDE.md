@@ -73,6 +73,35 @@ transport rather than `httpx` and so bypass the mock.
   tile/MBTiles support exist specifically so the tool keeps working with the WAN down
   during an incident. Don't introduce a code path that silently requires live internet.
 
+## Raster row orientation (the one that bit us)
+
+Two grid conventions coexist and both are staying, because each is natural in
+its own module:
+
+- **`likelihood.py` and anything built on `geo.grid_xy_m` is south-first** -
+  row 0 is the bbox's south edge, because `grid_xy_m`'s y axis grows north from
+  that corner and `detections_xy_m` measures against the same origin.
+- **`terrain.py` is north-first** - `to_rowcol` indexes with `(north - lat)`,
+  matching raster/GeoTIFF convention.
+
+What is *not* optional is saying which one you mean. Both mirroring bugs that
+shipped came from an implicit assumption: terrain's isochrones read a
+north-first grid with the south-first formula, and likelihood's PNGs encoded a
+south-first grid into a format whose first row is drawn at the **north** edge.
+In each case the module's *other* output was correct, so nothing looked wrong.
+
+So: every row→latitude conversion goes through `geo.row_to_lat(...,
+origin=...)`, and every raster handed to a renderer goes through
+`geo.to_north_first(..., origin=...)`. Both take `origin` as a **mandatory
+keyword** - there is deliberately no default to inherit. `render_probability_png`
+/ `render_recency_png` serve both modules, which is exactly why they cannot
+assume.
+
+`tests/test_orientation.py` is the guard. Property tests cannot catch this
+class of bug: a mirrored isochrone is still monotone in time and a mirrored
+raster still sums to the same mass. Those checks put a signal in one hemisphere
+and assert it comes out on the same side.
+
 ## Standards interoperability (`nexfiremap/ingest/`)
 
 External formats (CoT/TAK, CAP, NMEA, MAVLink, Shapefile, mapped CAD JSON) are

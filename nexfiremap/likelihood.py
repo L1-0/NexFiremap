@@ -50,9 +50,13 @@ from .geo import (
     LAT_M_PER_DEG,
     MAX_GRID_DIM,
     MIN_RESOLUTION_M,
+    ROW_ORIGIN_NORTH,
+    ROW_ORIGIN_SOUTH,
     detections_xy_m,
     grid_geometry,
     grid_xy_m,
+    row_to_lat,
+    to_north_first,
 )
 from .jobs import JobContext, register_kind
 from .rasterpng import encode_png
@@ -425,7 +429,11 @@ def probability_envelopes(
             coords = []
             for row, col in contour:
                 lon = west + (col / nx) * (east - west)
-                lat = south + (row / ny) * (north - south)
+                # South-first, matching `grid_xy_m` - correct as it stands, and
+                # now said out loud rather than inferred. terrain.py's contour
+                # path is the mirror of this and read the same formula off a
+                # north-first grid, which is what made it draw mirrored.
+                lat = row_to_lat(geom["bbox"], row, ny, origin=ROW_ORIGIN_SOUTH)
                 coords.append([round(lon, 6), round(lat, 6)])
             if coords[0] != coords[-1]:
                 coords.append(coords[0])
@@ -462,9 +470,18 @@ def _ramp_color(t: float) -> tuple[int, int, int]:
 _RAMP_LUT = np.array([_ramp_color(t) for t in np.linspace(0, 1, 256)], dtype=np.uint8)
 
 
-def render_probability_png(raster: np.ndarray, max_alpha: int = 210) -> bytes:
+def render_probability_png(raster: np.ndarray, max_alpha: int = 210, *, origin: str) -> bytes:
     """Probability -> RGBA: color from the fire ramp, alpha from magnitude
-    so low-probability cells fade into whatever basemap is underneath."""
+    so low-probability cells fade into whatever basemap is underneath.
+
+    ``origin`` says which edge row 0 of ``raster`` sits on, and is mandatory:
+    these renderers serve both of this codebase's grid conventions (this
+    module's grids are south-first, terrain.py's are north-first), and a
+    default would silently mirror one of them. PNG rows run top-to-bottom and
+    Leaflet paints the first row at the northern edge of the overlay's bounds,
+    so everything is reoriented to north-first before encoding.
+    """
+    raster = to_north_first(raster, origin=origin)
     vmax = float(raster.max()) or 1.0
     norm = np.clip(raster / vmax, 0.0, 1.0)
     idx = (norm * 255).astype(np.uint8)
@@ -474,9 +491,14 @@ def render_probability_png(raster: np.ndarray, max_alpha: int = 210) -> bytes:
     return encode_png(rgba)
 
 
-def render_recency_png(hours_ago: np.ndarray, max_hours: float = 168.0, max_alpha: int = 210) -> bytes:
+def render_recency_png(hours_ago: np.ndarray, max_hours: float = 168.0, max_alpha: int = 210,
+                       *, origin: str) -> bytes:
     """Arrival-time -> RGBA, using the same ramp but inverted (fresher =
-    more saturated/opaque, matching the point markers' age colouring)."""
+    more saturated/opaque, matching the point markers' age colouring).
+
+    See `render_probability_png` for why ``origin`` is mandatory.
+    """
+    hours_ago = to_north_first(hours_ago, origin=origin)
     valid = ~np.isnan(hours_ago)
     norm = np.zeros(hours_ago.shape, dtype=np.float64)
     norm[valid] = 1.0 - np.clip(hours_ago[valid] / max_hours, 0.0, 1.0)
@@ -563,8 +585,14 @@ def analyze_event(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         envelopes = probability_envelopes(active, geom)
         ctx.report_progress(85, note=f"{len(envelopes)} envelope contours")
 
-        active_png = render_probability_png(active)
-        arrival_png = render_recency_png(hours_ago)
+        # This module's grids come from `grid_xy_m`, whose row 0 is the south
+        # edge. Both PNGs used to be encoded straight from that, putting south
+        # at the top of an overlay whose bounds place north there - so the heat
+        # and arrival rasters rendered mirrored about the AOI's centre latitude
+        # while `probability_envelopes` (which reads rows south-first, and is
+        # right to) drew its contours in the correct place on top of them.
+        active_png = render_probability_png(active, origin=ROW_ORIGIN_SOUTH)
+        arrival_png = render_recency_png(hours_ago, origin=ROW_ORIGIN_SOUTH)
 
         result_dir = ctx.result_path
         (result_dir / "active_heat.png").write_bytes(active_png)

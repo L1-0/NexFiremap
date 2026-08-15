@@ -1399,27 +1399,35 @@ class Database:
         """
         cutoff_day = cutoff.isoformat()
         with self._write_lock:
-            purged_ids = [
-                row[0]
-                for row in self.conn.execute(
-                    "SELECT id FROM detections WHERE acq_date < ?", (cutoff_day,)
-                ).fetchall()
-            ]
-            affected_events: list[int] = []
-            if purged_ids:
-                placeholders = ", ".join("?" for _ in purged_ids)
-                affected_events = [
-                    row[0]
-                    for row in self.conn.execute(
-                        f"SELECT DISTINCT event_id FROM event_members "
-                        f"WHERE detection_id IN ({placeholders})",
-                        purged_ids,
-                    ).fetchall()
-                ]
-                self.conn.execute(
-                    f"DELETE FROM event_members WHERE detection_id IN ({placeholders})",
-                    purged_ids,
-                )
+            # Everything below addresses the expiring rows through *subqueries*
+            # rather than by pulling their ids into Python and binding one
+            # placeholder each. That earlier shape had a hard ceiling: SQLite
+            # allows 32766 host parameters per statement (999 before 3.32), and
+            # a single expiring day of a whole-world FIRMS fetch clears that
+            # easily. Past the limit the purge raised, so retention silently
+            # stopped - and because `CacheManager.start()` runs one purge before
+            # the lifespan yields, the server then refused to boot at all,
+            # exactly after the downtime that let the backlog build. A subquery
+            # has no such limit and does the join inside SQLite besides.
+            #
+            # The affected event ids still have to be captured *before* the
+            # membership rows are deleted, or the link is gone; a temp table
+            # holds them so that list is unbounded too.
+            self.conn.execute("DROP TABLE IF EXISTS temp.purge_events")
+            self.conn.execute(
+                """
+                CREATE TEMP TABLE purge_events AS
+                SELECT DISTINCT event_id FROM event_members
+                WHERE detection_id IN (SELECT id FROM detections WHERE acq_date < ?)
+                """,
+                (cutoff_day,),
+            )
+            affected = self.conn.execute("SELECT COUNT(*) FROM temp.purge_events").fetchone()[0]
+            self.conn.execute(
+                "DELETE FROM event_members WHERE detection_id IN "
+                "(SELECT id FROM detections WHERE acq_date < ?)",
+                (cutoff_day,),
+            )
 
             det = self.conn.execute(
                 "DELETE FROM detections WHERE acq_date < ?", (cutoff_day,)
@@ -1428,8 +1436,8 @@ class Database:
                 "DELETE FROM coverage WHERE day < ?", (cutoff_day,)
             ).rowcount
 
-            if affected_events:
-                placeholders = ", ".join("?" for _ in affected_events)
+            if affected:
+                placeholders = "SELECT event_id FROM temp.purge_events"
                 # Drop events with no surviving members *before* the
                 # recompute below - an event with zero members has nothing
                 # for those correlated MIN/MAX/AVG subqueries to aggregate,
@@ -1440,8 +1448,7 @@ class Database:
                     DELETE FROM events
                     WHERE id IN ({placeholders})
                       AND id NOT IN (SELECT DISTINCT event_id FROM event_members)
-                    """,
-                    affected_events,
+                    """
                 )
                 self.conn.execute(
                     f"""
@@ -1490,10 +1497,10 @@ class Database:
                             WHERE m.event_id = events.id
                         )
                     WHERE id IN ({placeholders})
-                    """,
-                    affected_events,
+                    """
                 )
 
+            self.conn.execute("DROP TABLE IF EXISTS temp.purge_events")
             self.conn.commit()
         return max(det, 0), max(cov, 0)
 

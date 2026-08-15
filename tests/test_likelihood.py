@@ -33,6 +33,7 @@ from nexfiremap.likelihood import (
     render_probability_png,
     render_recency_png,
 )
+from nexfiremap.geo import ROW_ORIGIN_SOUTH
 
 failures: list[str] = []
 
@@ -204,12 +205,15 @@ def test_probability_envelopes_area_counts_ties(geom: dict) -> None:
 
 def test_png_rendering() -> None:
     print("\nPNG rendering")
+    # This module's grids are south-first; `origin` is mandatory so no call
+    # site can inherit the wrong convention silently. See test_orientation.py
+    # for the checks that the flip actually happens.
     raster = np.array([[0.0, 0.5], [0.9, 0.1]])
-    png_bytes = render_probability_png(raster)
+    png_bytes = render_probability_png(raster, origin=ROW_ORIGIN_SOUTH)
     check("PNG signature present", png_bytes[:8] == b"\x89PNG\r\n\x1a\n")
 
     hours_ago = np.array([[0.0, 24.0], [np.nan, 100.0]])
-    png2 = render_recency_png(hours_ago)
+    png2 = render_recency_png(hours_ago, origin=ROW_ORIGIN_SOUTH)
     check("recency PNG signature present", png2[:8] == b"\x89PNG\r\n\x1a\n")
 
 

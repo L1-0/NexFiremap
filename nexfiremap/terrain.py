@@ -56,7 +56,14 @@ from skimage import measure
 
 from . import moisture as moisture_model
 from . import rothermel
-from .geo import LAT_M_PER_DEG, grid_geometry, lon_m_per_deg
+from .geo import (
+    LAT_M_PER_DEG,
+    ROW_ORIGIN_NORTH,
+    grid_geometry,
+    lon_m_per_deg,
+    row_to_lat,
+    to_north_first,
+)
 from .imagery import read_band_on_grid
 from .jobs import JobContext, register_kind
 from .likelihood import (
@@ -403,10 +410,68 @@ def build_directional_behavior(
 # --------------------------------------------------------------- solving
 
 
-_NEIGHBORS: tuple[tuple[int, int, float, float], ...] = (
-    (-1, 0, 0.0, 1.0), (-1, 1, 45.0, math.sqrt(2)), (0, 1, 90.0, 1.0), (1, 1, 135.0, math.sqrt(2)),
-    (1, 0, 180.0, 1.0), (1, -1, 225.0, math.sqrt(2)), (0, -1, 270.0, 1.0), (-1, -1, 315.0, math.sqrt(2)),
-)  # (row_delta, col_delta, bearing_deg_from_this_cell, distance_multiplier) - 8-connected
+def _sign(value: int) -> int:
+    return (value > 0) - (value < 0)
+
+
+def _stencil(offsets: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int, float, float], ...]:
+    """(row_delta, col_delta) -> (row_delta, col_delta, bearing_deg, distance_multiplier).
+
+    Row 0 is north, so -row is north and the compass bearing of a step is
+    ``atan2(dcol, -drow)``. Deriving both the bearing and the length from the
+    offset rather than writing them out keeps a longer stencil from acquiring a
+    transcription error in one of 16 hand-typed constants.
+    """
+    return tuple(
+        (dr, dc, math.degrees(math.atan2(dc, -dr)) % 360.0, math.hypot(dr, dc))
+        for dr, dc in offsets
+    )
+
+
+# The 8 unit steps: N, NE, E, SE, S, SW, W, NW.
+_STEPS_8: tuple[tuple[int, int], ...] = (
+    (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1), (-1, -1),
+)
+# Plus the 8 knight's moves, giving 16 directions at 22.5 degrees apart.
+#
+# Why: a graph solve can only travel along its stencil's directions, so a head
+# fire whose true bearing falls between two of them has to zigzag. With an
+# 8-direction stencil the worst case is 22.5 degrees off-axis, and on a strongly
+# wind-driven ellipse that is punishing - spread rate off the major axis
+# collapses fast. Measured on a uniform field at the model's own eccentricity
+# ceiling (LWR capped at 8:1, so e = sqrt(63)/8 = 0.992), the 8-direction solve
+# reports head-fire arrival **11.5x later than the exact ellipse** at a 22.5
+# degree wind; 16 directions cuts that to 4.5x, and the isotropic error from
+# 8.2% to 1.4%. Crucially the error does *not* shrink as the grid is refined -
+# it is the fixed set of directions, not the cell size - so a finer AOI never
+# escapes it. See tests/test_solver_accuracy.py, which measures both.
+#
+# 4.5x is still a real overestimate at the extreme, and this is not a claim to
+# have made the solve exact: a continuous anisotropic Eikonal solver is what
+# would do that. It is a large, cheap, verified reduction in a bias that always
+# points the same way - fire arriving *earlier* than forecast.
+_STEPS_16: tuple[tuple[int, int], ...] = _STEPS_8 + (
+    (-2, 1), (-1, 2), (1, 2), (2, 1), (2, -1), (1, -2), (-1, -2), (-2, -1),
+)
+
+_NEIGHBORS: tuple[tuple[int, int, float, float], ...] = _stencil(_STEPS_16)
+
+#: For each knight's move, the two unit-step cells it passes between. A long
+#: step is only allowed when at least one of them is itself passable, so the
+#: stencil can never connect two cells that the 8-neighbour graph could not
+#: already connect. Without this a (-2,+1) hop would straddle a one-cell-thick
+#: barrier - a rasterised control line is exactly that - and fire would tunnel
+#: through a line the plan says was built, which is the one thing a barrier in
+#: this model exists to prevent.
+#: A knight's move spans one diagonal step and one axial step along its long
+#: side; those are the two cells it passes between.
+_KNIGHT_MIDPOINTS: dict[tuple[int, int], tuple[tuple[int, int], tuple[int, int]]] = {
+    (dr, dc): (
+        (_sign(dr), _sign(dc)),                                    # the diagonal neighbour
+        (_sign(dr), 0) if abs(dr) == 2 else (0, _sign(dc)),        # the axial one, long side
+    )
+    for dr, dc in _STEPS_16[8:]
+}
 
 
 def solve_travel_time_anisotropic(
@@ -460,6 +525,21 @@ def solve_travel_time_anisotropic(
             nr, nc = r + dr, c + dc
             if not (0 <= nr < ny and 0 <= nc < nx) or visited[nr, nc]:
                 continue
+            midpoints = _KNIGHT_MIDPOINTS.get((dr, dc))
+            if midpoints is not None:
+                # A long step is a straighter *cost estimate* for a route the
+                # 8-neighbour graph already has; it must never be a new route.
+                # Requiring one passable cell between keeps a rasterised control
+                # line - one cell thick - genuinely impassable instead of being
+                # hopped over. See _KNIGHT_MIDPOINTS.
+                passable = False
+                for mr, mc in midpoints:
+                    ar, ac = r + mr, c + mc
+                    if 0 <= ar < ny and 0 <= ac < nx and max_ros_m_min[ar, ac] > BARRIER_ROS_M_MIN:
+                        passable = True
+                        break
+                if not passable:
+                    continue
             ros_dir = rothermel.ros_at_bearing(ros_here, dir_here, ecc_here, bearing) / 60.0  # m/s
             ros_dir = max(ros_dir, BARRIER_ROS_M_MIN / 60.0)
             nd = d + (res_m * dist_mult) / ros_dir
@@ -529,8 +609,16 @@ def isochrone_contours(
         for contour in contours:
             if len(contour) < 3:
                 continue
+            # Row 0 of this grid is NORTH - `run_propagation`'s `to_rowcol`
+            # indexes with (north - lat), matching raster convention. This once
+            # read `south + (row / ny) * (north - south)`, which is the
+            # south-first formula, so every isochrone rendered mirrored about
+            # the AOI's centre latitude while the PNG built from the same array
+            # rendered correctly - the two layers disagreed, and a crew placed
+            # relative to the vector one stood on the wrong side of the fire.
             coords = [
-                [round(west + (col / nx) * (east - west), 6), round(south + (row / ny) * (north - south), 6)]
+                [round(west + (col / nx) * (east - west), 6),
+                 round(row_to_lat(geom["bbox"], row, ny, origin=ROW_ORIGIN_NORTH), 6)]
                 for row, col in contour
             ]
             features.append(
@@ -626,7 +714,7 @@ def run_propagation(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
 
     hours_to_arrival = travel_time_s / 3600.0
     hours_to_arrival[~np.isfinite(hours_to_arrival)] = np.nan
-    png = render_recency_png(hours_to_arrival, max_hours=48.0)
+    png = render_recency_png(hours_to_arrival, max_hours=48.0, origin=ROW_ORIGIN_NORTH)
 
     (ctx.result_path / "spread_time.png").write_bytes(png)
     (ctx.result_path / "isochrones.geojson").write_text(
@@ -874,8 +962,10 @@ def run_ensemble_assimilation(params: dict[str, Any], ctx: JobContext) -> dict[s
     envelopes = probability_envelopes(probability, geom)
     ctx.report_progress(95, note="rendering")
 
-    prob_png = render_probability_png(probability)
-    median_png = render_recency_png(hours_to_median, max_hours=48.0)
+    # terrain grids are north-first (see `to_rowcol`), so these were already
+    # correct - the explicit origin just stops that being a coincidence.
+    prob_png = render_probability_png(probability, origin=ROW_ORIGIN_NORTH)
+    median_png = render_recency_png(hours_to_median, max_hours=48.0, origin=ROW_ORIGIN_NORTH)
 
     (ctx.result_path / "probability.png").write_bytes(prob_png)
     (ctx.result_path / "median_arrival.png").write_bytes(median_png)
