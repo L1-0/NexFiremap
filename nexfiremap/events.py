@@ -646,7 +646,22 @@ def _contour_band(raster: np.ndarray, geom: dict[str, Any], level: float) -> lis
     if raster.max() <= level:
         return []
     try:
-        contours = measure.find_contours(raster, level)
+        # Pad with a one-cell border below the contour level before tracing.
+        #
+        # find_contours returns a *closed* path for a feature wholly inside the
+        # raster, but an *open* one wherever the contour runs off an edge.
+        # Closing an open path by appending its first point draws a straight
+        # chord from where it left the raster back to where it re-entered -
+        # which rendered as a hard-edged wedge slicing across the map, most
+        # visibly on the outermost (latest) band, since that is the one that
+        # actually reaches the edge.
+        #
+        # Padding makes every feature that touched the edge close naturally
+        # just inside the border, so there are no open paths left to
+        # mis-close. Cheaper and far less error-prone than walking the raster
+        # perimeter to close them by hand.
+        padded = np.pad(raster, 1, mode="constant", constant_values=float(level) - 1.0)
+        contours = measure.find_contours(padded, level)
     except Exception:  # pragma: no cover - defensive, skimage edge cases
         return []
 
@@ -657,7 +672,10 @@ def _contour_band(raster: np.ndarray, geom: dict[str, Any], level: float) -> lis
         if len(contour) < 3:
             continue
         coords = [
-            [round(west + (col / nx) * (east - west), 6), round(south + (row / ny) * (north - south), 6)]
+            # -1 on each axis undoes the pad, putting the contour back in the
+            # original raster's coordinate space.
+            [round(west + ((col - 1) / nx) * (east - west), 6),
+             round(south + ((row - 1) / ny) * (north - south), 6)]
             for row, col in contour
         ]
         if coords[0] != coords[-1]:

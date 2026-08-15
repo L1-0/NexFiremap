@@ -30,6 +30,15 @@
 
 <div id="map" role="application" aria-label="Fire detection map"></div>
 
+<!-- ============================== Tool palette ============================
+     Exactly one tool owns the left click at a time (see static/js/tools.js).
+     "Select" is the default and reproduces the map's previous behaviour, so
+     ignoring this toolbar changes nothing. Sits on the left edge below the
+     topbar and well above Leaflet's zoom control and the basemap picker,
+     which both occupy the bottom-left corner. -->
+<div id="map-tools" class="map-tools" role="toolbar" aria-label="Map tools"></div>
+<div id="map-tool-panel" class="map-tool-panel" aria-live="polite" hidden></div>
+
 <!-- Right-click-and-drag area selection: a plain screen-pixel overlay (see
      wireMapContextMenu() in app.js), not a Leaflet layer. Hidden by default. -->
 <div id="map-select-rect" class="map-select-rect" hidden></div>
@@ -773,6 +782,9 @@
      Depends on both only through context.js's registries, so app.js and
      operations.js still know nothing about each other. -->
 <script type="module" src="/static/js/integration.js"></script>
+<!-- The map tool palette. Registers "Select" (the existing behaviour) and
+     "Waypoint"; other modules register their own tools with it. -->
+<script type="module" src="/static/js/tools.js"></script>
 <!-- Optional: adds nothing to the page (not even its control) unless the
      server reports configured CAP warning feeds via /api/config. -->
 <script type="module" src="/static/js/alerts.js"></script>

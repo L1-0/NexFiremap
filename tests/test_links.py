@@ -377,6 +377,37 @@ def check_http_surface() -> None:
             assert client.post("/api/operations/incidents/from_context",
                                json={"event_id": 99999}).status_code == 404
 
+            # The two commit paths the map tool palette's area tool writes
+            # through (static/js/tools.js). Its geometry helpers are JavaScript
+            # and this repo has no JS test runner, so what is pinned here is the
+            # server contract they depend on: a polygon posted as an AOI, and
+            # the same polygon posted as an area feature.
+            drawn = {"type": "Polygon", "coordinates": [[
+                [11.50, 48.10], [11.60, 48.10], [11.60, 48.20], [11.50, 48.20], [11.50, 48.10]]]}
+            aoi_set = client.put(f"/api/operations/incidents/{incident_id}/aoi",
+                                 json={"aoi": drawn})
+            assert aoi_set.status_code == 200, aoi_set.text
+            stored = client.get(f"/api/operations/incidents/{incident_id}/aoi").json()["aoi"]
+            assert stored["type"] == "Polygon"
+            assert stored["coordinates"][0][0] == stored["coordinates"][0][-1], \
+                "the server must close the ring the tool sends"
+
+            # Every AREA_TYPES value must be offerable, because the tool builds
+            # its dropdown from the server's own vocabulary rather than a
+            # hardcoded list - so any of them can arrive here.
+            meta = client.get("/api/operations/meta").json()
+            area_types = meta["geometry"]["Polygon"]
+            assert "evacuation_area" in area_types
+            workspace = client.get(f"/api/operations/incidents/{incident_id}").json()
+            period_id = workspace["operational_periods"][0]["id"]
+            for feature_type in area_types:
+                created_feature = client.post(
+                    f"/api/operations/incidents/{incident_id}/features",
+                    json={"period_id": period_id, "feature_type": feature_type,
+                          "geometry": drawn, "title": f"Drawn {feature_type}"})
+                assert created_feature.status_code == 201, \
+                    f"{feature_type} rejected: {created_feature.text}"
+
 
 def main() -> None:
     check_snapshot_is_frozen()

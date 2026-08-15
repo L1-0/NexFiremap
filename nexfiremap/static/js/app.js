@@ -46,6 +46,9 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
   // fetch/compute on every pan at world scale. Zooming in past this level
   // resumes loading automatically (see loadDetections's own gate below).
   const MIN_ACTIVE_ZOOM = 6;
+  // About 2 km at mid latitudes - a VIIRS footprint radius plus margin, so a
+  // zoomed-in view still contains the density field's own boundary.
+  const SPREAD_TOPOLOGY_MIN_PAD_DEG = 0.02;
 
   const state = {
     config: null,
@@ -1348,7 +1351,15 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          bbox: bboxParam(),
+          // Padded, not the bare viewport. The bands are contours of a
+          // detection-density field, so tracing one needs the *boundary* to be
+          // inside the raster. Zoomed in far enough that the whole view sits
+          // within a detection's own footprint, every cell is above the
+          // contour level, there is no boundary to trace, and the layer came
+          // back empty - the map simply lost its spread overlay the closer you
+          // looked at the fire. Padding by a minimum ground distance keeps the
+          // transition in frame at any zoom.
+          bbox: spreadTopologyBbox(),
           days: state.days,
           sources: Array.from(state.enabledSources),
         }),
@@ -1464,7 +1475,14 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
         color: ring,
         weight: 1,
         opacity: 0.5,
-        fillOpacity: 0.94,
+        // 0.75 rather than the near-opaque 0.94 this used to carry: the bands
+        // are cumulative supersets drawn latest-first, so each earlier band
+        // paints over the larger one beneath it and only ever shows its own
+        // colour - the alpha-stacking problem the old comment worried about
+        // does not arise from the *fill* itself. At 0.75 the basemap stays
+        // legible underneath, which is what an operator needs to relate the
+        // burn progression to the terrain and roads it is crossing.
+        fillOpacity: 0.75,
       }),
       onEachFeature: (feature, layer) => {
         const when = new Date(feature.properties.cutoff_ts * 1000).toISOString().slice(0, 16).replace("T", " ");
@@ -1682,6 +1700,31 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
   // ------------------------------------------------------------ data load
 
   /** @returns {string} the map's current viewport as a "west,south,east,north" query param, longitude clamped to ±180 (worldCopyJump can otherwise report bounds outside that range). */
+  /** The bbox to compute spread bands over: the viewport, padded outward.
+   *
+   * A contour needs both sides of its own level inside the raster. At high
+   * zoom the viewport can sit entirely inside the burn footprint, where the
+   * density field is above the contour level everywhere and marching squares
+   * has nothing to trace - so the layer silently emptied exactly when the
+   * operator zoomed in to look closely.
+   *
+   * `SPREAD_TOPOLOGY_MIN_PAD_DEG` is a floor rather than a pure percentage
+   * because a percentage of a very small viewport is still very small; roughly
+   * 2 km covers a VIIRS footprint radius plus margin, which is the scale the
+   * density kernel works at.
+   * @returns {string} "west,south,east,north". */
+  function spreadTopologyBbox() {
+    const b = map.getBounds();
+    const padLon = Math.max((b.getEast() - b.getWest()) * 0.5, SPREAD_TOPOLOGY_MIN_PAD_DEG);
+    const padLat = Math.max((b.getNorth() - b.getSouth()) * 0.5, SPREAD_TOPOLOGY_MIN_PAD_DEG);
+    return [
+      Math.max(-180, b.getWest() - padLon),
+      Math.max(-90, b.getSouth() - padLat),
+      Math.min(180, b.getEast() + padLon),
+      Math.min(90, b.getNorth() + padLat),
+    ].map((v) => v.toFixed(4)).join(",");
+  }
+
   function bboxParam() {
     const b = map.getBounds();
     const west = Math.max(-180, b.getWest());
@@ -2195,6 +2238,28 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
           (ev.params?.wide_span ? ` · ⚠ ${ev.params.span_km} km span, likely chained sources` : "")
       )
     );
+    // Clicking the rectangle does what clicking the list row does: pan to the
+    // event and analyze it. Previously these rectangles carried a tooltip and
+    // nothing else, so the most obvious thing an operator can do - click the
+    // fire on the map - silently did nothing, and the only way in was to find
+    // the matching row in the side panel.
+    boxes.forEach((box, index) => {
+      const ev = state.events[index];
+      box.on("click", (clickEvent) => {
+        // Stop the map's own click handling: without this the click also
+        // reaches whatever else is listening, and on a modal tool it would
+        // both open the event and drop a waypoint.
+        L.DomEvent.stopPropagation(clickEvent);
+        map.fitBounds(
+          [[ev.bbox_south, ev.bbox_west], [ev.bbox_north, ev.bbox_east]],
+          { maxZoom: 13, padding: [40, 40] }
+        );
+        // Same guard the list row uses: with the likelihood module unavailable
+        // server-side, analyzeEvent has nothing to run, so clicking still pans
+        // to the event rather than failing.
+        if (state.features.likelihood !== false) analyzeEvent(ev.id);
+      });
+    });
     eventMarkersLayer = L.layerGroup(boxes).addTo(map);
   }
 
@@ -3446,10 +3511,31 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
     // pair with none of those markers falls back to whatever coordinate
     // system is currently selected (see wireCoordSystemSelect() below),
     // WGS84 decimal degrees by default.
+    // A bounding box is tried first: "50.7,6.3,50.9,6.5" is four numbers, and
+    // parseDecimalPair would otherwise happily read the first two and silently
+    // discard the rest, zooming to a corner of the box the operator pasted.
+    const box = Coords.parseBbox(raw);
+    if (box) {
+      const bounds = [[box.south, box.west], [box.north, box.east]];
+      return {
+        label: `Area ${box.west.toFixed(4)}, ${box.south.toFixed(4)} → ${box.east.toFixed(4)}, ${box.north.toFixed(4)}`,
+        detected: "bounding box",
+        lat: (box.south + box.north) / 2, lon: (box.west + box.east) / 2,
+        bounds, type: "coordinates",
+      };
+    }
     const point = Coords.parse(raw, Coords.currentSystem());
     if (!point) return null;
     const label = Coords.format(point.lat, point.lon, Coords.currentSystem());
-    return { label: label || `${point.lat.toFixed(5)}, ${point.lon.toFixed(5)}`, lat: point.lat, lon: point.lon, bounds: null, type: "coordinates" };
+    return {
+      label: label || `${point.lat.toFixed(5)}, ${point.lon.toFixed(5)}`,
+      // Naming the format that was actually detected is what keeps an
+      // auto-detecting parser honest: a grid reference misread as a decimal
+      // pair lands somewhere plausible hundreds of km away, and without this
+      // the operator has nothing to tell them why.
+      detected: Coords.detectFormat(raw, Coords.currentSystem()),
+      lat: point.lat, lon: point.lon, bounds: null, type: "coordinates",
+    };
   }
 
   /** Populates the coordinate-system dropdown from coords.js's registry, restores the last-selected system (and any saved custom proj4 string), and wires changes to persist. */
@@ -3509,7 +3595,13 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
           `<strong>${escapeHtml(item.label)}</strong>` +
           (item.type && item.type !== "coordinates"
             ? `<small>${escapeHtml([item.class, item.type].filter(Boolean).join(", "))}</small>`
-            : "") +
+            // For a coordinate hit, say which format was detected. An
+            // auto-detecting parser that guesses wrong lands somewhere
+            // plausible but distant, and this is the only clue the operator
+            // gets that it read their grid reference as decimal degrees.
+            : item.detected
+              ? `<small>read as ${escapeHtml(item.detected)}</small>`
+              : "") +
           `</button></li>`
       )
       .join("");
@@ -3610,6 +3702,10 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
 
     input.addEventListener("input", () => {
       clearBtn.hidden = !input.value;
+      // Keeps the compact search box expanded while there is something in it,
+      // so it does not shrink away mid-edit the moment focus moves to the
+      // results list (see .map-search.is-active in app.css).
+      $("#map-search").classList.toggle("is-active", Boolean(input.value));
       clearTimeout(searchDebounceTimer);
       const query = input.value;
       if (!query.trim()) {

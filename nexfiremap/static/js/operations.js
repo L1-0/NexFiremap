@@ -8,6 +8,7 @@
 
 import { showContextMenu } from "./app.js";
 import { whenMap, setPrintView, onMapContextMenu, setActiveIncident } from "./context.js";
+import { registerTool, setTool } from "./tools.js";
 
   const $ = (s) => document.querySelector(s);
   // Almost every innerHTML template below interpolates operator-supplied
@@ -495,6 +496,30 @@ import { whenMap, setPrintView, onMapContextMenu, setActiveIncident } from "./co
     $("#btn-finish-draw").hidden = d.geometry === "Point"; $("#btn-undo-draw").hidden = d.geometry === "Point";
     setStatus(`Recovered unsaved sketch · ${d.points.length} vertex/vertices. Finish or cancel explicitly.`, true);
   }
+
+  // The sketch tool's entry in the map tool palette (tools.js).
+  //
+  // Registered rather than reimplemented: startDraw/cancelDraw already own the
+  // vertex collection, the crash-recovery draft and the mutual exclusivity with
+  // record editing. All the palette adds is *visibility* - until now this was a
+  // mode you entered by finding a button inside the incident panel, with
+  // nothing on the map saying it was active.
+  //
+  // `available()` gates it on an incident and period existing, because
+  // startDraw() refuses without them; reporting that as a disabled button with
+  // a reason beats letting an operator click and get a status message.
+  whenMap(() => {
+    registerTool({
+      id: "sketch",
+      label: "Sketch",
+      key: "s",
+      available: () => Boolean(state.incidentId && state.periodId),
+      unavailableHint: "select an incident and operational period first",
+      hasUnsavedWork: () => Boolean(state.drawing?.points?.length),
+      activate() { startDraw(); },
+      deactivate() { cancelDraw(); },
+    });
+  });
 
   // --------------------------------------- drawing / sketch state machine
   //

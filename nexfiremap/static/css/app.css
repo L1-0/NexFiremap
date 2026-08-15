@@ -255,9 +255,25 @@ html, body {
    (right) or the zoom control (now bottom-left, see initMap()). */
 .map-search {
   position: relative;
-  flex: 1 1 260px;
-  max-width: 400px;
+  /* Centred in the topbar and compact until it is being used.
+     An always-full-width search bar spends the whole incident occupying the
+     middle of the screen for a control that is used in bursts; growing on
+     focus (or once something is typed) keeps the map visible the rest of the
+     time. `margin: 0 auto` is what centres it between the brand on the left
+     and the status pills on the right, rather than letting flex-grow push it
+     against one of them. */
+  flex: 0 1 auto;
+  width: 220px;
+  max-width: 40vw;
   min-width: 0;
+  margin: 0 auto;
+  transition: width .16s ease;
+}
+/* Expanded while focused, while a query is present, or while results are
+   showing - the three states in which the operator is actually reading it. */
+.map-search:focus-within,
+.map-search.is-active {
+  width: 520px;
 }
 
 .map-search-icon {
@@ -1379,3 +1395,161 @@ code {
   height: 18px;
   color: #fff;
 }
+
+/* ------------------------------------------------------------ tool palette */
+/* Photoshop-style vertical tool bar: exactly one tool owns the left click at a
+   time (static/js/tools.js). Positioned on the left edge below .topbar - which
+   spans the full width to about 96px and has already swallowed one
+   top-anchored control - and stopping well above the bottom-left corner, which
+   Leaflet's zoom control and the basemap picker occupy. */
+.map-tools {
+  position: absolute;
+  left: 10px;
+  top: 108px;
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 8px;
+  background: rgba(26, 26, 25, 0.92);
+  border: 1px solid var(--border);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, .45);
+}
+.nf-tool {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 38px;
+  overflow: hidden;
+  padding: 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: width .12s ease, background .12s ease;
+  white-space: nowrap;
+}
+/* Icon-only until hovered, so the palette stays out of the map's way but never
+   requires memorising five glyphs. */
+.map-tools:hover .nf-tool { width: 132px; }
+.nf-tool svg { width: 22px; height: 22px; flex: 0 0 22px; }
+.nf-tool:hover:not(:disabled) { background: var(--surface-2); color: var(--text-primary); }
+.nf-tool.is-active { background: var(--accent); color: #1a1a19; }
+.nf-tool:disabled { opacity: .4; cursor: not-allowed; }
+.nf-tool-label { font-size: 12px; font-weight: 600; opacity: 0; transition: opacity .12s ease; }
+.map-tools:hover .nf-tool-label { opacity: 1; }
+
+/* The waypoint/area side panel: situation report while it is one point, commit
+   bar once it is an area. */
+.map-tool-panel {
+  position: absolute;
+  /* Clears the palette at its *hover-expanded* width (38px collapsed, 132px
+     with labels showing) plus its padding and a gap - anchoring to the
+     collapsed width would put the expanded labels behind this panel the moment
+     the operator moved the mouse back to the toolbar. */
+  left: 152px;
+  top: 108px;
+  z-index: 900;
+  width: 320px;
+  max-height: calc(100vh - 220px);
+  overflow-y: auto;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(26, 26, 25, 0.96);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, .45);
+  font-size: 12px;
+}
+.map-tool-panel header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.map-tool-panel header span { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.map-tool-panel dl { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 6px 0; }
+.map-tool-panel dt { color: var(--text-muted); }
+.map-tool-panel dd { margin: 0; }
+.nf-panel-hint { color: var(--text-muted); margin: 6px 0 0; }
+.nf-panel-hint.is-error { color: #ff8b7a; }
+.nf-panel-field { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px; }
+.nf-panel-field select { flex: 1; }
+.nf-panel-btn {
+  display: block; width: 100%; margin-top: 6px; padding: 6px 8px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--accent); color: #1a1a19; font-weight: 600; cursor: pointer; font-size: 12px;
+}
+.nf-panel-btn.ghost { background: transparent; color: var(--text-secondary); font-weight: 400; }
+
+/* Draggable vertex handles on the in-progress shape. */
+.nf-vertex { background: transparent; border: 0; }
+.nf-vertex span {
+  display: block; width: 14px; height: 14px; border-radius: 50%;
+  background: #fff; border: 2px solid var(--accent); box-shadow: 0 1px 4px rgba(0,0,0,.6);
+  cursor: grab;
+}
+/* The active tool sets a body class, matching operations.js's ops-drawing
+   pattern, so the cursor tells the operator what a click will do. */
+body.nf-tool-waypoint #map { cursor: crosshair; }
+
+/* Zoom control, restyled to match the tool palette.
+   Leaflet's default is a hairline-bordered pair of squares that read as a
+   different app from the palette sitting directly above it on the same left
+   edge. Same container treatment, same button metrics, same hover - so the
+   left edge looks like one control strip rather than two libraries' defaults
+   stacked. Scoped to .leaflet-control-zoom rather than .leaflet-bar, because
+   the alerts overlay control is also a .leaflet-bar and has its own layout. */
+.leaflet-control-zoom.leaflet-bar {
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(26, 26, 25, 0.92);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, .45);
+}
+.leaflet-control-zoom.leaflet-bar a {
+  width: 38px;
+  height: 30px;
+  line-height: 30px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 18px;
+  font-weight: 600;
+  transition: background .12s ease, color .12s ease;
+}
+.leaflet-control-zoom.leaflet-bar a + a { margin-top: 2px; }
+.leaflet-control-zoom.leaflet-bar a:hover {
+  background: var(--surface-2);
+  color: var(--text-primary);
+}
+.leaflet-control-zoom.leaflet-bar a.leaflet-disabled {
+  background: transparent;
+  color: var(--text-muted);
+  opacity: .4;
+}
+
+/* While a drawing/measuring tool owns the left click, every layer except the
+   tool's own becomes click-through.
+   Without this, a click inside an analysis polygon, an event outline or a CAP
+   alert area never reaches the map - those layers are interactive and consume
+   it - so the waypoint tool silently did nothing over precisely the ground an
+   operator most wants to ask about. Making them transparent to clicks is the
+   correct behaviour for a modal tool: while it is active, the map is a canvas.
+   The tool's own pane keeps pointer events so its vertex handles stay
+   draggable. */
+body.nf-tool-waypoint .leaflet-marker-pane,
+body.nf-tool-waypoint .leaflet-overlay-pane,
+body.nf-tool-waypoint .leaflet-analysis-pane,
+body.nf-tool-waypoint .leaflet-industrial-pane,
+body.nf-tool-waypoint .leaflet-coverage-pane,
+body.nf-tool-measure .leaflet-marker-pane,
+body.nf-tool-measure .leaflet-overlay-pane,
+body.nf-tool-measure .leaflet-analysis-pane,
+body.nf-tool-measure .leaflet-industrial-pane,
+body.nf-tool-measure .leaflet-coverage-pane {
+  pointer-events: none;
+}
+body.nf-tool-waypoint .leaflet-nfTools-pane,
+body.nf-tool-measure .leaflet-nfTools-pane {
+  pointer-events: auto;
+}
+body.nf-tool-measure #map { cursor: crosshair; }

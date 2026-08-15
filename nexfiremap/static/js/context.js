@@ -177,6 +177,51 @@ export function onActiveIncident(callback) {
   callback(activeIncident);
 }
 
+// ----------------------------------------------------------- active tool
+
+/* Which map tool currently owns the left click.
+
+   Left-click in this app was subscribed by three modules at once: operations.js
+   binds `map.on("click", drawClick)` while sketching, markers and features have
+   their own popups, and app.js has handlers of its own. Nothing made that
+   visible or mutually exclusive, so "what does clicking do right now?" was an
+   implicit, unanswerable question.
+
+   The tool palette (tools.js) makes it explicit: exactly one tool is active,
+   and it owns the click. `"select"` is the default and reproduces the previous
+   behaviour exactly, so anyone who ignores the toolbar notices no change.
+
+   Same publish/subscribe/late-subscriber shape as the registries above - one
+   idiom for shared state in this app, not four. */
+
+/** @type {string} */
+let activeTool = "select";
+/** @type {Array<function(string): void>} */
+const toolSubscribers = [];
+
+/** Publishes the active tool. Called only by tools.js, which is also the only
+ * place a tool's deactivate() runs - centralising that is what stops a tool
+ * failing to release the click and leaving the map feeling broken.
+ * @param {string} tool - Tool id, e.g. "select" / "waypoint". */
+export function setActiveTool(tool) {
+  activeTool = tool || "select";
+  toolSubscribers.forEach((callback) => callback(activeTool));
+}
+
+/** The active tool id; "select" when the palette has not loaded at all, so a
+ * consumer never has to special-case its absence.
+ * @returns {string} */
+export function getActiveTool() {
+  return activeTool;
+}
+
+/** Subscribes to tool changes, firing immediately with the current value.
+ * @param {function(string): void} callback */
+export function onActiveTool(callback) {
+  toolSubscribers.push(callback);
+  callback(activeTool);
+}
+
 // ------------------------------------------------------------ fetch helper
 
 /** Fetches JSON from the local command server and throws with the server's

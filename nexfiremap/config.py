@@ -51,11 +51,22 @@ SOURCES = {
     },
 }
 
+# Enabled on a fresh install. The two VIIRS sensors left on are the 375 m ones
+# a European operator gets the most trustworthy picture from; the others stay
+# available in the source list and are one click away, just not on by default:
+#
+#   * MODIS_NRT is 1 km per pixel - nearly three times VIIRS's footprint in
+#     each axis, so a MODIS detection localises a fire far more loosely, and
+#     mixing it in widens every derived footprint and cluster.
+#   * VIIRS_NOAA21_NRT is the same 375 m instrument class as the two below,
+#     but its detections largely duplicate NOAA-20's on the same orbit track,
+#     adding overlapping pixels for the same fire rather than new information.
+#
+# This only sets the *default*; NEXFIREMAP_SOURCES overrides it, and nothing
+# here removes a source from SOURCES or stops an operator enabling it.
 DEFAULT_SOURCES = [
     "VIIRS_NOAA20_NRT",
-    "VIIRS_NOAA21_NRT",
     "VIIRS_SNPP_NRT",
-    "MODIS_NRT",
 ]
 
 

@@ -256,6 +256,65 @@
     );
   }
 
+  /** Parses a bounding box, returning {west, south, east, north} or null.
+   *
+   * Four numbers rather than two, in the "west,south,east,north" order every
+   * API in this app already uses (GeoJSON's bbox order, and what /api/events,
+   * /api/detections and /api/situation all take). Separators are deliberately
+   * loose - commas, whitespace, semicolons, and surrounding brackets - because
+   * an operator pasting a bbox has copied it from a log line, a GeoJSON file
+   * or another tool's URL, and none of those agree on punctuation.
+   *
+   * The south/north and west/east pairs are ordered here rather than rejected
+   * if reversed: a bbox typed the other way round is unambiguous about which
+   * area was meant, so correcting it is right where guessing usually is not.
+   * The antimeridian case is left alone - west > east is a legitimate
+   * wraparound elsewhere in this codebase (see geo.split_antimeridian), so it
+   * is only reordered when the values are plainly a latitude pair.
+   * @param {string} text - Raw input.
+   * @returns {?{west: number, south: number, east: number, north: number}} */
+  function parseBbox(text) {
+    if (!text) return null;
+    const parts = String(text)
+      .replace(/[[\]()]/g, " ")
+      .split(/[,;\s]+/)
+      .filter(Boolean);
+    if (parts.length !== 4) return null;
+    const values = parts.map(Number);
+    if (values.some((value) => !Number.isFinite(value))) return null;
+    let [west, south, east, north] = values;
+    if (Math.abs(south) > 90 || Math.abs(north) > 90) return null;
+    if (Math.abs(west) > 180 || Math.abs(east) > 180) return null;
+    if (south > north) [south, north] = [north, south];
+    // Only reorder longitudes when the span is small enough that a wraparound
+    // is implausible; a genuine antimeridian bbox has west > east on purpose.
+    if (west > east && west - east < 180) [west, east] = [east, west];
+    return { west, south, east, north };
+  }
+
+  /** Names the format `parse` actually used, so the UI can show it.
+   *
+   * A silent wrong guess is the failure mode of any auto-detecting parser -
+   * an operator pastes a grid reference, gets a plausible point 400 km away,
+   * and has nothing to tell them why. Reporting the detected format makes that
+   * visible at a glance.
+   * @param {string} text - Raw input.
+   * @param {?string} preferredSystem - Fallback system id.
+   * @returns {?string} A short human label, or null if nothing parsed. */
+  function detectFormat(text, preferredSystem) {
+    if (!text || !text.trim()) return null;
+    if (parseBbox(text)) return "bounding box";
+    if (parseDecimalPair(text)) return "WGS84 decimal degrees";
+    if (parseDmsPair(text)) return "WGS84 degrees/minutes";
+    if (parseMgrs(text)) return "MGRS";
+    if (parseUtm(text)) return "UTM";
+    if (parseGrid(text, preferredSystem)) {
+      const grid = findGrid(preferredSystem);
+      return grid ? grid.label : "selected grid";
+    }
+    return null;
+  }
+
   // ------------------------------------------------------------ formatting
 
   /** Formats a WGS84 point for display in the given coordinate system.
@@ -345,4 +404,4 @@
     }
   }
 
-  export { SYSTEMS, parse, format, currentSystem, setSystem, NATIONAL_GRIDS };
+  export { SYSTEMS, parse, parseBbox, detectFormat, format, currentSystem, setSystem, NATIONAL_GRIDS };
