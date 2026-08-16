@@ -228,6 +228,19 @@
         </div>
         <ul id="ops-safety-alerts-list"></ul>
       </section>
+
+      <!-- Modelled arrival at each trigger point. A trigger point says "when
+           fire reaches X, do Y"; the model knows when fire reaches X and, until
+           now, never said so - the IC had to click each point in the situation
+           panel and do the arithmetic by hand. Sits next to the automatic
+           warnings because it answers the same question earlier: how long have
+           we got before the withdrawal decision is due? -->
+      <section id="ops-trigger-points" class="ops-trigger-points" data-app="incident-command" hidden>
+        <h3>Trigger points &middot; modelled arrival</h3>
+        <ul id="ops-trigger-points-list"></ul>
+        <p class="hint">Modelled, not observed. Timings come from the model run attached to this
+          scenario; re-run it after the weather changes.</p>
+      </section>
       <div data-app="incident-command eventview">
         <label class="field"><span>Operator / unit</span><input id="ops-operator" maxlength="200" value="local operator"></label>
         <div class="ops-context-grid">

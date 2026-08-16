@@ -323,6 +323,7 @@ import { askConfirm, askText, askForm } from "./modal.js";
     await refreshVehicleTelemetry();
     await refreshSafetyAlerts();
     await loadIncidentAoi();
+    await loadTriggerPoints();
     await loadDroneMissions();
     await loadSafety();
     await loadSnapshots();
@@ -1048,6 +1049,55 @@ import { askConfirm, askText, askForm } from "./modal.js";
       },
     }).bindTooltip("Incident area of interest - new detections inside it raise a watch hit")
       .addTo(state.aoiLayer);
+  }
+
+  /** Shows modelled fire arrival at each trigger point, soonest first.
+   *
+   * The panel is hidden when the incident has no trigger points at all - an
+   * empty box teaches the eye to skip the place this information appears. It is
+   * *not* hidden when there is no model: "no propagation run is attached" is an
+   * answer the commander needs, and silently showing nothing would read as "no
+   * trigger point is threatened".
+   */
+  async function loadTriggerPoints() {
+    const host = $("#ops-trigger-points");
+    const list = $("#ops-trigger-points-list");
+    if (!host || !list) return;
+    if (!state.incidentId) { host.hidden = true; return; }
+
+    let payload;
+    try {
+      payload = await api(`/api/operations/incidents/${state.incidentId}/trigger-points`);
+    } catch (error) {
+      console.warn("trigger points unavailable", error);
+      host.hidden = true;
+      return;
+    }
+    const points = payload.trigger_points || [];
+    host.hidden = points.length === 0;
+    list.replaceChildren();
+    points.forEach((point) => {
+      const item = document.createElement("li");
+      const title = point.title || "trigger point";
+      if (!point.hours) {
+        item.className = "trigger-unknown";
+        item.textContent = payload.modelled
+          ? `${title}: outside the modelled area - no arrival time`
+          : `${title}: no propagation run attached to this scenario`;
+      } else {
+        const earliest = point.hours.earliest ?? point.hours.median;
+        const median = point.hours.median;
+        // Earliest drives the reading, for the same reason the position
+        // warning keys off it: a withdrawal is decided against the worst
+        // credible case the ensemble produced, not the middle one.
+        item.className = earliest <= 1 ? "trigger-imminent" : "";
+        item.textContent =
+          `${title}: fire modelled to arrive in ~${earliest} h` +
+          (median && median !== earliest ? ` (median ${median} h)` : "") +
+          (point.model_is_stale ? " - from a STALE model run" : "");
+      }
+      list.append(item);
+    });
   }
 
   async function refreshSafetyAlerts() {
@@ -2275,6 +2325,9 @@ import { askConfirm, askText, askForm } from "./modal.js";
       if (!state.incidentId) return;
       refreshVehicleTelemetry().catch(console.warn);
       refreshSafetyAlerts().catch(console.warn);
+      // Re-sampled on the same cycle: a re-run model moves every trigger
+      // point's timing at once, and that is exactly when it matters.
+      loadTriggerPoints().catch(console.warn);
     }, 15000);
     // "Mark seen" hides what is currently shown without deleting anything - the
     // audit trail is the record, this panel is only the notification. Stamped

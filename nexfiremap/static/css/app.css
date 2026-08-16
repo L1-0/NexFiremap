@@ -981,6 +981,22 @@ input[type="range"] { accent-color: var(--accent); }
 .ops-safety-alerts li { font-size: 12px; line-height: 1.5; }
 .ops-safety-alerts li + li { margin-top: 4px; }
 
+/* Trigger points with their modelled arrival. Deliberately calmer than the
+   safety alerts above: this is planning information ("how long have we got?"),
+   not an alarm, right up until a point goes imminent - at which stage it takes
+   the same amber the model caveats use, because it has become a statement about
+   how much time is left rather than a schedule. */
+.ops-trigger-points {
+  margin: 0 0 10px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2);
+}
+.ops-trigger-points[hidden] { display: none; }
+.ops-trigger-points h3 { margin: 0 0 6px; font-size: 12px; }
+.ops-trigger-points ul { margin: 0 0 6px; padding-left: 18px; }
+.ops-trigger-points li { font-size: 12px; line-height: 1.5; color: var(--text-secondary); }
+.ops-trigger-points li.trigger-imminent { color: var(--warning); font-weight: 600; }
+.ops-trigger-points li.trigger-unknown { color: var(--text-muted); font-style: italic; }
+
 .event-analysis {
   margin-top: 4px;
   padding-top: 10px;

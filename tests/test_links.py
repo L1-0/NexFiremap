@@ -282,6 +282,76 @@ def check_safety_warnings_are_readable() -> None:
             assert any(e["payload"] == {} for e in survived["entries"])
 
 
+def check_trigger_points_are_evaluated() -> None:
+    """The model must say when fire reaches each trigger point.
+
+    A trigger point's whole doctrinal job is "when fire reaches X, do Y" - the
+    withdrawal decision taken in advance so nobody has to judge it under
+    pressure. `evaluate_position` already sampled this exact surface for every
+    vehicle position; nothing sampled it for the trigger points themselves, so
+    the arithmetic was left to the commander at the moment they can least afford
+    it, and first-class LCES vocabulary stayed decorative.
+    """
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        settings = dataclasses.replace(
+            load_settings(), db_path=root / "links.sqlite3", job_dir=root / "jobs")
+        db, store = _store(root)
+        try:
+            incident = store.create_incident({"name": "Triggers"}, "IC")
+            period = store.create_period(incident["id"], default_period(), "IC")
+
+            def trigger(title: str, lon: float, lat: float) -> None:
+                store.create_feature(incident["id"], {
+                    "period_id": period["id"], "feature_type": "trigger_point",
+                    "title": title, "status": "planned",
+                    "geometry": {"type": "Point", "coordinates": [lon, lat]}}, "IC")
+
+            trigger("TP-1 inside the path", 11.60, 48.15)   # inside the fast region
+            trigger("TP-2 off the surface", 2.00, 40.00)    # outside the raster entirely
+
+            # With no model attached, every point is honestly "unknown" rather
+            # than silently reported as unthreatened.
+            before = safety.evaluate_trigger_points(db, settings, incident["id"])
+            assert len(before) == 2, before
+            assert all(entry["hours"] is None for entry in before), before
+
+            job_dir = root / "jobs" / "11"
+            job_dir.mkdir(parents=True)
+            hours = np.full((64, 64), 99.0, dtype=np.float32)
+            hours[20:44, 20:44] = 0.5
+            np.savez_compressed(job_dir / "impact_surface.npz", earliest_hours=hours,
+                                median_hours=hours + 0.4, latest_hours=hours + 1.0)
+            db.conn.execute(
+                "INSERT INTO jobs (id,kind,status,params_json,result_json,created_at,finished_at) "
+                "VALUES (11,'propagation','done','{}',?,1,1)",
+                (json.dumps({"bounds": [[48.10, 11.55], [48.20, 11.65]]}),))
+            db.conn.commit()
+            store.add_link(incident["id"], "model_run", "11", {"job_id": 11}, "", "IC")
+            safety.clear_cache()
+
+            after = safety.evaluate_trigger_points(db, settings, incident["id"])
+            by_title = {entry["title"]: entry for entry in after}
+            inside = by_title["TP-1 inside the path"]
+            assert inside["hours"], "the trigger point inside the modelled path got no arrival"
+            assert inside["hours"]["earliest"] == 0.5, inside["hours"]
+            # A band, never one number - the same rule the position warning follows.
+            assert inside["hours"]["median"] > inside["hours"]["earliest"], inside["hours"]
+
+            # A point the model does not cover is reported, not dropped: "the
+            # model does not reach TP-2" and "TP-2 is not threatened" are
+            # different answers and must not look alike.
+            assert "TP-2 off the surface" in by_title
+            outside = by_title["TP-2 off the surface"]
+            assert outside["hours"] is None or outside["hours"].get("earliest", 0) > 90, outside
+
+            # Soonest first, so a panel showing the top few shows the ones
+            # about to fire.
+            assert after[0]["title"] == "TP-1 inside the path", [e["title"] for e in after]
+        finally:
+            db.close()
+
+
 def check_safety_loop() -> None:
     """A crew inside a hazard area, and a crew in the modelled path, both get
     warned - and neither warning is allowed to cost the position."""
@@ -563,6 +633,7 @@ def main() -> None:
     check_point_in_polygon()
     check_export_import_round_trip()
     check_safety_loop()
+    check_trigger_points_are_evaluated()
     check_safety_warnings_are_readable()
     check_control_lines()
     check_control_lines_reach_the_model()

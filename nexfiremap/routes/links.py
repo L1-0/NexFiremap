@@ -282,6 +282,33 @@ async def api_safety_warnings(
     })
 
 
+@router.get("/api/operations/incidents/{incident_id}/trigger-points")
+async def api_trigger_points(request: Request, incident_id: str) -> Response:
+    """Modelled fire arrival at each of this incident's trigger points.
+
+    A trigger point exists to say "when fire reaches X, do Y" - the withdrawal
+    decision made in advance so nobody has to judge it under pressure. The model
+    already knows when fire reaches X, and `safety.evaluate_position` samples
+    exactly this surface for every vehicle position; nothing sampled it for the
+    trigger points themselves, so the arithmetic was left to the commander at
+    the moment they can least afford it.
+    """
+    from ..safety import evaluate_trigger_points
+
+    store: OperationsStore = request.app.state.operations
+    store.get_incident(incident_id)
+
+    points = await asyncio.to_thread(
+        evaluate_trigger_points, request.app.state.db, request.app.state.settings, incident_id)
+    return _json({
+        "incident_id": incident_id,
+        "trigger_points": points,
+        # "no model attached" and "no trigger point is threatened" are
+        # different answers, and a caller must be able to tell them apart.
+        "modelled": any(point["hours"] for point in points),
+    })
+
+
 @router.get("/api/operations/watch")
 async def api_aoi_watch(
     request: Request,

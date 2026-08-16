@@ -271,6 +271,72 @@ def _arrival(db: Any, settings: Any, incident_id: str, callsign: str,
     }]
 
 
+def evaluate_trigger_points(db: Any, settings: Any, incident_id: str) -> list[dict[str, Any]]:
+    """Modelled fire arrival at each of the incident's trigger points.
+
+    A trigger point's entire doctrinal job is "when fire reaches X, do Y" - it
+    is the pre-agreed moment a crew stops working and withdraws, decided in
+    advance precisely so nobody has to judge it under pressure. The model knows
+    when fire reaches X: `safety.evaluate_position` already samples exactly this
+    surface for every vehicle position. Nothing sampled it for the trigger
+    points themselves, so the IC had to click each one in the situation panel
+    and do the arithmetic by hand - which makes first-class LCES vocabulary
+    decorative at the moment it matters most.
+
+    Returns one entry per trigger point with a geometry, ordered soonest first,
+    so a panel showing the top few shows the ones about to fire. Points the
+    model does not cover are returned with `hours: null` rather than dropped:
+    "the model does not reach TP-3" and "TP-3 is not threatened" are different
+    answers, and silently omitting the first would read as the second.
+    """
+    from .structures import _sample_hours
+
+    surface = _active_arrival(db, settings, incident_id)
+    rows = db.conn.execute(
+        "SELECT id,title,geometry_json,status FROM tactical_features "
+        "WHERE incident_id=? AND deleted_at IS NULL AND feature_type='trigger_point'",
+        (incident_id,)).fetchall()
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            geometry = json.loads(row["geometry_json"] or "{}")
+            longitude, latitude = geometry["coordinates"][0], geometry["coordinates"][1]
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        entry: dict[str, Any] = {
+            "feature_id": row["id"],
+            "title": row["title"] or "trigger point",
+            "status": row["status"],
+            "lat": latitude, "lon": longitude,
+            "hours": None,
+            "model_is_stale": bool(surface.get("is_stale")) if surface else False,
+        }
+        if surface:
+            bands: dict[str, float] = {}
+            for key, label in (("earliest_hours", "earliest"), ("median_hours", "median"),
+                               ("latest_hours", "latest")):
+                if key in surface:
+                    hours = _sample_hours(surface[key], {"lat": latitude, "lon": longitude},
+                                          surface["bounds"])
+                    if hours is not None:
+                        bands[label] = round(float(hours), 2)
+            if bands:
+                entry["hours"] = bands
+        results.append(entry)
+
+    # Soonest first, on the earliest band for the same reason the position
+    # warning keys off it: a withdrawal decision is made against the worst
+    # credible case, not the middle one. Unreached points sort last.
+    def order(entry: dict[str, Any]) -> float:
+        bands = entry.get("hours") or {}
+        value = bands.get("earliest", bands.get("median"))
+        return float(value) if value is not None else float("inf")
+
+    results.sort(key=order)
+    return results
+
+
 def record_warnings(store: Any, incident_id: str, warnings: list[dict[str, Any]],
                     actor: str = "safety") -> None:
     """Write warnings to the incident's audit trail.
@@ -295,7 +361,7 @@ def record_warnings(store: Any, incident_id: str, warnings: list[dict[str, Any]]
 
 
 __all__ = ["DEFAULT_WARNING_HOURS", "HAZARD_FEATURE_TYPES", "RASTER_CACHE_SECONDS",
-           "clear_cache", "evaluate_position", "record_warnings",
+           "clear_cache", "evaluate_position", "evaluate_trigger_points", "record_warnings",
            "record_watch", "watch_detections",
            "CONTROL_LINE_BUILT", "CONTROL_LINE_TYPES", "control_mask"]
 
