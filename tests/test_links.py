@@ -350,6 +350,78 @@ def check_safety_loop() -> None:
             db.close()
 
 
+def check_control_lines_reach_the_model() -> None:
+    """The barrier mask must actually be reachable from a propagation run.
+
+    `control_mask` and CONTROL_LINE_BUILT were complete and unit-tested with
+    **zero production callers**: `build_directional_behavior` accepted a
+    `control_lines` argument that both job bodies left unset, and the propagate
+    route took no incident id, so a run could not have known whose lines to
+    fetch. The rule this protects - a *planned* line must never be fed to the
+    model, because the resulting forecast would flatter the plan - was
+    therefore guarding a code path that never ran.
+
+    This exercises `terrain._built_control_lines`, the seam the job bodies
+    actually call, rather than `control_mask` in isolation.
+    """
+    import sqlite3
+
+    from nexfiremap.geo import grid_geometry
+    from nexfiremap.terrain import _built_control_lines
+
+    bbox = (11.0, 48.0, 11.2, 48.2)
+    geom = grid_geometry(bbox, desired_res_m=200.0)
+
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp) / "lines.sqlite3"
+        db = Database(path)
+        try:
+            store = OperationsStore(db)
+            incident = store.create_incident({"name": "Barrier"}, "IC")
+            period = store.create_period(incident["id"], default_period(), "IC")
+            crossing = [[11.05, 48.0], [11.05, 48.2]]
+            for status in ("held", "planned"):
+                store.create_feature(incident["id"], {
+                    "period_id": period["id"], "feature_type": "tactical_line",
+                    "status": status, "title": f"{status} line",
+                    "geometry": {"type": "LineString", "coordinates": crossing},
+                }, "IC")
+        finally:
+            db.close()
+
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        try:
+            mask, cells = _built_control_lines(conn, incident["id"], bbox, geom)
+            assert cells > 0, "a held control line did not reach the model as a barrier"
+            assert mask is not None and mask.shape == (geom["ny"], geom["nx"]), mask
+            held_cells = cells
+
+            # No incident named: no barriers, and no error - a propagation run
+            # without an incident is legitimate.
+            assert _built_control_lines(conn, None, bbox, geom) == (None, 0)
+            # An unknown incident must degrade quietly, not fail the forecast.
+            assert _built_control_lines(conn, "no-such-incident", bbox, geom)[1] == 0
+
+            # The load-bearing rule: with every line merely *planned*, nothing
+            # rasterises. A plan must not appear to the model as a barrier.
+            db = Database(path)
+            try:
+                with db._write_lock:
+                    db.conn.execute("UPDATE tactical_features SET status='planned'")
+                    db.conn.commit()
+            finally:
+                db.close()
+            conn.close()
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            assert _built_control_lines(conn, incident["id"], bbox, geom)[1] == 0, \
+                "a planned line was fed to the model as a barrier"
+            assert held_cells > 0
+        finally:
+            conn.close()
+
+
 def check_control_lines() -> None:
     """Built control lines become barriers; planned ones must not.
 
@@ -493,6 +565,7 @@ def main() -> None:
     check_safety_loop()
     check_safety_warnings_are_readable()
     check_control_lines()
+    check_control_lines_reach_the_model()
     check_http_surface()
     print("Cross-module link, AOI and safety-loop checks passed.")
 

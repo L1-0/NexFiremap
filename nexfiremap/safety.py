@@ -146,7 +146,29 @@ def _active_arrival(db: Any, settings: Any, incident_id: str) -> dict[str, Any] 
         bounds = json.loads(dict(job).get("result_json") or "{}").get("bounds")
     except (TypeError, ValueError):
         bounds = None
-    return _load_arrival(settings.job_dir, job_id, bounds)
+    arrival = _load_arrival(settings.job_dir, job_id, bounds)
+    if arrival is None:
+        return None
+
+    # Carry the run's own staleness through to the warning. The wind module and
+    # the scenario panel both track `is_stale`, and this - the one consumer
+    # where being wrong is a life-safety matter - took the newest linked run
+    # unconditionally. A surface computed against weather from many hours ago
+    # can put the arrival band in the wrong place in either direction, and a
+    # crew told "fire reaches you in 40 minutes" deserves to know the number
+    # came from a model nobody has re-run since the wind changed.
+    #
+    # Deliberately *not* a reason to withhold the warning: a stale forecast is
+    # still the best available estimate, and suppressing it would trade a
+    # qualified warning for no warning at all.
+    try:
+        snapshot = json.loads(row["snapshot_json"] or "{}")
+        provenance = snapshot.get("provenance") or {}
+    except (TypeError, ValueError):
+        provenance = {}
+    arrival["is_stale"] = bool(provenance.get("is_stale"))
+    arrival["valid_until"] = provenance.get("valid_until")
+    return arrival
 
 
 def evaluate_position(db: Any, settings: Any, incident_id: str, *, callsign: str,
@@ -230,13 +252,22 @@ def _arrival(db: Any, settings: Any, incident_id: str, callsign: str,
     if soonest is None or soonest > warning_hours:
         return []
     span = (f" (median {bands['median']:g} h)" if "median" in bands and bands["median"] != soonest else "")
+    # Say so when the surface behind the number is stale. The warning still
+    # fires - a stale forecast beats no forecast - but "in ~40 minutes" from a
+    # model nobody has re-run since the wind changed is a different claim from
+    # the same number off a current one, and the crew acting on it is entitled
+    # to the difference.
+    stale = " - from a STALE model run, re-run before relying on the timing" \
+        if surface.get("is_stale") else ""
     return [{
         "code": "modelled_arrival_imminent",
         "severity": "high" if soonest <= warning_hours / 2 else "elevated",
         "callsign": callsign,
         "hours": bands,
+        "model_is_stale": bool(surface.get("is_stale")),
+        "model_valid_until": surface.get("valid_until"),
         "message": (f"{callsign}: fire modelled to arrive in ~{soonest:g} h{span} - "
-                    f"modelled, not observed"),
+                    f"modelled, not observed{stale}"),
     }]
 
 

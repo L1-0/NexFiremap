@@ -480,6 +480,56 @@ def build_directional_behavior(
 # --------------------------------------------------------------- solving
 
 
+class _ConnHandle:
+    """Adapts a raw sqlite3 connection to the ``.conn`` attribute style.
+
+    `safety.control_mask` takes the `Database` wrapper the operational half
+    passes around; a job body has only the bare connection it opened from
+    `ctx.db_path`. One attribute is the whole difference, and adapting here is
+    better than widening control_mask's contract to accept either - that
+    function's one job is reading rows, and it should not have to care which
+    of two shapes it was handed.
+    """
+
+    __slots__ = ("conn",)
+
+    def __init__(self, conn: Any) -> None:
+        self.conn = conn
+
+
+def _built_control_lines(conn: Any, incident_id: str | None, bbox: tuple[float, float, float, float],
+                         geom: dict[str, Any]) -> tuple[Any, int]:
+    """Built control lines for `incident_id`, rasterised onto the model grid.
+
+    Returns (mask or None, count). `safety.control_mask` and its
+    CONTROL_LINE_BUILT filter have existed and been unit-tested since the
+    integration work with **no production caller** - `build_directional_behavior`
+    accepted `control_lines` and both job bodies passed nothing, and the
+    propagate route took no incident id, so a run could not have known whose
+    lines to fetch even if it wanted them. The carefully-argued rule that a
+    *planned* line must not be fed to the model (it would produce a forecast
+    flattering the plan) was therefore protecting a code path that never ran.
+
+    Degrades to "no barriers" rather than failing the run: a propagation that
+    cannot read control lines is still a useful forecast, and losing the whole
+    job because the operational half is unavailable would be the worse trade.
+    The count is returned so the result can say whether barriers were applied -
+    a forecast that assumed a dozer line held should not look identical to one
+    that did not.
+    """
+    if not incident_id:
+        return None, 0
+    try:
+        from .safety import control_mask
+
+        bounds = [[bbox[1], bbox[0]], [bbox[3], bbox[2]]]
+        mask = control_mask(_ConnHandle(conn), incident_id, bounds, (geom["ny"], geom["nx"]))
+        return (mask, int(mask.sum())) if mask.any() else (None, 0)
+    except Exception:  # noqa: BLE001 - a barrier lookup must never cost the forecast
+        log.warning("Could not read control lines for incident %s", incident_id, exc_info=True)
+        return None, 0
+
+
 def _sign(value: int) -> int:
     return (value > 0) - (value < 0)
 
@@ -762,8 +812,14 @@ def run_propagation(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
     moisture = dead_fuel_moisture_from_weather(weather)
     ctx.report_progress(60, note=f"wind {weather['wind_speed_ms']:.1f} m/s, dead-1h moisture {moisture[0]:.0%}")
 
+    control_lines, control_cells = _built_control_lines(
+        conn, params.get("incident_id"), bbox, geom)
+    if control_cells:
+        ctx.report_progress(62, note=f"{control_cells} cell(s) held by built control lines")
+
     behavior = build_directional_behavior(
-        fuel_classes, slope_rad, aspect_deg, weather["wind_speed_ms"], weather["wind_direction_deg"], moisture
+        fuel_classes, slope_rad, aspect_deg, weather["wind_speed_ms"], weather["wind_direction_deg"],
+        moisture, control_lines=control_lines,
     )
 
     west, south, _, _ = bbox
@@ -813,6 +869,11 @@ def run_propagation(params: dict[str, Any], ctx: JobContext) -> dict[str, Any]:
         # suspiciously slow forecast. `situation.py` takes the same position:
         # "we did not ask" and "there is nothing there" are different answers.
         "caveats": _model_caveats(weather),
+        # Whether the run treated operator-built control lines as barriers.
+        # A forecast that assumed a dozer line held must not look identical to
+        # one that did not - and 0 here on an incident that has cut lines is
+        # the signal that they were not read.
+        "control_line_cells": control_cells,
         "dead_fuel_moisture": {"1h": round(float(moisture[0]), 3), "10h": round(float(moisture[1]), 3), "100h": round(float(moisture[2]), 3)},
         "typical_max_travel_hours": typical_max_hours,
         # Distinct hour levels actually drawn, not the raw feature count -
@@ -982,6 +1043,13 @@ def run_ensemble_assimilation(params: dict[str, Any], ctx: JobContext) -> dict[s
     travel_stack = np.empty((n_members, geom["ny"], geom["nx"]), dtype=np.float64)
     log_likelihood = np.zeros(n_members)
 
+    # Built lines are ground truth, not a sampled uncertainty: every member
+    # sees the same barriers. Varying them across the ensemble would model
+    # doubt about whether a line the operator reported as built exists, which
+    # is not the uncertainty this ensemble is about.
+    control_lines, control_cells = _built_control_lines(
+        conn, params.get("incident_id"), bbox, geom)
+
     for i, member in enumerate(ensemble):
         behavior = build_directional_behavior(
             fuel_classes,
@@ -992,6 +1060,7 @@ def run_ensemble_assimilation(params: dict[str, Any], ctx: JobContext) -> dict[s
             moisture,
             fuel_mult=member["fuel_mult"],
             spread_mult=member["spread_mult"],
+            control_lines=control_lines,
         )
         ignition_rowcols = [
             to_rowcol(lat, lon, member["ignition_dx_m"], member["ignition_dy_m"])
@@ -1073,6 +1142,11 @@ def run_ensemble_assimilation(params: dict[str, Any], ctx: JobContext) -> dict[s
         # "we did not ask" and "there is nothing there" are different answers.
         "caveats": _model_caveats(weather, effective_sample_size=effective_sample_size,
                                   n_members=n_members),
+        # Whether the run treated operator-built control lines as barriers.
+        # A forecast that assumed a dozer line held must not look identical to
+        # one that did not - and 0 here on an incident that has cut lines is
+        # the signal that they were not read.
+        "control_line_cells": control_cells,
         "n_members": n_members,
         "effective_sample_size": round(effective_sample_size, 1),
         "seed_detections": len(seed_points),

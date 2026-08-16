@@ -67,6 +67,12 @@ class BurnScarRequest(BaseModel):
 class PropagationRequest(BaseModel):
     resolution_m: float = Field(60.0, ge=20, le=500)
     reference_ts: float | None = None
+    # Which incident's *built* control lines to rasterise as barriers. Optional
+    # because a propagation run is meaningful without an incident - the
+    # analytical half can model a fire nobody has opened a record for yet - but
+    # without it `safety.control_mask` has no way to know whose lines to fetch,
+    # which is why that function had no production caller at all.
+    incident_id: str | None = Field(None, max_length=64)
 
 
 class EnsembleRequest(BaseModel):
@@ -74,6 +80,7 @@ class EnsembleRequest(BaseModel):
     reference_ts: float | None = None
     n_members: int = Field(60, ge=5, le=300)
     random_seed: int | None = None
+    incident_id: str | None = Field(None, max_length=64)
 
 
 class ValidationRequest(BaseModel):

@@ -187,6 +187,12 @@ async def api_events_propagate(
             "event_id": event_id,
             "resolution_m": body.resolution_m,
             "reference_ts": body.reference_ts,
+            # Carries the incident whose built control lines should act as
+            # barriers. Without it the model cannot see the lines an operator
+            # has actually cut - `safety.control_mask` existed, was tested, and
+            # had no caller, so the "a planned line must not flatter the plan"
+            # rule guarded a path that never ran.
+            "incident_id": body.incident_id,
         },
     )
     return _json({"job_id": job_id}, status_code=202)
@@ -209,6 +215,7 @@ async def api_events_ensemble(
             "reference_ts": body.reference_ts,
             "n_members": body.n_members,
             "random_seed": body.random_seed,
+            "incident_id": body.incident_id,
         },
     )
     return _json({"job_id": job_id}, status_code=202)

@@ -249,7 +249,16 @@ class AlertManager:
         interchangeably, so the document's own shape is the more reliable
         signal.
         """
-        assert self._client is not None
+        # Not an `assert`: `python -O` strips those, so a bare assertion is a
+        # check that silently stops existing in exactly the deployment most
+        # likely to be running unattended. `start()` always builds the client
+        # before the poll loop, so this is a guard against a future caller
+        # reaching here out of order, and it returns the same (count, error)
+        # shape every other failure path here returns rather than raising into
+        # the loop.
+        if self._client is None:
+            log.warning("CAP poll attempted before the client was started")
+            return 0, "poller not started"
         try:
             response = await self._client.get(url)
         except httpx.HTTPError as exc:

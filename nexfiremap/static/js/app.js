@@ -9,7 +9,9 @@
    scripts are deferred and the vendor tags are not. */
 
 import * as Coords from "./coords.js";
-import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./context.js";
+import {
+  setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu, getActiveIncident,
+} from "./context.js";
 
   const $ = (sel) => document.querySelector(sel);
   const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -2750,6 +2752,20 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
    * empty box trains the eye to skip the place warnings appear.
    * @param {string[]|null|undefined} caveats
    */
+  /** `{incident_id}` when one is being worked, `{}` otherwise.
+   *
+   * A propagation run is meaningful without an incident - the analytical half
+   * models fires nobody has opened a record for yet - so this is optional
+   * rather than required. When there *is* one, naming it is what lets
+   * `safety.control_mask` find that incident's built control lines and hand
+   * them to the model as barriers; that function had no production caller at
+   * all until this, so lines an operator had cut changed nothing.
+   * @returns {{incident_id?: string}} */
+  function activeIncidentBody() {
+    const incident = getActiveIncident();
+    return incident?.id ? { incident_id: incident.id } : {};
+  }
+
   function showCaveats(caveats) {
     const host = $("#analysis-caveats");
     if (!host) return;
@@ -2915,7 +2931,11 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
       const res = await fetch(`/api/events/${eventId}/propagate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        // Naming the active incident lets the model rasterise that incident's
+        // *built* control lines as barriers. Without it the run cannot know
+        // whose lines to read, so a dozer line an operator has actually cut had
+        // no effect on the forecast at all.
+        body: JSON.stringify(activeIncidentBody()),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const { job_id } = await res.json();
@@ -2950,7 +2970,7 @@ import { setMap, setSpreadAnalysis, getPrintView, emitMapContextMenu } from "./c
       const res = await fetch(`/api/events/${eventId}/ensemble`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ n_members: 40 }),
+        body: JSON.stringify({ n_members: 40, ...activeIncidentBody() }),
       });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
