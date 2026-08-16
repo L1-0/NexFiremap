@@ -50,7 +50,7 @@ import { askConfirm, askText, askForm } from "./modal.js";
     incidentId: "", periodId: "", scenarioId: "",
     featureLayer: null, resourceLayer: null, vehicleLayer: null, vehicleTrackLayer: null,
     windLayer: null, windObservationLayer: null,
-    sketchLayer: null, progressionLayer: null,
+    sketchLayer: null, progressionLayer: null, aoiLayer: null,
     // Mutually exclusive: at most one of these is ever non-null at a time.
     // `drawing` means "collecting vertices for a brand-new geometry" (see
     // startDraw()); `editingFeatureId` means "editing an existing saved
@@ -295,6 +295,7 @@ import { askConfirm, askText, askForm } from "./modal.js";
   async function selectIncident(id) {
     cancelDraw({ discardDraft: false });
     state.progressionLayer?.clearLayers(); state.vehicleLayer?.clearLayers();
+    state.aoiLayer?.clearLayers();
     state.vehicleTrackLayer?.clearLayers(); state.pendingFieldImport = null;
     clearWindMap();
     if ($("#btn-apply-field-import")) $("#btn-apply-field-import").hidden = true;
@@ -321,6 +322,7 @@ import { askConfirm, askText, askForm } from "./modal.js";
     renderResources();
     await refreshVehicleTelemetry();
     await refreshSafetyAlerts();
+    await loadIncidentAoi();
     await loadDroneMissions();
     await loadSafety();
     await loadSnapshots();
@@ -1012,6 +1014,42 @@ import { askConfirm, askText, askForm } from "./modal.js";
    * this panel stays current, and asked for since the last poll so a long
    * session does not re-render the same warnings forever.
    */
+  /** Draws the incident's area of interest, or clears it when there is none.
+   *
+   * The AOI decides real things - `incidents_covering` answers "does this new
+   * detection concern anyone", and `GET /api/operations/watch` scans new
+   * detections against every active one - and it could be *set* from the
+   * waypoint tool and from `from_context` but never *seen*. An operator had no
+   * way to tell whether the area their watch was keyed to matched the fire, or
+   * whether an incident had one at all.
+   *
+   * Drawn as an outline with almost no fill: it is a boundary, not a hazard,
+   * and it sits under everything tactical rather than colouring the ground the
+   * plan is drawn on.
+   */
+  async function loadIncidentAoi() {
+    if (!state.aoiLayer) return;
+    state.aoiLayer.clearLayers();
+    if (!state.incidentId) return;
+    let aoi;
+    try {
+      aoi = await api(`/api/operations/incidents/${state.incidentId}/aoi`);
+    } catch (error) {
+      // An incident with no AOI is the ordinary case, not a fault.
+      console.warn("AOI unavailable", error);
+      return;
+    }
+    const geometry = aoi?.aoi || aoi;
+    if (!geometry || geometry.type !== "Polygon") return;
+    L.geoJSON(geometry, {
+      style: {
+        color: "#8bb4ff", weight: 2, dashArray: "6 4",
+        fillColor: "#8bb4ff", fillOpacity: 0.04, interactive: false,
+      },
+    }).bindTooltip("Incident area of interest - new detections inside it raise a watch hit")
+      .addTo(state.aoiLayer);
+  }
+
   async function refreshSafetyAlerts() {
     const host = $("#ops-safety-alerts");
     const list = $("#ops-safety-alerts-list");
@@ -2177,6 +2215,7 @@ import { askConfirm, askText, askForm } from "./modal.js";
     state.windObservationLayer = L.featureGroup().addTo(map);
     state.sketchLayer = L.featureGroup().addTo(map);
     state.progressionLayer = L.featureGroup().addTo(map);
+    state.aoiLayer = L.featureGroup().addTo(map);
     // Wired before any await below, not after: every handler here only
     // touches state/DOM lazily when it actually runs, never at attachment
     // time, so there's no ordering requirement forcing this later - but
