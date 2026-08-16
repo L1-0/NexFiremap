@@ -329,6 +329,20 @@ CONNECTIVITY_TARGETS: list[tuple[str, str]] = [
     # SECRET, if configured, get a deeper check in run_connectivity_tests below,
     # the same way FIRMS_MAP_KEY does via check_firms_key.
     ("EUMETSAT Data Store (optional, MTG/FCI corroboration)", "https://api.eumetsat.int/token"),
+    # These three were missing while the README claimed the wizard "tests
+    # reachability of every external data source". They are the ones an
+    # operator hits *first* in the field, which made the omission worse than
+    # the count suggests: Overpass backs the structure and industrial scans,
+    # Terrarium backs the 3D terrain view, and Nominatim backs the search box
+    # and the reverse-geocoded incident naming on the right-click menu. A
+    # wizard reporting "everything reachable" while none of those had been
+    # tried is exactly the kind of reassuring-by-omission answer this project
+    # works hard to avoid elsewhere.
+    ("Overpass API (structures / industrial screening)", "https://overpass-api.de/api/status"),
+    ("AWS Terrarium terrain tiles (3D view)",
+     "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/0/0/0.png"),
+    ("Nominatim (place search, incident naming)",
+     "https://nominatim.openstreetmap.org/search?q=test&format=json&limit=1"),
 ]
 
 

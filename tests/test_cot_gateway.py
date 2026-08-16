@@ -344,6 +344,7 @@ def main() -> None:
     check_http_surface()
     check_security_carveout_stays_narrow()
     check_one_bad_clock_does_not_blank_the_fleet()
+    check_misconfigured_feature_acceptance_is_visible()
     print("CoT gateway, OsmAnd and MAVLink checks passed.")
 
 
@@ -412,6 +413,53 @@ def check_one_bad_clock_does_not_blank_the_fleet() -> None:
                 ]},
             )
             assert only_bad.status_code == 400, only_bad.status_code
+
+
+def check_misconfigured_feature_acceptance_is_visible() -> None:
+    """Accepting features with no incident configured must not fail silently.
+
+    `_upsert_features` returned early when `cot_incident_id` was unset, with no
+    log line and nothing in `status()`. So an operator who switched feature
+    acceptance on and forgot the incident id saw a gateway reporting healthy
+    receipt while every tactical marker a TAK device sent was discarded -
+    "features disabled" and "features misconfigured" were indistinguishable
+    from outside, which is the failure mode this project spends most of its
+    effort avoiding elsewhere.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from nexfiremap.cot_gateway import CotGateway
+    from nexfiremap.db import Database
+    from nexfiremap.operations import OperationsStore
+    from nexfiremap.telemetry import TelemetryManager
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        settings = _settings(root, cot_accept_features=True, cot_incident_id="")
+        db = Database(root / "gw.sqlite3")
+        try:
+            store = OperationsStore(db)
+            gateway = CotGateway(settings, TelemetryManager(store, settings), store)
+
+            status = gateway.status()
+            assert status["accept_features"] is True, status
+            assert status["incident_id"] is None, status
+            assert status["features_discarded"] == 0, status
+
+            overlays = [({"type": "Point", "coordinates": [11.5, 48.1]},
+                         {"cot_uid": "marker-1", "title": "Spot"})]
+            gateway._upsert_features(overlays, "127.0.0.1")
+            gateway._upsert_features(overlays, "127.0.0.1")
+
+            after = gateway.status()
+            assert after["features_discarded"] == 2, after
+            assert after["features"] == 0, "nothing may be reported as stored"
+            # Warned once, not per packet: an ATAK device refreshes markers every
+            # few seconds and a per-packet log would bury its own message.
+            assert gateway._warned_missing_incident is True
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

@@ -28,7 +28,9 @@ against in another.
 
 **Easiest**: run the setup wizard. It creates a virtual environment, installs
 dependencies package-by-package with fallbacks, walks you through the FIRMS key, and
-tests reachability of every external source before starting the server.
+tests reachability of every external source it knows about before starting the server
+(FIRMS, Celestrak, Planetary Computer, Open-Meteo, OSM tiles, EUMETSAT, Overpass,
+AWS Terrarium and Nominatim).
 
 | Platform | Install (once) | Start |
 |---|---|---|

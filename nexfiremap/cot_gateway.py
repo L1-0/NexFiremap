@@ -83,6 +83,11 @@ class CotGateway:
         self.rejected = 0
         self.positions = 0
         self.features = 0
+        # Features received while feature acceptance is on but no incident is
+        # configured. Counted rather than only logged so the misconfiguration
+        # is visible in `status()` long after the one-shot warning scrolled by.
+        self.features_discarded = 0
+        self._warned_missing_incident = False
         self.last_error: str | None = None
         self.last_received_at: str | None = None
 
@@ -299,6 +304,24 @@ class CotGateway:
         """
         incident_id = self.settings.cot_incident_id
         if not incident_id:
+            # Feature acceptance is switched on but has nowhere to put anything.
+            # This used to return in silence, so an operator who had enabled
+            # cot_accept_features and forgotten cot_incident_id saw a gateway
+            # reporting healthy receipt while every tactical marker a TAK device
+            # sent was dropped - "features disabled" and "features misconfigured"
+            # looked identical from outside.
+            #
+            # Warned once rather than per packet: an ATAK device refreshes its
+            # markers every few seconds, and a per-packet log would bury the
+            # message it is trying to deliver. `status()` carries the standing
+            # version of the same fact.
+            if not self._warned_missing_incident:
+                self._warned_missing_incident = True
+                log.warning(
+                    "NEXFIREMAP_COT_ACCEPT_FEATURES is on but NEXFIREMAP_COT_INCIDENT_ID is "
+                    "unset - inbound CoT tactical features are being discarded. Set the "
+                    "incident id, or turn feature acceptance off.")
+            self.features_discarded += len(overlays)
             return
         for geometry, properties in overlays:
             uid = str(properties.get("cot_uid") or "")
@@ -362,6 +385,11 @@ class CotGateway:
             "rejected": self.rejected,
             "positions": self.positions,
             "features": self.features,
+            "features_discarded": self.features_discarded,
+            # Surfaced so "features are off" and "features are on but going
+            # nowhere" are distinguishable without reading the server log.
+            "accept_features": bool(self.settings.cot_accept_features),
+            "incident_id": self.settings.cot_incident_id or None,
             "last_received_at": self.last_received_at,
             "last_error": self.last_error,
         }

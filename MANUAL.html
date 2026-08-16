@@ -289,7 +289,7 @@ with the least-privileged role that covers their job; do not share the administr
 let the <code>admin</code> login be a routine daily login for a field user.</p>
 
 <h2 id="c3-5">3.5 Sessions and login limits</h2>
-<p>A session lasts <code>NEXFIREMAP_SESSION_MINUTES</code> (default 60) from login, holds a session
+<p>A session lasts <code>NEXFIREMAP_SESSION_MINUTES</code> (default 30) from login, holds a session
 token and a separate CSRF token, and is checked on every request. Login attempts are rate-limited: at
 most 10 attempts per 60 seconds per client. If a device cannot sign in, an administrator creates a
 replacement named account; do not disable authentication or fall back to loopback-only mode to work
@@ -351,7 +351,7 @@ scenario, and, where relevant, an area of interest and a link back to what was s
 <p>The map-style button (bottom right of the map) opens a grid of basemaps: OpenStreetMap, Humanitarian
 OSM, OpenTopoMap, CyclOSM, Carto Positron (light), Carto Dark Matter, Esri World Imagery, and Esri Terrain
 (full detail to zoom 9, enlarged beyond that). A place-labels overlay can be switched on over any of them.
-An administrator can add further WMS, WMTS or plain XYZ layers from an external service (chapter 8.5), or
+An administrator can add further WMS, WMTS or plain XYZ layers from an external service (layer administration, chapter 11.4.9), or
 an imported local MBTiles/GeoTIFF basemap (chapter 8.4); both then appear in this same picker.</p>
 
 <h2 id="c4-5">4.5 Search and coordinates</h2>
