@@ -24,7 +24,9 @@ from ..config import SOURCES
 from ..db import Database
 from ..geocode import GeocodeService
 from ..jobs import JobManager
-from ..operations import AREA_TYPES, FEATURE_TYPES, LINE_TYPES, POINT_TYPES, SAFETY_CHECKS
+from ..operations import (
+    AREA_TYPES, FEATURE_TYPES, LINE_TYPES, POINT_TYPES, SAFETY_CHECKS, SCENARIO_KINDS,
+)
 from .. import settings_store, symbology
 from ..tiles import TileCache, public_layer
 from . import common
@@ -133,6 +135,10 @@ async def api_operations_meta(request: Request) -> Response:
     settings = request.app.state.settings
     return _json({
         "feature_types": sorted(FEATURE_TYPES),
+        # Published so the scenario dialog can render a picker rather than
+        # asking an operator to retype one of four exact strings, which the
+        # old prompt() did and the server then silently rejected.
+        "scenario_kinds": sorted(SCENARIO_KINDS),
         "geometry": {
             "Point": sorted(POINT_TYPES),
             "LineString": sorted(LINE_TYPES),

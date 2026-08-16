@@ -27,6 +27,7 @@
 import {
   whenMap, fetchJson, setActiveTool, getActiveTool, getActiveIncident,
 } from "./context.js";
+import { askConfirm } from "./modal.js";
 
 const SPRITE_URL = "/static/vendor/symbols/tools.svg";
 
@@ -101,14 +102,20 @@ export function registerTool(tool) {
  * @param {string} id - Tool id to activate.
  * @param {{force?: boolean}} [options] - force skips the unsaved-work prompt.
  * @returns {boolean} Whether the switch happened. */
-export function setTool(id, options = {}) {
+export async function setTool(id, options = {}) {
   // One-shot entries run without disturbing the active tool - see registerTool.
   const target = tools.get(id);
   if (target?.action) { target.action(); return true; }
   const current = tools.get(getActiveTool());
   if (current && current.id === id) return true;
   if (current && !options.force && current.hasUnsavedWork?.()) {
-    if (!window.confirm(`${current.label} has unsaved work. Discard it?`)) return false;
+    // In-page rather than window.confirm: a native dialog blocks the event
+    // loop, so the telemetry refresh and the safety-warning poll stop while it
+    // is open, with nothing on screen saying the map went stale. setTool's
+    // return value is not consumed anywhere, so awaiting here costs no caller
+    // anything - checked before changing it.
+    if (!await askConfirm(`${current.label} has unsaved work. Discard it?`,
+        { title: "Unsaved work", confirmLabel: "Discard", cancelLabel: "Keep editing", danger: true })) return false;
   }
   try {
     current?.deactivate?.();

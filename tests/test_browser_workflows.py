@@ -193,7 +193,18 @@ def main() -> None:
             cdp.wait("getComputedStyle(document.querySelector('.operations-block')).display!=='none'")
             cdp.wait("getComputedStyle(document.querySelector('[aria-labelledby=\"h-history\"]')).display==='none'")
 
-            cdp.evaluate("window.prompt=(()=>{const values=['Browser drill','BROWSER-1'];return()=>values.shift()||''})();document.querySelector('#btn-new-incident').click()")
+            # Incident creation used two consecutive window.prompt() calls and
+            # this test stubbed window.prompt to answer them. Both are now one
+            # in-page form (static/js/modal.js), so the test drives the real
+            # dialog instead - which is the better check anyway: stubbing the
+            # native meant the actual naming UI was never exercised.
+            cdp.evaluate("document.querySelector('#btn-new-incident').click();true")
+            cdp.wait("Boolean(document.querySelector('.nf-modal')?.open)")
+            cdp.evaluate(
+                "(()=>{const d=document.querySelector('.nf-modal');"
+                "d.querySelector('[data-field=\"name\"]').value='Browser drill';"
+                "d.querySelector('[data-field=\"number\"]').value='BROWSER-1';"
+                "d.querySelector('[data-confirm]').click();return true})()")
             cdp.wait("Boolean(document.querySelector('#ops-incident').value && !document.querySelector('#ops-workspace').hidden)")
             # Trailing ";true" matters: Leaflet's fire() returns the map
             # itself for chaining, and evaluate() always serializes the
@@ -209,13 +220,34 @@ def main() -> None:
             # reload with confirmation pre-installed before application code.
             cdp.evaluate("document.querySelector('#ops-feature-type').value='tactical_line';document.querySelector('#ops-feature-type').dispatchEvent(new Event('change',{bubbles:true}));document.querySelector('#btn-start-draw').click();window.NexFiremapMap.fire('click',{latlng:L.latLng(48.11,11.51)});true")
             cdp.wait("Boolean(localStorage.getItem('nexfiremap.unsavedSketch.v1'))")
-            cdp.call("Page.addScriptToEvaluateOnNewDocument", {"source": "window.confirm=()=>true;"})
+            # The recovery prompt is now an in-page dialog too, so there is no
+            # native confirm() to pre-install before application code runs.
+            # Reload, wait for the dialog, and accept it the way an operator
+            # would.
             cdp.call("Page.reload", {"ignoreCache": True})
+            cdp.wait("Boolean(document.querySelector('.nf-modal')?.open)")
+            cdp.evaluate("document.querySelector('.nf-modal [data-confirm]').click();true")
             cdp.wait("document.querySelector('#ops-status')?.textContent.includes('Recovered unsaved sketch')")
             cdp.evaluate("document.querySelector('#btn-cancel-draw').click()")
 
             cdp.evaluate("(()=>{const boxes=[...document.querySelectorAll('#ops-safety input[type=checkbox]')];boxes.forEach(box=>box.checked=true);boxes[0].dispatchEvent(new Event('change',{bubbles:true}));return boxes.length})()")
             time.sleep(.5); cdp.evaluate("document.querySelector('#btn-approve-scenario').click()")
+            # Approving over unresolved warnings asks for explicit
+            # acknowledgement. That used to be a window.confirm() this test had
+            # stubbed to true, which meant the acknowledgement gate - the thing
+            # that makes approval a deliberate act - was never actually
+            # exercised. It is now an in-page dialog, so accept it the way an
+            # operator would. Conditional because whether any warning survives
+            # depends on what this drill happened to draw; the approval must
+            # work either way.
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                if cdp.evaluate("Boolean(document.querySelector('.nf-modal')?.open)"):
+                    cdp.evaluate("document.querySelector('.nf-modal [data-confirm]').click();true")
+                    break
+                if cdp.evaluate("document.querySelector('#ops-scenario-status')?.value==='approved'"):
+                    break
+                time.sleep(.2)
             cdp.wait("document.querySelector('#ops-scenario-status')?.value==='approved'")
 
             # wireControls() wires every operations-panel control exactly

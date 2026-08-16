@@ -12,6 +12,7 @@ import {
   getSpreadAnalysis, onSpreadAnalysis, onIncidentCreated,
 } from "./context.js";
 import { registerTool, setTool, refreshTools } from "./tools.js";
+import { askConfirm, askText, askForm } from "./modal.js";
 
   const $ = (s) => document.querySelector(s);
   // Almost every innerHTML template below interpolates operator-supplied
@@ -511,7 +512,8 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
       // brand-new sketch below - no geometry to restore, just re-open the
       // same feature for editing and reapply the drafted field values.
       if (!knownIncident) { clearSketchDraft(); return; }
-      if (!confirm("An unsaved edit to an operational record was recovered from this browser. Restore it?")) { clearSketchDraft(); return; }
+      if (!await askConfirm("An unsaved edit to an operational record was recovered from this browser. Restore it?",
+          { confirmLabel: "Restore", cancelLabel: "Discard" })) { clearSketchDraft(); return; }
       if (state.incidentId !== draft.incidentId) await selectIncident(draft.incidentId);
       if (!state.workspace.operational_periods.some((item) => item.id === draft.periodId)) { clearSketchDraft(); return; }
       const feature = state.workspace.features.features.find((f) => f.properties.id === draft.editingFeatureId);
@@ -531,7 +533,8 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
     if (!knownIncident || !state.meta.feature_types.includes(d?.featureType) || geometryType(d.featureType) !== d.geometry || !validPoints) {
       clearSketchDraft(); return;
     }
-    if (!confirm("An unsaved tactical sketch was recovered from this browser. Restore it?")) { clearSketchDraft(); return; }
+    if (!await askConfirm("An unsaved tactical sketch was recovered from this browser. Restore it?",
+      { confirmLabel: "Restore", cancelLabel: "Discard" })) { clearSketchDraft(); return; }
     if (state.incidentId !== draft.incidentId) await selectIncident(draft.incidentId);
     if (!state.workspace.operational_periods.some((item) => item.id === draft.periodId)) { clearSketchDraft(); return; }
     state.periodId = draft.periodId;
@@ -887,7 +890,9 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
 
   async function removeFeature(id) {
     const feature = state.workspace.features.features.find((f) => f.properties.id === id);
-    if (!feature || !confirm("Remove this object from the active operational map? Its audit history remains.")) return;
+    if (!feature) return;
+    if (!await askConfirm("Remove this object from the active operational map? Its audit history remains.",
+        { confirmLabel: "Remove", danger: true })) return;
     await api(`/api/operations/incidents/${state.incidentId}/features/${id}?expected_revision=${feature.properties.revision}`, { method: "DELETE" });
     await selectIncident(state.incidentId);
   }
@@ -951,7 +956,8 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
       await selectIncident(state.incidentId);
       setStatus(result.safety_warnings?.length ? "Plan approved with explicitly acknowledged safety warnings." : "Plan approved after safety review.");
     } catch (error) {
-      if (!acknowledge && confirm(`${error.message}\n\nApprove with the remaining warnings explicitly acknowledged?`)) return approveScenario(true);
+      if (!acknowledge && await askConfirm(`${error.message}\n\nApprove with the remaining warnings explicitly acknowledged?`,
+          { title: "Unresolved warnings", confirmLabel: "Approve anyway", danger: true })) return approveScenario(true);
       setStatus(error.message, true);
     }
   }
@@ -1367,8 +1373,15 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
   // --------------------------------- creating incidents/periods/scenarios
 
   async function createIncident() {
-    const name = prompt("Incident name"); if (!name) return;
-    const number = prompt("Incident identifier / number (optional)", "") || "";
+    // One form rather than two consecutive prompts: cancelling the second
+    // prompt used to discard the name already typed into the first.
+    const answers = await askForm("New incident", [
+      { name: "name", label: "Incident name", placeholder: "Waldbrand Nord" },
+      { name: "number", label: "Incident identifier / number (optional)", value: "" },
+    ], { confirmLabel: "Create incident" });
+    if (!answers) return;
+    const name = answers.name.trim(); if (!name) return;
+    const number = answers.number.trim();
     const center = state.map.getCenter();
     const result = await api("/api/operations/incidents", { method: "POST", body: {
       name, incident_number: number, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
@@ -1382,7 +1395,8 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
     const current = currentPeriod();
     const starts = current ? new Date(current.ends_at) : new Date();
     const ends = new Date(starts.getTime() + 12 * 3600 * 1000);
-    const name = prompt("Operational period name", `Operational period ${localTime(starts)}`);
+    const name = await askText("Operational period name", `Operational period ${localTime(starts)}`,
+      { title: "Next operational period", confirmLabel: "Create" });
     if (!name) return;
     const period = await api(`/api/operations/incidents/${state.incidentId}/periods`, {
       method: "POST", body: { name, starts_at: starts.toISOString(), ends_at: ends.toISOString(), objectives: "" },
@@ -1395,8 +1409,17 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
   }
 
   async function createScenario() {
-    const name = prompt("Scenario name", "Plan B"); if (!name) return;
-    const kind = prompt("Kind: primary, contingency, alternative, or worst_case", "contingency"); if (!kind) return;
+    // `kind` is a closed vocabulary, so it is a select rather than free text -
+    // the old prompt asked the operator to retype one of four exact strings and
+    // silently rejected anything else server-side.
+    const answers = await askForm("New plan scenario", [
+      { name: "name", label: "Scenario name", value: "Plan B" },
+      { name: "kind", label: "Kind", value: "contingency",
+        options: state.meta?.scenario_kinds || ["primary", "contingency", "alternative", "worst_case"] },
+    ], { confirmLabel: "Create scenario" });
+    if (!answers) return;
+    const name = answers.name.trim(); if (!name) return;
+    const kind = answers.kind;
     const scenario = await api(`/api/operations/incidents/${state.incidentId}/periods/${state.periodId}/scenarios`, {
       method: "POST", body: { name, kind, description: "", assumptions: "" },
     });
@@ -1406,7 +1429,8 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
   // ------------------------------------- snapshots, products & model runs
 
   async function createSnapshot() {
-    const name = prompt("Snapshot name", `${currentPeriod()?.name || "Incident"} handover`); if (name === null) return;
+    const name = await askText("Snapshot name", `${currentPeriod()?.name || "Incident"} handover`,
+      { title: "Create snapshot", confirmLabel: "Create" }); if (name === null) return;
     await api(`/api/operations/incidents/${state.incidentId}/snapshots`, {
       method: "POST", body: { name, period_id: state.periodId || null, classification: "operational" },
     });
@@ -1701,7 +1725,8 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
     const pending = state.pendingFieldImport; if (!pending) return;
     const payload = { ...pending.payload };
     if (pending.report.requires_aoi_acknowledgement) {
-      if (!confirm(`${pending.report.outside_aoi} imported feature(s) extend outside the reviewed current map view. Apply with this explicitly acknowledged?`)) return;
+      if (!await askConfirm(`${pending.report.outside_aoi} imported feature(s) extend outside the reviewed current map view. Apply with this explicitly acknowledged?`,
+          { title: "Features outside the reviewed area", confirmLabel: "Apply anyway" })) return;
       payload.acknowledge_outside_aoi = true;
     }
     if (pending.report.requires_confirmation && !payload.confirmation_reason) {
@@ -1765,7 +1790,8 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
   }
 
   async function acknowledgeTacticalWarning(warningId) {
-    const reason = prompt("Reason or mitigation for acknowledging this screening warning");
+    const reason = await askText("Reason or mitigation for acknowledging this screening warning", "",
+      { title: "Acknowledge warning", multiline: true, confirmLabel: "Acknowledge" });
     if (!reason?.trim()) return;
     await api(`/api/operations/incidents/${state.incidentId}/tactical-warning-acknowledgements`, {
       method: "POST", body: { period_id: state.periodId, scenario_id: state.scenarioId || null,
@@ -1835,7 +1861,8 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
       const classes = report.classifications
         ? Object.entries(report.classifications).map(([key, count]) => `${key} ${count}`).join(" · ")
         : `${(report.conflicts || []).length} conflict(s)`;
-      if (report.mode === "existing_incident" && confirm(`This package targets an existing incident. Stage both versions for side-by-side resolution?\n\n${classes}\n\nNo record will change until every conflict is resolved.`)) {
+      if (report.mode === "existing_incident" && await askConfirm(`This package targets an existing incident. Stage both versions for side-by-side resolution?\n\n${classes}\n\nNo record will change until every conflict is resolved.`,
+        { title: "Existing incident", confirmLabel: "Stage for resolution" })) {
         const staged = await api("/api/operations/merge/stage", { method: "POST", body: { bundle } });
         renderMerge(staged);
         setStatus(`Package staged with SHA-256 ${staged.sha256}. Both inputs are preserved; resolve below.`, true);
@@ -1844,7 +1871,8 @@ import { registerTool, setTool, refreshTools } from "./tools.js";
     }
     const c = report.counts;
     const summary = `${c.periods} period(s), ${c.scenarios} scenario(s), ${c.features} feature(s), ${c.resources} resource(s)`;
-    if (!confirm(`Import new incident “${report.incident_name}”?\n\n${summary}\n\nThis was validated as a new incident and will be applied atomically.`)) return;
+    if (!await askConfirm(`Import new incident “${report.incident_name}”?\n\n${summary}\n\nThis was validated as a new incident and will be applied atomically.`,
+      { title: "Import incident", confirmLabel: "Import" })) return;
     const result = await api("/api/operations/import/apply", { method: "POST", body: { bundle } });
     await loadIncidents(result.report.incident_id);
     setStatus(`Imported ${report.incident_name}: ${summary}.`);

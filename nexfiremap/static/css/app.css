@@ -1280,6 +1280,36 @@ code {
   content: ""; flex: 1; height: 1px; background: var(--border);
 }
 #auth-oidc-button { text-align: center; text-decoration: none; }
+
+/* In-page replacements for prompt()/confirm() - see static/js/modal.js.
+   Sized for a gloved finger on a field tablet rather than a mouse: the actions
+   are full-height buttons with real spacing, which the native dialogs this
+   replaces could not be made to be at any price. */
+.nf-modal {
+  width: min(460px, calc(100vw - 32px));
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text-primary);
+}
+.nf-modal::backdrop { background: rgba(0, 0, 0, .78); }
+.nf-modal-form { display: grid; gap: 12px; }
+.nf-modal h2 { margin: 0; font-size: 15px; }
+.nf-modal-body { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.55; }
+.nf-modal .field { display: grid; gap: 4px; }
+.nf-modal .field span { font-size: 12px; color: var(--text-secondary); }
+.nf-modal input, .nf-modal select, .nf-modal textarea {
+  width: 100%; padding: 8px 9px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-2); color: var(--text-primary); font: inherit;
+}
+.nf-modal textarea { resize: vertical; }
+.nf-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.nf-modal-actions .btn { min-height: 38px; padding: 0 16px; }
+/* Destructive confirmations (discard a draft, remove an object, approve over
+   unresolved warnings) read red, so the irreversible button never looks like
+   the safe one. */
+.nf-modal .btn.danger { background: #d5392c; color: #fff; border-color: #d5392c; }
 #ops-workspace { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 #ops-workspace[hidden] { display: none; }
 #ops-workspace h3 { margin: 3px 0 -2px; font-size: 12px; font-weight: 650; }
